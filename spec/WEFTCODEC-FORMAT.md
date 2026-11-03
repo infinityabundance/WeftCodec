@@ -46,6 +46,7 @@ encoders may appear on the wire.
 | Relation assertion | `weft/relation/v1` |
 | Object version record | `weft/version/v1` |
 | Object identity seed | `weft/object/v1` |
+| Directory entry identity | `weft/entry/v1` |
 
 A digest is content identity only. It is not a capability, signature, or
 authorization decision.
