@@ -208,7 +208,33 @@ A checkpoint MUST describe exactly the state after applying the commit that
 names it; a mismatch is `Corrupt` and replay falls back to an earlier base.
 The state manifest hash is `H("weft/manifest/v1", WCB bytes)`.
 
-### 2.5 Pointer files
+### 2.5 Reserved relation values, saved contexts, and xattrs
+
+Reserved predicate `tagged_as` is sugar for a tag: target is a text value.
+
+Reserved predicate `saved_context` stores a named selector as a normal
+relation, so it participates in the same transactions and snapshots:
+
+```
+subject   = root ObjectId (32 zero bytes)
+predicate = "saved_context"
+kind      = "value"
+target    = text name (unique among saved contexts)
+attrs     = {"selector_hex": text}, where selector_hex is lowercase hex of
+            the canonical selector bytes from WEFT-SELECTORS.md
+```
+
+A `saved_context` relation is visible only to principals allowed to read the
+root object. Two relations with the same name but different selectors are a
+validation error; replacement is delete+add in one commit.
+
+Extended attributes are stored in the object's `attrs` map with the key
+`xattr.<name>` and a `bytes` value. `listxattr` exposes the `<name>` suffixes;
+`getxattr`/`setxattr`/`removexattr` operate on those entries. Names are UTF-8
+without NUL and without `/`; values are bounded by the store's attribute
+limit. Reserved `weft.*` keys are not exposed through xattr calls.
+
+### 2.6 Pointer files
 
 `refs/snapshots/<name>` and `refs/tags/<name>` contain lowercase hex of a
 32-byte hash followed by a single `\n`. They are **caches**, not authority:
