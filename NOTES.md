@@ -348,3 +348,26 @@ comparisons across 3 repos)`.
 - AI tensor/token/KV/delta modes: **specified, not implemented**
   (`spec/WEFT-AI-CODEC.md`); no wire mode values were allocated.
 - No performance claim and no model-checking claim for the new identities.
+
+## F5 — decoder limits, DAG frame source, adversarial vectors (2026-11-03)
+
+- `decode`, `archive decode`, and `selector id|canonicalize` accept the ten
+  requested limit flags: `--max-frame-bytes`, `--max-decoded-bytes`,
+  `--max-dependency-depth`, `--max-dependency-count`,
+  `--max-total-fetched-bytes`, `--max-chunks`, `--max-dictionary-bytes`,
+  `--max-delta-ops`, `--max-structured-depth`, and `--max-selector-bytes`.
+  Additional `--max-structured-items`, `--max-selector-depth`,
+  `--max-selector-operands`, and `--max-archive-entries` bound the remaining
+  spec limits. Defaults are the normative v1 values.
+- `decode --frame-source DIR` resolves dependency *frames* from a directory
+  named by lowercase content hash and walks the DAG with the existing depth,
+  cycle, total-fetch, and cumulative-decoded bounds.
+- **Allocation fix:** zstd and dictionary decompression previously allocated
+  the full declared output length via `zstd::bulk::Decompressor`. A tiny frame
+  claiming 4 GiB could therefore force a 4 GiB allocation. Both paths now
+  stream with an exact `declared_len + 1` read bound; the 4 GiB-declared vector
+  returns `Corrupt` with a few MiB RSS.
+- `conformance --adversarial --dir conformance/v1` writes 36 vectors plus
+  `PROVENANCE.json`. They are copied byte-identically into WeftCodec-Go and
+  replayed by `bench/scripts/run_decoder_bomb_court.sh`; expected classes are
+  identical in both implementations. This is a curated corpus, not fuzzing.
