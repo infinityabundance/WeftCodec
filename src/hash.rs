@@ -145,10 +145,14 @@ pub fn hash_domain(domain: &str, data: &[u8]) -> Hash32 {
 }
 
 /// Checked variant of [`hash_domain`] that rejects domains which are not
-/// representable in v1 (longer than `u32::MAX`) with `LimitExceeded`.
+/// representable in v1 (longer than `u32::MAX`) with `LimitExceeded`, and
+/// rejects non-ASCII domains or domains containing NUL with `Malformed`.
 pub fn try_hash_domain(domain: &str, data: &[u8]) -> Result<Hash32> {
     if domain.len() > u32::MAX as usize {
         return Err(Error::limit_exceeded("hash domain exceeds u32 length"));
+    }
+    if !domain.is_ascii() || domain.as_bytes().contains(&0) {
+        return Err(Error::malformed("hash domain must be ASCII without NUL"));
     }
     Ok(hash_domain(domain, data))
 }

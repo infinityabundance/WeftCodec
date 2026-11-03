@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
 use weftcodec::dependency::MapResolver;
-use weftcodec::error::ErrorClass;
 use weftcodec::hash::hash_domain;
 use weftcodec::hash::DOMAIN_CHUNK;
 use weftcodec::limits::Limits;
@@ -214,5 +213,4 @@ fn vectors_are_not_empty_and_cover_modes() {
             "missing error class vector: {class}"
         );
     }
-    let _ = ErrorClass::Malformed;
 }

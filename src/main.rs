@@ -503,11 +503,12 @@ fn resolver_for(deps: Option<&str>) -> Box<dyn Resolver> {
 
 fn read_limited(path: &str, max: u64) -> Result<Vec<u8>> {
     if path == "-" {
-        let limit = usize::try_from(max)
-            .map_err(|_| Error::limit_exceeded("input limit does not fit usize"))?;
+        let read_cap = max
+            .checked_add(1)
+            .ok_or_else(|| Error::limit_exceeded("input limit overflow"))?;
         let mut buffer = Vec::new();
         std::io::stdin()
-            .take(limit as u64 + 1)
+            .take(read_cap)
             .read_to_end(&mut buffer)
             .map_err(|e| Error::io(format!("cannot read stdin: {e}")))?;
         if buffer.len() as u64 > max {
@@ -525,7 +526,14 @@ fn read_limited(path: &str, max: u64) -> Result<Vec<u8>> {
             metadata.len()
         )));
     }
-    fs::read(path).map_err(|e| Error::io(format!("cannot read {path}: {e}")))
+    let bytes = fs::read(path).map_err(|e| Error::io(format!("cannot read {path}: {e}")))?;
+    if bytes.len() as u64 > max {
+        return Err(Error::limit_exceeded(format!(
+            "{path} grew to {} bytes while reading, limit {max}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
 }
 
 fn write_output(path: &str, bytes: &[u8]) -> Result<()> {
