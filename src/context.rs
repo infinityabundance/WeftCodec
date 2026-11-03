@@ -1556,6 +1556,21 @@ mod tests {
     }
 
     #[test]
+    fn identity_mode_parsing() {
+        assert_eq!(
+            IdentityMode::parse("bytes_only").unwrap(),
+            IdentityMode::BytesOnly
+        );
+        assert_eq!(
+            IdentityMode::parse("causal_exact").unwrap(),
+            IdentityMode::CausalExact
+        );
+        assert_eq!(IdentityMode::CausalExact.to_string(), "causal_exact");
+        let error = IdentityMode::parse("causalish").unwrap_err();
+        assert_eq!(error.class(), crate::ErrorClass::UnsupportedVersion);
+    }
+
+    #[test]
     fn text_validators() {
         for good in ["default", "a", "a.b-c_9"] {
             assert!(validate_namespace(good).is_ok(), "{good}");

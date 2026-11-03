@@ -301,8 +301,8 @@ launched only through `scripts/docker-court.sh rust`; hard limits unchanged
 
 ```sh
 scripts/docker-court.sh rust "cd WeftCodec && cargo test --all-targets --quiet"
-# Observed: 35 + 0 + 8 + 4 + 5 + 12 + 8 + 9 + 7 + 7 + 4 = 99 passed, 0 failed
-# (the new 5 are tests/context.rs; 7 new unit tests are in src/context.rs)
+# Observed: 36 + 0 + 8 + 4 + 5 + 12 + 8 + 9 + 7 + 7 + 4 = 100 passed, 0 failed
+# (the new 5 are tests/context.rs; 8 new unit tests are in src/context.rs)
 
 scripts/docker-court.sh rust "cd WeftCodec && cargo run --quiet -- conformance --dir /work/.docker-cache/vectors"
 # Observed: wrote conformance vectors to /work/.docker-cache/vectors
@@ -310,7 +310,7 @@ scripts/docker-court.sh rust "cd WeftCodec && cargo run --quiet -- conformance -
 # existing codec/structured/selectors vectors were not touched.
 
 scripts/docker-court.sh rust "cd WeftCodec && cargo fmt --all && cargo test --all-targets --quiet"
-# Observed: same 99 passed, 0 failed after formatting.
+# Observed: same 100 passed, 0 failed after formatting.
 ```
 
 Cross-language Context Root gate (run in the courts, exact commands):
