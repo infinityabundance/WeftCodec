@@ -158,6 +158,12 @@ pub fn canonical_bytes(input: &str) -> Result<Vec<u8>> {
     parse(input)?.canonical_bytes()
 }
 
+/// Canonical WCB bytes for a selector source string (alias used by callers that
+/// mirror the specification's name for this value).
+pub fn canonical_selector_bytes(input: &str) -> Result<Vec<u8>> {
+    canonical_bytes(input)
+}
+
 /// Selector identity for a selector source string.
 pub fn selector_id(input: &str) -> Result<Hash32> {
     parse(input)?.selector_id()
@@ -200,6 +206,12 @@ impl Selector {
     /// Canonical WCB bytes with default limits.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         self.canonical_bytes_with_limits(&Limits::default())
+    }
+
+    /// Alias for [`Selector::canonical_bytes`], matching the specification's
+    /// name for the bytes that are hashed into a selector id.
+    pub fn canonical_selector_bytes(&self) -> Result<Vec<u8>> {
+        self.canonical_bytes()
     }
 
     /// Canonical WCB bytes with explicit limits.
