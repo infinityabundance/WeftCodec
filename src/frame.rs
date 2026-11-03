@@ -71,6 +71,10 @@ pub enum Mode {
     Delta = 3,
     Dictionary = 4,
     Structured = 5,
+    /// Canonical tensor payload with WCB descriptor (WEFT-AI-CODEC §2).
+    Tensor = 6,
+    /// Token-id sequence with WCB descriptor (WEFT-AI-CODEC §3).
+    TokenSequence = 7,
 }
 
 impl Mode {
@@ -83,7 +87,9 @@ impl Mode {
             3 => Ok(Mode::Delta),
             4 => Ok(Mode::Dictionary),
             5 => Ok(Mode::Structured),
-            6..=127 => Err(Error::unsupported_mode(format!(
+            6 => Ok(Mode::Tensor),
+            7 => Ok(Mode::TokenSequence),
+            8..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -106,6 +112,8 @@ impl Mode {
             Mode::Delta => "delta",
             Mode::Dictionary => "dictionary",
             Mode::Structured => "structured",
+            Mode::Tensor => "tensor",
+            Mode::TokenSequence => "tokens",
         }
     }
 
@@ -118,6 +126,8 @@ impl Mode {
             "delta" => Ok(Mode::Delta),
             "dictionary" => Ok(Mode::Dictionary),
             "structured" => Ok(Mode::Structured),
+            "tensor" => Ok(Mode::Tensor),
+            "tokens" | "token_sequence" => Ok(Mode::TokenSequence),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -738,6 +748,31 @@ fn validate_mode_rules(
             }
             if header.chunk_count != 0 {
                 return Err(Error::malformed("DELTA must not be chunked"));
+            }
+        }
+        Mode::Tensor | Mode::TokenSequence => {
+            if header.domain != DOMAIN_PAYLOAD {
+                return Err(Error::malformed(
+                    "TENSOR/TOKEN_SEQUENCE frames must use the payload domain",
+                ));
+            }
+            if dict_flag {
+                return Err(Error::malformed("DICT_RAW is only valid for DICTIONARY"));
+            }
+            if header.dep_count != 0 {
+                return Err(Error::malformed(
+                    "TENSOR/TOKEN_SEQUENCE frames must not have dependencies in v1",
+                ));
+            }
+            if header.chunk_count != 0 {
+                return Err(Error::malformed(
+                    "TENSOR/TOKEN_SEQUENCE frames must not be chunked",
+                ));
+            }
+            if header.body_len < 4 {
+                return Err(Error::malformed(
+                    "TENSOR/TOKEN_SEQUENCE body is shorter than its 4-byte metadata length",
+                ));
             }
         }
         Mode::Dictionary => {

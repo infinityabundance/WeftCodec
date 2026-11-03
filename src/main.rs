@@ -79,7 +79,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -94,6 +94,31 @@ struct EncodeArgs {
     /// Chunk size in bytes (RAW and ZSTD only).
     #[arg(long)]
     chunk_size: Option<usize>,
+    /// TENSOR dtype (`f16|bf16|f32|f64|i8|u8|i16|i32|i64`).
+    #[arg(long)]
+    dtype: Option<String>,
+    /// TENSOR shape as comma-separated u64 extents (empty means scalar).
+    #[arg(long)]
+    shape: Option<String>,
+    /// TENSOR metadata JSON file: `{"dtype":"f32","shape":[2,3]}`.
+    #[arg(long)]
+    metadata: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct TensorMetaInput {
+    dtype: String,
+    shape: Vec<u64>,
+    #[serde(default)]
+    layout: Option<String>,
+    #[serde(default)]
+    endianness: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct TokensInput {
+    vocab_schema: String,
+    token_ids: Vec<u64>,
 }
 
 /// Decoder resource limits. Defaults are the normative v1 values; every flag
@@ -116,6 +141,12 @@ struct LimitArgs {
     max_dictionary_bytes: u64,
     #[arg(long, default_value_t = limits::DEFAULT_MAX_DELTA_OPS)]
     max_delta_ops: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_TENSOR_ELEMENTS)]
+    max_tensor_elements: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_TENSOR_RANK)]
+    max_tensor_rank: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_TOKENS)]
+    max_tokens: u64,
     #[arg(long, default_value_t = limits::DEFAULT_MAX_STRUCTURED_DEPTH)]
     max_structured_depth: u64,
     #[arg(long, default_value_t = limits::DEFAULT_MAX_STRUCTURED_ITEMS)]
@@ -141,6 +172,9 @@ impl LimitArgs {
             max_chunks: self.max_chunks,
             max_dictionary_bytes: self.max_dictionary_bytes,
             max_delta_ops: self.max_delta_ops,
+            max_tensor_elements: self.max_tensor_elements,
+            max_tensor_rank: self.max_tensor_rank,
+            max_tokens: self.max_tokens,
             max_structured_depth: self.max_structured_depth,
             max_structured_items: self.max_structured_items,
             max_selector_bytes: self.max_selector_bytes,
@@ -370,7 +404,17 @@ fn encode(args: EncodeArgs) -> Result<()> {
         None => None,
     };
 
-    let frame = if args.mode == "auto" {
+    let frame = if args.mode == "tensor" {
+        let (dtype, shape) = tensor_metadata_args(&args)?;
+        modes::encode_tensor(&data, dtype, &shape, &limits)?
+    } else if args.mode == "tokens" {
+        let input: TokensInput = serde_json::from_slice(&data).map_err(|err| {
+            Error::malformed(format!(
+                "tokens input must be JSON {{\"vocab_schema\":string,\"token_ids\":[u64,...]}}: {err}"
+            ))
+        })?;
+        modes::encode_token_sequence(&input.token_ids, &input.vocab_schema, &limits)?
+    } else if args.mode == "auto" {
         encode_auto(
             &data,
             base.as_deref(),
@@ -424,7 +468,63 @@ fn encode_mode(
             let value = wcb::decode(data, limits)?;
             modes::encode_structured(&value, limits)
         }
+        Mode::Tensor => Err(Error::malformed(
+            "TENSOR encoding requires the dedicated CLI path with --dtype/--shape/--metadata",
+        )),
+        Mode::TokenSequence => Err(Error::malformed(
+            "TOKEN_SEQUENCE encoding requires a JSON token input",
+        )),
     }
+}
+
+/// Parse the TENSOR descriptor from `--metadata` or `--dtype`/`--shape`.
+fn tensor_metadata_args(args: &EncodeArgs) -> Result<(modes::TensorDtype, Vec<u64>)> {
+    if let Some(path) = &args.metadata {
+        if args.dtype.is_some() || args.shape.is_some() {
+            return Err(Error::malformed(
+                "--metadata cannot be combined with --dtype or --shape",
+            ));
+        }
+        let bytes = read_limited(path, Limits::default().max_string_bytes)?;
+        let input: TensorMetaInput = serde_json::from_slice(&bytes).map_err(|err| {
+            Error::malformed(format!(
+                "tensor metadata must be JSON {{\"dtype\":string,\"shape\":[u64,...]}}: {err}"
+            ))
+        })?;
+        if let Some(layout) = input.layout {
+            if layout != "row_major" {
+                return Err(Error::malformed(format!(
+                    "tensor layout `{layout}` is specified but not implemented in v1 (only row_major)"
+                )));
+            }
+        }
+        if let Some(endianness) = input.endianness {
+            if endianness != "little" {
+                return Err(Error::malformed(format!(
+                    "tensor endianness `{endianness}` is specified but not implemented in v1 (only little)"
+                )));
+            }
+        }
+        let dtype = modes::TensorDtype::from_name(&input.dtype)?;
+        return Ok((dtype, input.shape));
+    }
+    let dtype = args
+        .dtype
+        .as_deref()
+        .ok_or_else(|| Error::malformed("TENSOR encoding requires --dtype or --metadata"))?;
+    let dtype = modes::TensorDtype::from_name(dtype)?;
+    let shape = match args.shape.as_deref() {
+        None | Some("") => Vec::new(),
+        Some(text) => text
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<u64>()
+                    .map_err(|err| Error::malformed(format!("bad --shape extent `{part}`: {err}")))
+            })
+            .collect::<Result<Vec<u64>>>()?,
+    };
+    Ok((dtype, shape))
 }
 
 fn encode_auto(

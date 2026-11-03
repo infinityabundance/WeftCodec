@@ -28,6 +28,13 @@ pub const DEFAULT_MAX_STRUCTURED_ITEMS: u64 = 1_000_000;
 pub const DEFAULT_MAX_STRING_BYTES: u64 = 256 << 20;
 /// Default maximum delta operations (16,777,216).
 pub const DEFAULT_MAX_DELTA_OPS: u64 = 16_777_216;
+/// Default maximum tensor element count (2^32).
+pub const DEFAULT_MAX_TENSOR_ELEMENTS: u64 = 1 << 32;
+/// Default maximum tensor rank (8 dimensions, WEFT-AI-CODEC §2.1).
+pub const DEFAULT_MAX_TENSOR_RANK: u64 = 8;
+/// Default maximum token count in a token sequence (2^24 = 16,777,216).
+/// Chosen so an in-memory `Vec<u64>` of ids is at most 128 MiB.
+pub const DEFAULT_MAX_TOKENS: u64 = 1 << 24;
 /// Default maximum selector source length (64 KiB).
 pub const DEFAULT_MAX_SELECTOR_BYTES: u64 = 64 << 10;
 /// Default maximum selector AST nesting depth (64).
@@ -59,6 +66,12 @@ pub struct Limits {
     pub max_structured_items: u64,
     pub max_string_bytes: u64,
     pub max_delta_ops: u64,
+    /// Tensor element count (WEFT-AI-CODEC §2).
+    pub max_tensor_elements: u64,
+    /// Tensor rank / shape dimensions (WEFT-AI-CODEC §2).
+    pub max_tensor_rank: u64,
+    /// Token count in a token sequence (WEFT-AI-CODEC §3).
+    pub max_tokens: u64,
     /// Selector source bytes (WEFT-SELECTORS §1).
     pub max_selector_bytes: u64,
     /// Selector AST nesting depth (WEFT-SELECTORS §1).
@@ -91,6 +104,9 @@ impl Default for Limits {
             max_structured_items: DEFAULT_MAX_STRUCTURED_ITEMS,
             max_string_bytes: DEFAULT_MAX_STRING_BYTES,
             max_delta_ops: DEFAULT_MAX_DELTA_OPS,
+            max_tensor_elements: DEFAULT_MAX_TENSOR_ELEMENTS,
+            max_tensor_rank: DEFAULT_MAX_TENSOR_RANK,
+            max_tokens: DEFAULT_MAX_TOKENS,
             max_selector_bytes: DEFAULT_MAX_SELECTOR_BYTES,
             max_selector_depth: DEFAULT_MAX_SELECTOR_DEPTH,
             max_field_segments: DEFAULT_MAX_FIELD_SEGMENTS,
@@ -151,6 +167,18 @@ impl Limits {
     }
     pub fn with_max_delta_ops(mut self, value: u64) -> Self {
         self.max_delta_ops = value;
+        self
+    }
+    pub fn with_max_tensor_elements(mut self, value: u64) -> Self {
+        self.max_tensor_elements = value;
+        self
+    }
+    pub fn with_max_tensor_rank(mut self, value: u64) -> Self {
+        self.max_tensor_rank = value;
+        self
+    }
+    pub fn with_max_tokens(mut self, value: u64) -> Self {
+        self.max_tokens = value;
         self
     }
     pub fn with_max_selector_bytes(mut self, value: u64) -> Self {
@@ -227,6 +255,9 @@ mod tests {
         assert_eq!(l.max_structured_items, 1_000_000);
         assert_eq!(l.max_string_bytes, 268_435_456);
         assert_eq!(l.max_delta_ops, 16_777_216);
+        assert_eq!(l.max_tensor_elements, 4_294_967_296);
+        assert_eq!(l.max_tensor_rank, 8);
+        assert_eq!(l.max_tokens, 16_777_216);
     }
 
     #[test]

@@ -50,6 +50,9 @@ fn limits_from(vector: &Json) -> Limits {
                 "max_structured_items" => limits.with_max_structured_items(number),
                 "max_string_bytes" => limits.with_max_string_bytes(number),
                 "max_delta_ops" => limits.with_max_delta_ops(number),
+                "max_tensor_elements" => limits.with_max_tensor_elements(number),
+                "max_tensor_rank" => limits.with_max_tensor_rank(number),
+                "max_tokens" => limits.with_max_tokens(number),
                 _ => limits,
             };
         }
@@ -72,6 +75,9 @@ fn codec_vectors() {
     assert!(files.len() >= 20, "expected at least 20 codec vectors");
     for path in files {
         let vector = load(&path);
+        if vector.get("superseded_by").is_some() {
+            continue;
+        }
         let name = vector["name"].as_str().unwrap_or("?");
         let frame = hex_field(&vector, "frame_hex");
         let limits = limits_from(&vector);
@@ -195,6 +201,8 @@ fn vectors_are_not_empty_and_cover_modes() {
         "delta",
         "dictionary",
         "structured",
+        "tensor",
+        "tokens",
     ] {
         assert!(modes_seen.contains(mode), "missing mode vector: {mode}");
     }

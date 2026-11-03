@@ -5,7 +5,7 @@
 //! dependency hash/length at the materialization boundary, and the whole
 //! content hash.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::dependency::Resolver;
 use crate::error::{Error, Result};
@@ -13,7 +13,7 @@ use crate::frame::{
     encode_frame, ChunkEntry, Dependency, Frame, FrameParts, Mode, DEP_DOMAIN_DICTIONARY,
     DEP_DOMAIN_PAYLOAD, DOMAIN_PAYLOAD, DOMAIN_STRUCTURED, FORMAT_MAJOR, FORMAT_MINOR,
 };
-use crate::hash::{hash_domain, DOMAIN_CHUNK};
+use crate::hash::{hash_domain, DOMAIN_CHUNK, DOMAIN_TENSOR_PAYLOAD, DOMAIN_TOKENS_PAYLOAD};
 use crate::limits::{check_len, Limits};
 use crate::varint;
 use crate::wcb::{self, Value};
@@ -212,6 +212,8 @@ pub fn decode_bytes(
             wcb::decode(frame.body, limits)?;
             frame.body.to_vec()
         }
+        Mode::Tensor => decode_tensor(&frame, limits)?,
+        Mode::TokenSequence => decode_token_sequence(&frame, limits)?,
     };
 
     if plaintext.len() as u64 != frame.header.decoded_len {
@@ -626,4 +628,614 @@ pub fn decode_delta_ops(
         )));
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// AI-native modes (WEFT-AI-CODEC §2–§3)
+// ---------------------------------------------------------------------------
+//
+// Both modes carry a WCB descriptor followed by an exact payload:
+//
+//     u32le(metadata_len) || WCB(metadata) || payload
+//
+// The frame's `decoded_len` is the payload length and `content_hash` is
+// `H("weft/chunk/v1", payload)`. The descriptor additionally binds the payload
+// with a mode-specific hash domain, so swapping a descriptor cannot silently
+// reinterpret bytes.
+
+/// Tensor element dtypes implemented in v1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorDtype {
+    F16,
+    Bf16,
+    F32,
+    F64,
+    I8,
+    U8,
+    I16,
+    I32,
+    I64,
+}
+
+impl TensorDtype {
+    /// Parse the canonical dtype name.
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "f16" => Ok(TensorDtype::F16),
+            "bf16" => Ok(TensorDtype::Bf16),
+            "f32" => Ok(TensorDtype::F32),
+            "f64" => Ok(TensorDtype::F64),
+            "i8" => Ok(TensorDtype::I8),
+            "u8" => Ok(TensorDtype::U8),
+            "i16" => Ok(TensorDtype::I16),
+            "i32" => Ok(TensorDtype::I32),
+            "i64" => Ok(TensorDtype::I64),
+            other => Err(Error::malformed(format!(
+                "unknown tensor dtype `{other}` (v1 allows f16, bf16, f32, f64, i8, u8, i16, i32, i64)"
+            ))),
+        }
+    }
+
+    /// Canonical dtype name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TensorDtype::F16 => "f16",
+            TensorDtype::Bf16 => "bf16",
+            TensorDtype::F32 => "f32",
+            TensorDtype::F64 => "f64",
+            TensorDtype::I8 => "i8",
+            TensorDtype::U8 => "u8",
+            TensorDtype::I16 => "i16",
+            TensorDtype::I32 => "i32",
+            TensorDtype::I64 => "i64",
+        }
+    }
+
+    /// Fixed element size in bytes.
+    pub fn element_size(self) -> u64 {
+        match self {
+            TensorDtype::F16 | TensorDtype::Bf16 | TensorDtype::I16 => 2,
+            TensorDtype::F32 | TensorDtype::I32 => 4,
+            TensorDtype::F64 | TensorDtype::I64 => 8,
+            TensorDtype::I8 | TensorDtype::U8 => 1,
+        }
+    }
+}
+
+/// Token payload wire encoding implemented in v1.
+pub const TOKEN_ENCODING: &str = "u64-zigzag-delta-leb128";
+
+/// Tensor descriptor recovered from a frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorMeta {
+    pub dtype: TensorDtype,
+    pub shape: Vec<u64>,
+    pub element_count: u64,
+    pub payload_bytes: u64,
+}
+
+/// Token-sequence descriptor recovered from a frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenMeta {
+    pub vocab_schema: String,
+    pub token_count: u64,
+    pub payload_bytes: u64,
+}
+
+fn ai_map<'a>(value: &'a Value, what: &str) -> Result<&'a BTreeMap<String, Value>> {
+    match value {
+        Value::Map(map) => Ok(map),
+        _ => Err(Error::malformed(format!(
+            "{what} metadata must be a WCB map"
+        ))),
+    }
+}
+
+fn check_exact_keys(map: &BTreeMap<String, Value>, expected: &[&str], what: &str) -> Result<()> {
+    for key in map.keys() {
+        if !expected.contains(&key.as_str()) {
+            return Err(Error::malformed(format!(
+                "{what} metadata has unknown key `{key}`"
+            )));
+        }
+    }
+    for key in expected {
+        if !map.contains_key(*key) {
+            return Err(Error::malformed(format!(
+                "{what} metadata is missing key `{key}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn meta_text<'a>(map: &'a BTreeMap<String, Value>, key: &str) -> Result<&'a str> {
+    match map.get(key) {
+        Some(Value::Str(text)) => Ok(text.as_str()),
+        _ => Err(Error::malformed(format!("metadata `{key}` must be text"))),
+    }
+}
+
+fn meta_u64(map: &BTreeMap<String, Value>, key: &str) -> Result<u64> {
+    match map.get(key) {
+        Some(Value::U64(value)) => Ok(*value),
+        _ => Err(Error::malformed(format!("metadata `{key}` must be u64"))),
+    }
+}
+
+fn meta_bytes<'a>(map: &'a BTreeMap<String, Value>, key: &str) -> Result<&'a [u8]> {
+    match map.get(key) {
+        Some(Value::Bytes(bytes)) => Ok(bytes.as_slice()),
+        _ => Err(Error::malformed(format!("metadata `{key}` must be bytes"))),
+    }
+}
+
+fn meta_shape(map: &BTreeMap<String, Value>) -> Result<Vec<u64>> {
+    match map.get("shape") {
+        Some(Value::Array(items)) => {
+            let mut shape = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::U64(value) => shape.push(*value),
+                    _ => return Err(Error::malformed("metadata `shape` elements must be u64")),
+                }
+            }
+            Ok(shape)
+        }
+        _ => Err(Error::malformed("metadata `shape` must be an array")),
+    }
+}
+
+fn tensor_product(shape: &[u64], limits: &Limits) -> Result<u64> {
+    if shape.len() as u64 > limits.max_tensor_rank {
+        return Err(Error::limit_exceeded(format!(
+            "tensor rank {} exceeds limit {}",
+            shape.len(),
+            limits.max_tensor_rank
+        )));
+    }
+    let mut product: u64 = 1;
+    for dim in shape {
+        product = product
+            .checked_mul(*dim)
+            .ok_or_else(|| Error::limit_exceeded("tensor shape product overflows u64"))?;
+    }
+    if product > limits.max_tensor_elements {
+        return Err(Error::limit_exceeded(format!(
+            "tensor element count {product} exceeds limit {}",
+            limits.max_tensor_elements
+        )));
+    }
+    Ok(product)
+}
+
+fn build_ai_body(meta: &Value, payload: &[u8], limits: &Limits) -> Result<Vec<u8>> {
+    let meta_bytes = wcb::encode(meta, limits)?;
+    let meta_len = u32::try_from(meta_bytes.len())
+        .map_err(|_| Error::limit_exceeded("AI metadata does not fit u32"))?;
+    let capacity = 4usize
+        .checked_add(meta_bytes.len())
+        .and_then(|value| value.checked_add(payload.len()))
+        .ok_or_else(|| Error::limit_exceeded("AI body length overflow"))?;
+    let mut body = Vec::with_capacity(capacity);
+    body.extend_from_slice(&meta_len.to_le_bytes());
+    body.extend_from_slice(&meta_bytes);
+    body.extend_from_slice(payload);
+    Ok(body)
+}
+
+fn split_ai_body<'a>(body: &'a [u8], decoded_len: u64) -> Result<(&'a [u8], &'a [u8])> {
+    if body.len() < 4 {
+        return Err(Error::malformed(
+            "AI body is shorter than its 4-byte metadata length",
+        ));
+    }
+    let meta_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let meta_end = 4usize
+        .checked_add(meta_len)
+        .ok_or_else(|| Error::malformed("AI metadata length overflow"))?;
+    if meta_end > body.len() {
+        return Err(Error::malformed("AI metadata extends past the frame body"));
+    }
+    let payload = &body[meta_end..];
+    if payload.len() as u64 != decoded_len {
+        return Err(Error::malformed(format!(
+            "AI payload length {} differs from decoded_len {decoded_len}",
+            payload.len()
+        )));
+    }
+    Ok((&body[4..meta_end], payload))
+}
+
+/// Encode a canonical tensor payload (WEFT-AI-CODEC §2).
+///
+/// The payload is the exact little-endian element bytes in row-major order.
+/// No dtype conversion, normalization, or quantization happens here.
+pub fn encode_tensor(
+    payload: &[u8],
+    dtype: TensorDtype,
+    shape: &[u64],
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    check_len(
+        payload.len() as u64,
+        limits.max_decoded_bytes,
+        "tensor payload",
+    )?;
+    let element_count = tensor_product(shape, limits)?;
+    let payload_bytes = element_count
+        .checked_mul(dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("tensor payload byte count overflows u64"))?;
+    if payload_bytes != payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "tensor payload is {} bytes but shape {} x {} is {payload_bytes} bytes",
+            payload.len(),
+            dtype.as_str(),
+            element_count
+        )));
+    }
+
+    let meta = Value::map([
+        ("schema", Value::Str("weft.tensor.v1".to_owned())),
+        ("dtype", Value::Str(dtype.as_str().to_owned())),
+        (
+            "shape",
+            Value::Array(shape.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        ("layout", Value::Str("row_major".to_owned())),
+        ("endianness", Value::Str("little".to_owned())),
+        ("element_count", Value::U64(element_count)),
+        ("payload_bytes", Value::U64(payload_bytes)),
+        (
+            "payload_hash",
+            Value::Bytes(
+                hash_domain(DOMAIN_TENSOR_PAYLOAD, payload)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ),
+    ]);
+    let body = build_ai_body(&meta, payload, limits)?;
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::Tensor,
+        flags: 0,
+        level: 0,
+        decoded_len: payload.len() as u64,
+        content_hash: hash_domain(DOMAIN_CHUNK, payload),
+        dependencies: &[],
+        chunks: &[],
+        body: &body,
+    };
+    encode_frame(&parts, limits)
+}
+
+/// Validate and decode a TENSOR frame, returning the exact element payload.
+pub fn decode_tensor(frame: &Frame<'_>, limits: &Limits) -> Result<Vec<u8>> {
+    let (meta, payload) = parse_tensor_body(frame, limits)?;
+    let _ = meta;
+    Ok(payload.to_vec())
+}
+
+/// Parse and validate a TENSOR descriptor, returning it with the payload slice.
+pub fn tensor_metadata(frame: &Frame<'_>, limits: &Limits) -> Result<TensorMeta> {
+    let (meta, _) = parse_tensor_body(frame, limits)?;
+    Ok(meta)
+}
+
+fn parse_tensor_body<'a>(frame: &'a Frame<'_>, limits: &Limits) -> Result<(TensorMeta, &'a [u8])> {
+    let (descriptor_bytes, payload) = split_ai_body(frame.body, frame.header.decoded_len)?;
+    let value = wcb::decode(descriptor_bytes, limits)?;
+    let map = ai_map(&value, "tensor")?;
+    check_exact_keys(
+        map,
+        &[
+            "schema",
+            "dtype",
+            "shape",
+            "layout",
+            "endianness",
+            "element_count",
+            "payload_bytes",
+            "payload_hash",
+        ],
+        "tensor",
+    )?;
+    let schema = meta_text(map, "schema")?;
+    if schema != "weft.tensor.v1" {
+        return Err(Error::malformed(format!(
+            "unsupported tensor schema `{schema}`"
+        )));
+    }
+    let dtype = TensorDtype::from_name(meta_text(map, "dtype")?)?;
+    let layout = meta_text(map, "layout")?;
+    if layout != "row_major" {
+        return Err(Error::malformed(format!(
+            "tensor layout `{layout}` is specified but not implemented in v1 (only row_major)"
+        )));
+    }
+    let endianness = meta_text(map, "endianness")?;
+    if endianness != "little" {
+        return Err(Error::malformed(format!(
+            "tensor endianness `{endianness}` is specified but not implemented in v1 (only little)"
+        )));
+    }
+    let shape = meta_shape(map)?;
+    let declared_count = meta_u64(map, "element_count")?;
+    let declared_bytes = meta_u64(map, "payload_bytes")?;
+    let expected_count = tensor_product(&shape, limits)?;
+    if declared_count != expected_count {
+        return Err(Error::malformed(format!(
+            "tensor element_count {declared_count} does not match shape product {expected_count}"
+        )));
+    }
+    let expected_bytes = declared_count
+        .checked_mul(dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("tensor payload byte count overflows u64"))?;
+    if declared_bytes != expected_bytes {
+        return Err(Error::malformed(format!(
+            "tensor payload_bytes {declared_bytes} does not match element_count x element_size {expected_bytes}"
+        )));
+    }
+    if declared_bytes != payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "tensor payload is {} bytes but metadata declares {declared_bytes}",
+            payload.len()
+        )));
+    }
+    let declared_hash = meta_bytes(map, "payload_hash")?;
+    if declared_hash.len() != 32 {
+        return Err(Error::malformed(format!(
+            "tensor payload_hash must be 32 bytes, got {}",
+            declared_hash.len()
+        )));
+    }
+    let actual_hash = hash_domain(DOMAIN_TENSOR_PAYLOAD, payload);
+    if declared_hash != actual_hash.as_bytes().as_slice() {
+        return Err(Error::corrupt("tensor payload_hash mismatch"));
+    }
+    Ok((
+        TensorMeta {
+            dtype,
+            shape,
+            element_count: declared_count,
+            payload_bytes: declared_bytes,
+        },
+        payload,
+    ))
+}
+
+/// Encode a token sequence (WEFT-AI-CODEC §3).
+pub fn encode_token_sequence(
+    token_ids: &[u64],
+    vocab_schema: &str,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    if vocab_schema.is_empty() {
+        return Err(Error::malformed("vocab_schema must not be empty"));
+    }
+    if token_ids.len() as u64 > limits.max_tokens {
+        return Err(Error::limit_exceeded(format!(
+            "token count {} exceeds limit {}",
+            token_ids.len(),
+            limits.max_tokens
+        )));
+    }
+    let payload = encode_token_payload(token_ids, limits)?;
+    check_len(
+        payload.len() as u64,
+        limits.max_decoded_bytes,
+        "token payload",
+    )?;
+    let token_count = token_ids.len() as u64;
+    let meta = Value::map([
+        ("schema", Value::Str("weft.tokens.v1".to_owned())),
+        ("vocab_schema", Value::Str(vocab_schema.to_owned())),
+        ("encoding", Value::Str(TOKEN_ENCODING.to_owned())),
+        ("token_count", Value::U64(token_count)),
+        ("payload_bytes", Value::U64(payload.len() as u64)),
+        (
+            "payload_hash",
+            Value::Bytes(
+                hash_domain(DOMAIN_TOKENS_PAYLOAD, &payload)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ),
+    ]);
+    let body = build_ai_body(&meta, &payload, limits)?;
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::TokenSequence,
+        flags: 0,
+        level: 0,
+        decoded_len: payload.len() as u64,
+        content_hash: hash_domain(DOMAIN_CHUNK, &payload),
+        dependencies: &[],
+        chunks: &[],
+        body: &body,
+    };
+    encode_frame(&parts, limits)
+}
+
+/// Encode token ids to the canonical delta payload.
+///
+/// The first id is an absolute minimal LEB128 u64. Every later id is
+/// `token[i] - token[i-1]` in wrapping 64-bit arithmetic, zigzag-encoded and
+/// written as a minimal LEB128 u64. This is a bijection over all u64 ids.
+pub fn encode_token_payload(token_ids: &[u64], limits: &Limits) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut previous: u64 = 0;
+    for (index, &token) in token_ids.iter().enumerate() {
+        if index == 0 {
+            varint::encode(token, &mut out);
+        } else {
+            let delta = token.wrapping_sub(previous) as i64;
+            varint::encode(varint::zigzag_encode(delta), &mut out);
+        }
+        previous = token;
+        check_len(out.len() as u64, limits.max_decoded_bytes, "token payload")?;
+    }
+    Ok(out)
+}
+
+/// Decode a canonical token payload into ids, enforcing exact count and
+/// canonical minimal varints. `token_count` must not exceed `max_tokens`.
+pub fn decode_token_payload(payload: &[u8], token_count: u64, limits: &Limits) -> Result<Vec<u64>> {
+    if token_count > limits.max_tokens {
+        return Err(Error::limit_exceeded(format!(
+            "token count {token_count} exceeds limit {}",
+            limits.max_tokens
+        )));
+    }
+    // Each token consumes at least one byte, so a larger count is truncated
+    // before any allocation proportional to the declared count.
+    if token_count > payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "token count {token_count} cannot fit in a {}-byte payload",
+            payload.len()
+        )));
+    }
+    let capacity = usize::try_from(token_count)
+        .map_err(|_| Error::limit_exceeded("token count does not fit usize"))?;
+    let mut ids = Vec::with_capacity(capacity);
+    let mut pos = 0usize;
+    let mut previous: u64 = 0;
+    for index in 0..capacity {
+        let raw = varint::decode(payload, &mut pos)?;
+        let token = if index == 0 {
+            raw
+        } else {
+            previous.wrapping_add(varint::zigzag_decode(raw) as u64)
+        };
+        ids.push(token);
+        previous = token;
+    }
+    if pos != payload.len() {
+        return Err(Error::malformed(format!(
+            "token payload has {} trailing bytes",
+            payload.len() - pos
+        )));
+    }
+    Ok(ids)
+}
+
+/// Validate a TOKEN_SEQUENCE payload without materializing the id vector.
+pub fn validate_token_payload(payload: &[u8], token_count: u64, limits: &Limits) -> Result<()> {
+    if token_count > limits.max_tokens {
+        return Err(Error::limit_exceeded(format!(
+            "token count {token_count} exceeds limit {}",
+            limits.max_tokens
+        )));
+    }
+    if token_count > payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "token count {token_count} cannot fit in a {}-byte payload",
+            payload.len()
+        )));
+    }
+    let capacity = usize::try_from(token_count)
+        .map_err(|_| Error::limit_exceeded("token count does not fit usize"))?;
+    let mut pos = 0usize;
+    let mut previous: u64 = 0;
+    for index in 0..capacity {
+        let raw = varint::decode(payload, &mut pos)?;
+        previous = if index == 0 {
+            raw
+        } else {
+            previous.wrapping_add(varint::zigzag_decode(raw) as u64)
+        };
+    }
+    if pos != payload.len() {
+        return Err(Error::malformed(format!(
+            "token payload has {} trailing bytes",
+            payload.len() - pos
+        )));
+    }
+    Ok(())
+}
+
+/// Validate and decode a TOKEN_SEQUENCE frame, returning the exact payload.
+pub fn decode_token_sequence(frame: &Frame<'_>, limits: &Limits) -> Result<Vec<u8>> {
+    let (meta, payload) = parse_token_body(frame, limits)?;
+    let _ = meta;
+    Ok(payload.to_vec())
+}
+
+/// Parse and validate a TOKEN_SEQUENCE descriptor.
+pub fn token_metadata(frame: &Frame<'_>, limits: &Limits) -> Result<TokenMeta> {
+    let (meta, _) = parse_token_body(frame, limits)?;
+    Ok(meta)
+}
+
+fn parse_token_body<'a>(frame: &'a Frame<'_>, limits: &Limits) -> Result<(TokenMeta, &'a [u8])> {
+    let (descriptor_bytes, payload) = split_ai_body(frame.body, frame.header.decoded_len)?;
+    let value = wcb::decode(descriptor_bytes, limits)?;
+    let map = ai_map(&value, "token")?;
+    check_exact_keys(
+        map,
+        &[
+            "schema",
+            "vocab_schema",
+            "encoding",
+            "token_count",
+            "payload_bytes",
+            "payload_hash",
+        ],
+        "token",
+    )?;
+    let schema = meta_text(map, "schema")?;
+    if schema != "weft.tokens.v1" {
+        return Err(Error::malformed(format!(
+            "unsupported token schema `{schema}`"
+        )));
+    }
+    let vocab_schema = meta_text(map, "vocab_schema")?;
+    if vocab_schema.is_empty() {
+        return Err(Error::malformed("token vocab_schema must not be empty"));
+    }
+    let encoding = meta_text(map, "encoding")?;
+    if encoding != TOKEN_ENCODING {
+        return Err(Error::malformed(format!(
+            "token encoding `{encoding}` is specified but not implemented in v1 (only {TOKEN_ENCODING})"
+        )));
+    }
+    let token_count = meta_u64(map, "token_count")?;
+    if token_count > limits.max_tokens {
+        return Err(Error::limit_exceeded(format!(
+            "token count {token_count} exceeds limit {}",
+            limits.max_tokens
+        )));
+    }
+    let declared_bytes = meta_u64(map, "payload_bytes")?;
+    if declared_bytes != payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "token payload is {} bytes but metadata declares {declared_bytes}",
+            payload.len()
+        )));
+    }
+    let declared_hash = meta_bytes(map, "payload_hash")?;
+    if declared_hash.len() != 32 {
+        return Err(Error::malformed(format!(
+            "token payload_hash must be 32 bytes, got {}",
+            declared_hash.len()
+        )));
+    }
+    let actual_hash = hash_domain(DOMAIN_TOKENS_PAYLOAD, payload);
+    if declared_hash != actual_hash.as_bytes().as_slice() {
+        return Err(Error::corrupt("token payload_hash mismatch"));
+    }
+    validate_token_payload(payload, token_count, limits)?;
+    Ok((
+        TokenMeta {
+            vocab_schema: vocab_schema.to_owned(),
+            token_count,
+            payload_bytes: declared_bytes,
+        },
+        payload,
+    ))
 }

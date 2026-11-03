@@ -1,264 +1,314 @@
-# WEFT-AI-CODEC v0.1.0 — AI-native codec modes (design status)
+# WEFT-AI-CODEC v1.1.0 — AI-native codec modes
 
-**Status: DESIGN STATUS. Every mode in this document is `specified, not
-implemented`.** There is no AI codec code in F1, no vectors, and no performance
-claim. Nothing here may be cited as implemented. When a mode gains an
-implementation and frozen vectors, this status changes in a separate commit and
-the mode's row is updated to `implemented`.
+**Status: PARTIALLY IMPLEMENTED.** Exactly two AI-native modes are normative
+and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
+
+| Value | Name | Status | Frozen vectors |
+|---:|---|---|---|
+| 6 | `TENSOR` | **implemented** | `100_tensor_f32_2x3`, `101_tensor_f16_scalar`, `102_tensor_u8_zero_element` + rejects |
+| 7 | `TOKEN_SEQUENCE` (CLI `tokens`) | **implemented** | `103_tokens_delta_boundaries`, `104_tokens_empty` + rejects |
+
+Every other mode below is `specified, not implemented` and has **no allocated
+wire value**. Nothing in this document is a compression or performance claim.
+
 **Depends on:** `WEFTCODEC-FORMAT.md` (framing, hashing, limits, modes),
 `WEFT-CONTEXT-ROOT.md`, `WEFT-CAUSAL.md`.
 **Source of truth:** `spec/WEFT-AI-CODEC.md` in `infinityabundance/WeftFS`.
 
-WeftCodec already provides exact, deterministic framing for opaque bytes. AI
-workloads add *typed* payloads whose semantics are known: tensors, gradients,
-token sequences, KV-cache pages, and weight deltas. The goal of this design is
-not "compression wins"; it is **exactness plus a declared layout**, so two
-independent implementations can produce and verify the same object, and a
-consumer can refuse an object whose semantics it cannot reproduce.
-
-This document defines constraints and acceptance tests for future modes. It
-deliberately does not define JSON schemas as wire formats; all structured values
-are WCB.
-
 ---
 
-## 1. Non-negotiable constraints for every mode
+## 1. Non-negotiable constraints
 
-A future AI mode MUST satisfy all of the following before it may be called
-implemented:
+Every implemented mode satisfies:
 
 1. **Exactness.** Decode(Encode(x)) == x byte-for-byte, or the decoder fails
-   closed with a typed error. No lossy fallback, no approximate layout, no
-   "close enough" dtype conversion.
-2. **Self-description.** Every semantic decision (dtype, shape, layout, shard
-   index/count, endianness, padding, quantization parameters, vocabulary hash)
-   is carried in the object or bound by a dependency hash. It is never inferred
-   from the byte length or from implementation defaults.
-3. **Frozen identity.** The plaintext bytes fed to `H("weft/chunk/v1", ...)` are
-   exactly the declared canonical payload. Compression is an encoding choice; it
-   never changes `content_hash`.
-4. **Cross-language equality.** For deterministic modes, Rust and Go MUST emit
-   byte-identical frames on the same input and parameters, and decode each
-   other's output. For modes that use a third-party compressor, conformance is
-   decode-equivalence plus recorded encoder identity (the existing
-   `WEFTCODEC-FORMAT.md` §12 rule).
-5. **Bounded resources.** Every mode declares limits checked before allocation:
-   element count, byte length, shard count, token count, page count, patch op
-   count, depth, and total decoded bytes. Exceeding a limit is `LimitExceeded`.
-6. **Hash binding.** Any base tensor/weight/vocabulary a mode depends on is a
-   codec dependency with a hash and length; a mismatch is
-   `DependencyMismatch`, never a substitute base.
-7. **No semantic execution.** A codec decodes bytes. It does not evaluate a
-   model, apply gradients, or interpret tokenizer text. Semantic checks are
-   limited to declared metadata consistency.
-8. **Vectors or it did not happen.** A mode is implemented only when committed
-   vectors include valid cases and adversarial rejects, replayable by both
-   implementations. Until then the mode's status is `specified, not
-   implemented` and its numeric value is reserved (see §2.10).
+   closed with a typed error. No lossy fallback, no dtype conversion, no
+   rounding.
+2. **Self-description.** Every semantic decision (dtype, shape, layout, byte
+   order, element count, token count, vocabulary schema, token encoding) is
+   carried in the WCB descriptor. Nothing is inferred from byte length or
+   implementation defaults.
+3. **Frozen identity.** The frame's `decoded_len` is the declared payload byte
+   length and `content_hash` is `H("weft/chunk/v1", payload)`. The descriptor
+   additionally binds the payload under a mode-specific domain. Changing the
+   descriptor without changing the payload is `Corrupt`.
+4. **Cross-language equality.** Rust and Go emit byte-identical frames for the
+   same payload and descriptor, and decode each other's frames. The
+   cross-language gate asserts both directions and byte identity.
+5. **Bounded resources.** Element count, rank, token count, descriptor size,
+   payload size, WCB depth/items, and frame length are checked before
+   allocation. Exceeding a limit is `LimitExceeded`.
+6. **No semantic execution.** A codec decodes bytes. It does not evaluate a
+   model, tokenize text, dequantize, or interpret tensor values. `f16`/`bf16`
+   bit patterns, NaNs, and infinities are preserved exactly.
+7. **Vectors or it did not happen.** A mode is implemented only when committed
+   vectors include valid cases and adversarial rejects replayable by both
+   implementations.
+8. **Unknown or unimplemented descriptor values fail closed.** A decoder MUST
+   reject a layout, endianness, dtype, schema, or token encoding it does not
+   implement. It MUST NOT reinterpret the payload.
 
 ---
 
-## 2. Mode family: canonical tensor (design)
+## 2. Mode 6 — `TENSOR` (implemented)
 
-Reserved mode names are given numeric values only when implemented. Proposed
-values below are **not allocated** and MUST NOT be used on the wire.
-
-### 2.1 Tensor descriptor
+### 2.1 Frame shape
 
 ```
-{
-  "schema": "weft.tensor.v1",
-  "dtype":  "f16" | "bf16" | "f32" | "f64" | "i8" | "u8" | "i16" | "u16"
-          | "i32" | "u32" | "i64" | "u64" | "bool",
-  "shape":  [ u64, ... ],            # row-major logical extents, 0..=8 dims
-  "layout": "row" | "col" | "blocked" | "sharded" | "quantized",
-  "layout_params": { ... },          # layout-specific, see §2.2–§2.5
-  "byte_order": "le"                # only "le" in v1 design
-}
+domain        = 0 (payload)
+mode          = 6
+flags         = 0 (CHUNKED, SELF_CONTAINED, DICT_RAW, ORIGINAL_HASH all clear)
+dep_count     = 0
+chunk_count   = 0
+decoded_len   = payload byte length
+content_hash  = H("weft/chunk/v1", payload)
+body          = u32le(meta_len) || WCB(meta) || payload
 ```
 
-- Element type size is fixed by `dtype` (bool is one byte, value 0 or 1; any
-  other value is `Corrupt`).
-- `shape` length 0 is a scalar; product is checked for overflow.
-- The canonical payload is the concatenation of elements in the declared layout
-  order. Its length MUST equal `product(shape) * elem_size`, checked before
-  allocation.
-- Padding bytes, if any, are part of the declared layout and MUST be zero. A
-  non-zero padding byte is `Corrupt`.
-- NaN/Inf bit patterns are preserved exactly. No canonicalization of floating
-  point values is permitted.
+`meta_len` is the length of the WCB descriptor only. The decoder checks
+`4 + meta_len + decoded_len == body_len` with checked arithmetic; any mismatch
+is `Malformed`. `meta_len` MUST be at most the configured string/body limits.
 
-### 2.2 `row` and `col`
+The payload is the exact little-endian element bytes in **row-major** order.
+No normalization, endianness conversion, quantization, quantization metadata,
+padding, or layout conversion is performed.
 
-- `row`: last dimension contiguous.
-- `col`: first dimension contiguous.
-- `layout_params` MUST be an empty map in v1 design.
-- Testable constraint: transposing a 2-D tensor and encoding it as `col` yields
-  the same payload as encoding the transposed tensor as `row`.
+### 2.2 Descriptor
 
-### 2.3 `blocked`
+The WCB value is a map with exactly these keys and no others. Missing or extra
+keys are `Malformed`.
 
-```
-layout_params := { "block": [ u64, ... ] }   # one per dimension, ≥ 1
-```
+| Key | WCB type | Value |
+|---|---|---|
+| `schema` | text | exactly `weft.tensor.v1` |
+| `dtype` | text | one of `f16`, `bf16`, `f32`, `f64`, `i8`, `u8`, `i16`, `i32`, `i64` |
+| `shape` | array of u64 | logical extents, rank 0..=8 (rank 0 is a scalar) |
+| `layout` | text | exactly `row_major` in v1 |
+| `endianness` | text | exactly `little` in v1 |
+| `element_count` | u64 | product of `shape` (rank 0 ⇒ 1) |
+| `payload_bytes` | u64 | `element_count * element_size(dtype)` |
+| `payload_hash` | bytes(32) | `H("weft/tensor/payload/v1", payload)` |
 
-- Block extents are declared, not inferred. The iteration order is block index
-  in row-major order over blocks, then element index in row-major order within
-  the block.
-- Blocks at the boundary are **dense**: the payload contains the full block with
-  zero padding. Partial blocks are not packed.
-- The decode result after removing declared padding MUST equal the logical
-  tensor exactly.
+Element sizes are fixed:
 
-### 2.4 `sharded`
+| dtype | bytes | dtype | bytes |
+|---|---:|---|---:|
+| `f16` | 2 | `i8` | 1 |
+| `bf16` | 2 | `u8` | 1 |
+| `f32` | 4 | `i16` | 2 |
+| `f64` | 8 | `i32` | 4 |
+| | | `i64` | 8 |
 
-```
-layout_params := { "shard": u64, "shards": u64, "shard_axis": u64 }
-```
+`shape` with zero in any dimension gives `element_count = 0` and an empty
+payload. This is valid and exact. A rank-0 (`shape = []`) tensor has
+`element_count = 1`.
 
-- `shards ≥ 1`, `shard < shards`, `shard_axis < len(shape)`.
-- Each shard is a complete object with its own `content_hash`; the full tensor is
-  reconstructed only by explicit assembly, never implicitly by a decoder.
-- The shard's logical shape is `shape` with `shard_axis` divided by `shards`.
-  Divisibility is required; otherwise `Malformed`.
-- A set of shards is bound by a manifest whose identity includes `(shards,
-  shard_axis, full_shape, dtype, per-shard hashes)`. A missing shard is an
-  explicit error; no "use what is present".
+### 2.3 Validation order (normative for error classes)
 
-### 2.5 `quantized`
+A decoder MUST perform these checks in this order and return the stated class:
 
-```
-layout_params := {
-  "scheme": "affine",
-  "scale":  { "num": u64, "den": u64 },   # positive rational, exact
-  "zero_point": i64,
-  "storage": "i8" | "u8" | "i4"
-}
-```
+1. Body split/`meta_len`/`decoded_len` consistency → `Malformed`.
+2. WCB canonical decode → `NonCanonical`, `Malformed`, or `LimitExceeded`.
+3. Descriptor key set, `schema` → `Malformed`.
+4. `dtype` → `Malformed`; `layout` and `endianness` not implemented → `Malformed`.
+5. `shape` array of u64, rank > `max_tensor_rank` → `LimitExceeded`.
+6. Shape product checked (`u64` overflow) → `LimitExceeded`; product >
+   `max_tensor_elements` → `LimitExceeded`.
+7. `element_count != product` → `Malformed`.
+8. `payload_bytes != element_count * element_size` (checked) → `Malformed` /
+   `LimitExceeded` on overflow.
+9. `payload_bytes != actual payload length` → `Malformed`.
+10. `payload_hash` length ≠ 32 → `Malformed`; value mismatch → `Corrupt`.
 
-- Dequantization is a **semantic** operation and is out of codec scope. The codec
-  stores integer codes plus exact scale/zero-point metadata. It does not claim a
-  floating-point result.
-- `i4` packs two codes per byte, low nibble first. The declared element count
-  determines the expected size; a trailing half-byte MUST be zero.
-- `den != 0`, `scale` positive, zero-point range checked against storage.
-- Rounding is not a codec concern; encoders that produce codes are responsible
-  for their own exactness policy, which MUST be recorded outside the codec.
+### 2.4 Encoder rules
 
-### 2.6 Activation and gradient streams
+`EncodeTensor(payload, dtype, shape)` MUST:
 
-- A stream is an ordered sequence of tensor records with a declared count.
-- Each element carries its own descriptor and hash; the stream descriptor binds
-  the ordered list of element hashes.
-- Partial streams are explicit: a stream object states `expected_count` and
-  `present_count`; a reader MUST NOT treat a truncated stream as complete.
+- validate dtype, rank, shape product, and payload length exactly as above;
+- emit the canonical WCB descriptor (map keys sorted by encoded key bytes, as
+  WCB requires);
+- not accept a payload whose length is a non-multiple of the element size;
+- be deterministic: the same payload/dtype/shape yields identical frame bytes
+  in Rust and Go.
 
-### 2.7 Embedding / KV-cache pages
+### 2.5 CLI (maintainer tool, not a new wire format)
 
 ```
-{
-  "schema": "weft.kvpage.v1",
-  "layer": u64, "head": u64,
-  "position_start": u64, "position_count": u64,
-  "dtype": "f16" | "bf16" | "f32",
-  "layout": "row" | "col",
-  "shape": [ u64, ... ]
-}
+weftcodec encode --mode tensor --input PAYLOAD --output FRAME \
+    (--dtype f32 --shape 2,3 | --metadata META.json)
+
+META.json := {"dtype":"f32","shape":[2,3]}
 ```
 
-- A page is exact bytes with its position range bound in the descriptor.
-- Pages from different layers/heads/positions are distinct identities even if
-  their bytes are equal, because the descriptor is part of the canonical
-  payload binding. Deduplicating across them MUST NOT merge descriptors.
-- A KV cache set is reconstructed only through an explicit manifest listing
-  pages and their expected ranges.
-
-### 2.8 Token sequences and masks
-
-```
-{
-  "schema": "weft.tokens.v1",
-  "encoding": "u32" | "u16",
-  "count": u64,
-  "vocabulary": bytes(32) | null,   # hash of the exact vocabulary artifact
-  "mask": { "bits": u64, "bytes_hex": ... } | null
-}
-```
-
-- Token IDs are little-endian unsigned integers, densely packed.
-- `count` is elements, not bytes; the byte length is checked.
-- `vocabulary` binds the tokenizer/token table by content hash when present. A
-  lookup mismatch is `DependencyMismatch`, never a remap.
-- Mask bits are MSB-first within each byte (declared explicitly). Padding bits
-  beyond `count` MUST be zero.
-- The codec does not interpret token text. Detokenization is not a codec
-  operation.
-
-### 2.9 Weight deltas and semantic deltas
-
-- **Weight delta**: dependency 0 is the base tensor/weight object; the body is
-  the existing DELTA op stream (`COPY`/`INSERT`) over the base's exact bytes. The
-  descriptor declares base hash, dtype/shape/layout of both sides, and requires
-  equality of semantics metadata. Reconstruction verifies the base hash and the
-  resulting whole-object hash.
-- **Semantic delta** (structured): a WCB patch stream with ops
-  `{"op":"set","path":[...],"value":...}`, `{"op":"delete","path":[...]}`,
-  `{"op":"insert","path":[...],"index":u64,"value":...}` and a declared
-  `base_hash`. Paths are canonical text segments. Application is left-to-right;
-  a failed path is `Malformed`; the result must re-encode to the declared target
-  hash. Patches that are not canonical are rejected.
-- Neither delta mode may fall back to a full object silently. A base mismatch is
-  an error.
-
-### 2.10 Reserved numeric values
-
-No numeric `mode` value is allocated by this document. A future allocation MUST
-be recorded in `WEFTCODEC-FORMAT.md` §3 with a new minor/major version, and MUST
-ship vectors in the same change. Until then, encoders MUST NOT emit them and
-decoders MUST reject candidate values as `UnsupportedMode`.
+An omitted `--shape` means rank 0. `layout` and `endianness` may appear in
+`META.json` only as `row_major` and `little`; other values are rejected before
+encoding. `decode` returns the exact payload bytes. `--shape ""` is the same as
+omitting it.
 
 ---
 
-## 3. Acceptance tests a future implementation must pass
+## 3. Mode 7 — `TOKEN_SEQUENCE` (implemented)
 
-For each mode that moves from design to implemented:
+### 3.1 Frame shape
 
-1. **Round-trip exactness** on at least: scalar, 1-D, 2-D non-square, 4-D,
-   zero-element, maximum-dimension, and adversarial-shape cases.
-2. **Descriptor binding**: mutate dtype, shape, layout params, byte order, and
-   padding; each mutation is rejected or yields different bytes, never silently
-   reinterpreted.
-3. **Padding discipline**: non-zero padding rejected; zero padding round-trips.
-4. **Shard discipline**: missing/duplicate/out-of-range shards rejected; the
-   assembled result matches the monolithic encoding under an explicit assembly
-   oracle.
-5. **Quantized metadata**: bad scale/zero-point/storage rejected; `i4` nibble
-   order frozen by vector.
-6. **Token/mask bounds**: count/byte-length mismatch, padding bits set, and
-   vocabulary hash mismatch rejected.
-7. **Delta exactness**: base mismatch, op-stream truncation, path failure, and
-   re-encoded target mismatch rejected.
-8. **Cross-language**: Rust and Go produce identical bytes for deterministic
-   modes and decode each other's vectors; the reverse direction is tested, not
-   assumed.
-9. **Limits**: each declared bound is exceeded in at least one adversarial vector
-   and fails closed with `LimitExceeded` under the standard hard limits.
-10. **No semantic execution**: a vector whose metadata is internally consistent
-    but whose tensor values are nonsense still round-trips; the codec must not
-    "fix" values.
+Identical to §2.1, with `mode = 7` and the token descriptor/payload below.
+`decoded_len` is the **encoded token payload** length and `content_hash` is
+`H("weft/chunk/v1", payload)`.
+
+### 3.2 Descriptor
+
+| Key | WCB type | Value |
+|---|---|---|
+| `schema` | text | exactly `weft.tokens.v1` |
+| `vocab_schema` | text | non-empty vocabulary/tokenizer schema identifier |
+| `encoding` | text | exactly `u64-zigzag-delta-leb128` in v1 |
+| `token_count` | u64 | number of token ids |
+| `payload_bytes` | u64 | encoded payload byte length |
+| `payload_hash` | bytes(32) | `H("weft/tokens/payload/v1", payload)` |
+
+The codec does not interpret text, tokenizer tables, or vocabulary content.
+`vocab_schema` is a declaration carried for the consumer; no lookup or remap
+occurs. Binding an actual vocabulary artifact is a future dependency mode and
+is `specified, not implemented`.
+
+### 3.3 Payload encoding — exact definition
+
+Token ids are unsigned 64-bit integers. For a sequence `t[0..n)`:
+
+- `n = 0` ⇒ the payload is empty.
+- `t[0]` is emitted as the minimal unsigned LEB128 encoding of `t[0]`.
+- For `i > 0`, let
+  `delta = t[i] - t[i-1]` computed in **wrapping 64-bit unsigned arithmetic**
+  (equivalently, the two's-complement bit pattern reinterpreted as `i64`).
+  Emit `zigzag64(delta)` as minimal unsigned LEB128, where
+  `zigzag64(x) = ((x << 1) ^ (x >> 63))` on the 64-bit pattern.
+- Decoding reverses this exactly:
+  `t[0] = varint[0]`,
+  `t[i] = t[i-1] + wrap64(zigzag_decode(varint[i]))`.
+- Every varint MUST be minimal (§1 of `WEFTCODEC-FORMAT.md`). Non-minimal is
+  `NonCanonical`.
+- After decoding exactly `token_count` varints, the cursor MUST equal
+  `payload_bytes`; trailing bytes are `Malformed`, and a truncated payload is
+  `Malformed`.
+- `token_count` MUST be ≤ `max_tokens`. It also MUST be ≤ `payload_bytes`
+  because every token consumes at least one byte; this bounds allocation before
+  it happens.
+- The transform is a bijection over all `u64` ids, including `0` and
+  `u64::MAX`. Decrease and sign-crossing sequences round-trip exactly. Golden
+  vector `103_tokens_delta_boundaries` freezes the zero, `u64::MAX`, decrease,
+  and repeat boundaries.
+
+### 3.4 Validation order (normative for error classes)
+
+1. Body split/`meta_len`/`decoded_len` consistency → `Malformed`.
+2. WCB canonical decode → `NonCanonical`, `Malformed`, or `LimitExceeded`.
+3. Descriptor key set, `schema`, non-empty `vocab_schema` → `Malformed`.
+4. `encoding` not implemented → `Malformed`.
+5. `token_count > max_tokens` → `LimitExceeded`.
+6. `payload_bytes != actual payload length` → `Malformed`.
+7. `payload_hash` length ≠ 32 → `Malformed`; value mismatch → `Corrupt`.
+8. Payload decode: non-minimal varint → `NonCanonical`; truncation, count/byte
+   mismatch, trailing bytes → `Malformed`; count > payload bytes → `Malformed`.
+
+### 3.5 Attention masks — `specified, not implemented`
+
+A mask would need an exact bit order, byte length, and padding rule. It has no
+wire representation in v1 and MUST NOT be inferred from `token_count`. A future
+version may add it as an explicit field (for example `mask_bits` plus
+`mask_bytes`) with its own vectors. Until then, an object carrying a mask field
+is rejected as having an unknown descriptor key.
+
+### 3.6 CLI input format (maintainer tool, not a new wire format)
+
+```
+weftcodec encode --mode tokens --input TOKENS.json --output FRAME
+
+TOKENS.json := {"vocab_schema":"weft.test.vocab.v1","token_ids":[1,2,3]}
+```
+
+`token_ids` are JSON unsigned integers in `0..=u64::MAX`; JSON negative values,
+fractions, strings, or missing keys are rejected. The decoder returns the
+canonical encoded payload bytes; token-id extraction is an API operation
+(`decode_token_payload` / `DecodeTokenPayload`), not a wire mode.
 
 ---
 
-## 4. Explicit non-goals and non-claims
+## 4. Specified, not implemented (no wire values)
 
-- No training, inference, gradient computation, tokenization, or model
-  evaluation.
-- No lossy compression claim. Any lossy storage is a different product and MUST
-  NOT use `weft/chunk/v1` content identity for the lossy form.
-- No cross-vendor dtype equivalence. `bf16` and `f16` are distinct.
-- No automatic layout conversion. A consumer asks for the declared layout or
-  converts outside the codec.
-- No performance or compression numbers in this document. None have been
-  measured.
-- No claim that any mode here is implemented. The status is `specified, not
-  implemented` for all of §2.
+These designs have **no allocated mode value and no wire representation**.
+They are recorded so a future version cannot silently invent them by reusing a
+reserved value or an existing descriptor field.
+
+| Family | Status | Notes |
+|---|---|---|
+| Tensor `column_major` layout | specified, not implemented | Do not infer from shape; reject the descriptor value |
+| Tensor `blocked` layout | specified, not implemented | No block extents/padding wire form |
+| Tensor `sharded` layout | specified, not implemented | No shard index/count/axis wire form; no assembly semantics |
+| Tensor `quantized` storage | specified, not implemented | No scale/zero-point/i4 nibble wire form; dequantization is out of codec scope |
+| Activation/gradient streams | specified, not implemented | No stream descriptor or element-hash list wire form |
+| Embedding / KV-cache pages | specified, not implemented | No layer/head/position wire form |
+| Vocabulary artifact binding | specified, not implemented | `vocab_schema` is a declaration only; no dependency hash field |
+| Attention masks | specified, not implemented | No mask bits/bytes field |
+| Weight deltas / model deltas | specified, not implemented as a typed mode | The generic `DELTA`/`DICTIONARY` modes already carry exact byte deltas against a dependency; there is no dtype/shape-checked weight-delta descriptor |
+| Semantic/structured deltas | specified, not implemented | No canonical patch stream or base-hash field |
+
+A consumer MUST NOT persist an object in any of these forms under a WeftCodec
+mode. A future implementation requires a new `weftcodec-format` version, frozen
+vectors, and the same cross-language gates.
+
+---
+
+## 5. Limits (added by this document)
+
+| Limit | Default | Applies to |
+|---|---:|---|
+| `max_tensor_elements` | 4,294,967,296 | TENSOR shape product |
+| `max_tensor_rank` | 8 | TENSOR shape length |
+| `max_tokens` | 16,777,216 | TOKEN_SEQUENCE `token_count` |
+
+Existing limits also apply: `max_decoded_bytes` (payload), `max_frame_bytes`,
+`max_structured_depth`, `max_structured_items`, `max_string_bytes` (descriptor
+and vocab schema), and `max_dependency_*` (frames have no dependencies, so the
+header rules reject them first).
+
+---
+
+## 6. Acceptance tests (both implementations)
+
+The committed suites and vectors cover:
+
+1. **Round-trip exactness** for every dtype, scalar (rank 0), 1-D, 2-D
+   non-square, 4-D, 5-D, zero-element, and maximum-rank (8) shapes.
+2. **Determinism**: encoding a decoded payload reproduces identical frame bytes.
+3. **Descriptor binding**: wrong dtype, shape, layout, endianness, element
+   count, payload length, and payload hash are rejected with the classes above;
+   a payload bound under the other AI mode's domain is `Corrupt`.
+4. **Checked arithmetic**: `u64` shape overflow and element-count overflow are
+   `LimitExceeded`.
+5. **Token boundaries**: empty, one token, `0`, `u64::MAX`, increases,
+   decreases, repeats, sign crossings, and a 4,096-token mixed sequence.
+6. **Token rejects**: count mismatch, non-minimal varint, trailing bytes,
+   unsupported encoding, hash mismatch, and count limit.
+7. **Resource limits**: rank, element count, token count, and payload limits
+   fail closed with `LimitExceeded`.
+8. **Cross-language**: Rust→Go and Go→Rust decode equivalence plus
+   byte-identical frames for both modes (`WeftCodec-Go/hack/cross.sh`).
+
+Frozen vector names live in both codec repositories under
+`conformance/v1/codec/`. The Rust generator is
+`cargo run -- conformance --dir conformance/v1`; the Go suite replays the same
+files without modification.
+
+---
+
+## 7. Explicit non-goals and non-claims
+
+- No training, inference, gradient computation, tokenization, dequantization,
+  layout conversion, or model evaluation.
+- No lossy compression claim. Any lossy storage is a different product and must
+  not use `weft/chunk/v1` content identity for the lossy form.
+- No cross-vendor dtype equivalence. `bf16`, `f16`, and `f32` are distinct.
+- No claim that TENSOR or TOKEN_SEQUENCE compresses better than ZSTD or DELTA.
+  F7 measures them and reports losses.
+- No claim of production data or Meta data. The F7 corpus is synthetic and its
+  manifest records that.

@@ -41,6 +41,10 @@ pub const DOMAIN_CONTEXT_ROOT: &str = "weft/context-root/v1";
 pub const DOMAIN_CAUSAL: &str = "weft/causal/v1";
 /// Capability scope record (WEFT-CAPABILITIES §1.1).
 pub const DOMAIN_CAPABILITY: &str = "weft/capability/v1";
+/// Tensor element payload binding (WEFT-AI-CODEC §2).
+pub const DOMAIN_TENSOR_PAYLOAD: &str = "weft/tensor/payload/v1";
+/// Token-sequence payload binding (WEFT-AI-CODEC §3).
+pub const DOMAIN_TOKENS_PAYLOAD: &str = "weft/tokens/payload/v1";
 
 /// A 32-byte Weft digest.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

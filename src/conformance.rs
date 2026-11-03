@@ -18,7 +18,10 @@ use crate::frame::{
     encode_frame, Dependency, Frame, FrameParts, Mode, DEP_DOMAIN_DICTIONARY, DEP_DOMAIN_PAYLOAD,
     DOMAIN_PAYLOAD, DOMAIN_STRUCTURED, FORMAT_MAJOR, FORMAT_MINOR,
 };
-use crate::hash::{hash_domain, Hash32, DOMAIN_CHUNK, DOMAIN_SELECTOR};
+use crate::hash::{
+    hash_domain, Hash32, DOMAIN_CHUNK, DOMAIN_SELECTOR, DOMAIN_TENSOR_PAYLOAD,
+    DOMAIN_TOKENS_PAYLOAD,
+};
 use crate::limits::Limits;
 use crate::modes;
 use crate::selector;
@@ -159,6 +162,72 @@ fn refix_header_and_trailer(frame: &mut [u8]) {
     let crc = crc32c::crc32c(&crc_input);
     frame[72..76].copy_from_slice(&crc.to_le_bytes());
     refix_trailer(frame);
+}
+
+fn ai_body(meta: &Value, payload: &[u8], limits: &Limits) -> Result<Vec<u8>> {
+    let meta_bytes = wcb::encode(meta, limits)?;
+    let meta_len = u32::try_from(meta_bytes.len())
+        .map_err(|_| Error::limit_exceeded("AI metadata does not fit u32"))?;
+    let mut body = Vec::with_capacity(4 + meta_bytes.len() + payload.len());
+    body.extend_from_slice(&meta_len.to_le_bytes());
+    body.extend_from_slice(&meta_bytes);
+    body.extend_from_slice(payload);
+    Ok(body)
+}
+
+fn ai_frame(mode: Mode, meta: &Value, payload: &[u8], limits: &Limits) -> Result<Vec<u8>> {
+    let body = ai_body(meta, payload, limits)?;
+    build_frame(
+        mode,
+        DOMAIN_PAYLOAD,
+        0,
+        payload.len() as u64,
+        hash_domain(DOMAIN_CHUNK, payload),
+        &[],
+        &body,
+        limits,
+    )
+}
+
+fn tensor_meta_value(
+    dtype: &str,
+    shape: &[u64],
+    count: u64,
+    payload_bytes: u64,
+    payload_hash: &[u8],
+    layout: &str,
+    endianness: &str,
+) -> Value {
+    Value::map([
+        ("schema", Value::Str("weft.tensor.v1".to_owned())),
+        ("dtype", Value::Str(dtype.to_owned())),
+        (
+            "shape",
+            Value::Array(shape.iter().map(|d| Value::U64(*d)).collect()),
+        ),
+        ("layout", Value::Str(layout.to_owned())),
+        ("endianness", Value::Str(endianness.to_owned())),
+        ("element_count", Value::U64(count)),
+        ("payload_bytes", Value::U64(payload_bytes)),
+        ("payload_hash", Value::Bytes(payload_hash.to_vec())),
+    ])
+}
+
+fn token_meta_value(
+    vocab_schema: &str,
+    encoding: &str,
+    count: u64,
+    payload_bytes: u64,
+    payload_hash: &[u8],
+) -> Value {
+    Value::map([
+        ("schema", Value::Str("weft.tokens.v1".to_owned())),
+        ("vocab_schema", Value::Str(vocab_schema.to_owned())),
+        ("encoding", Value::Str(encoding.to_owned())),
+        ("token_count", Value::U64(count)),
+        ("payload_bytes", Value::U64(payload_bytes)),
+        ("payload_hash", Value::Bytes(payload_hash.to_vec())),
+    ])
 }
 
 fn build_frame(
@@ -355,11 +424,11 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     );
 
     let mut unknown_mode = good.clone();
-    unknown_mode[7] = 6;
+    unknown_mode[7] = 8;
     refix_header_and_trailer(&mut unknown_mode);
     push_error(
         &mut vectors,
-        &name("unknown_mode"),
+        &name("unknown_mode_reserved8"),
         "raw",
         &unknown_mode,
         &[],
@@ -589,6 +658,306 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
         ErrorClass::LimitExceeded,
         Some(json!({ "max_decoded_bytes": 1024 })),
     );
+
+    // --- AI-mode error vectors --------------------------------------------
+    let tensor_payload = vec![1u8, 2, 3, 4, 5, 6];
+    let tensor_hash = hash_domain(DOMAIN_TENSOR_PAYLOAD, &tensor_payload);
+
+    // Shape product != element_count.
+    let meta = tensor_meta_value(
+        "u8",
+        &[2, 3],
+        5,
+        6,
+        tensor_hash.as_bytes(),
+        "row_major",
+        "little",
+    );
+    let frame = ai_frame(Mode::Tensor, &meta, &tensor_payload, limits)?;
+    push_error(
+        &mut vectors,
+        "120_tensor_shape_mismatch",
+        "tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    // payload_bytes disagrees with element_count * element_size.
+    let meta = tensor_meta_value(
+        "u8",
+        &[2, 3],
+        6,
+        7,
+        tensor_hash.as_bytes(),
+        "row_major",
+        "little",
+    );
+    let frame = ai_frame(Mode::Tensor, &meta, &tensor_payload, limits)?;
+    push_error(
+        &mut vectors,
+        "121_tensor_payload_bytes_mismatch",
+        "tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    // Declared payload hash does not bind the payload.
+    let meta = tensor_meta_value("u8", &[2, 3], 6, 6, &[0u8; 32], "row_major", "little");
+    let frame = ai_frame(Mode::Tensor, &meta, &tensor_payload, limits)?;
+    push_error(
+        &mut vectors,
+        "122_tensor_payload_hash_mismatch",
+        "tensor",
+        &frame,
+        &[],
+        ErrorClass::Corrupt,
+        None,
+    );
+
+    // Specified-but-not-implemented layout and dtype.
+    let meta = tensor_meta_value(
+        "u8",
+        &[6],
+        6,
+        6,
+        tensor_hash.as_bytes(),
+        "column_major",
+        "little",
+    );
+    let frame = ai_frame(Mode::Tensor, &meta, &tensor_payload, limits)?;
+    push_error(
+        &mut vectors,
+        "123_tensor_layout_not_implemented",
+        "tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+    let meta = tensor_meta_value(
+        "q4",
+        &[1],
+        1,
+        1,
+        tensor_hash.as_bytes(),
+        "row_major",
+        "little",
+    );
+    let frame = ai_frame(Mode::Tensor, &meta, &tensor_payload[..1], limits)?;
+    push_error(
+        &mut vectors,
+        "124_tensor_unknown_dtype",
+        "tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    // Checked shape arithmetic and resource limits.
+    let empty_hash = hash_domain(DOMAIN_TENSOR_PAYLOAD, b"");
+    let meta = tensor_meta_value(
+        "u8",
+        &[u64::MAX, 2],
+        0,
+        0,
+        empty_hash.as_bytes(),
+        "row_major",
+        "little",
+    );
+    let frame = ai_frame(Mode::Tensor, &meta, b"", limits)?;
+    push_error(
+        &mut vectors,
+        "125_tensor_shape_overflow",
+        "tensor",
+        &frame,
+        &[],
+        ErrorClass::LimitExceeded,
+        None,
+    );
+    let meta = tensor_meta_value(
+        "u8",
+        &[2, 3],
+        6,
+        6,
+        tensor_hash.as_bytes(),
+        "row_major",
+        "little",
+    );
+    let frame = ai_frame(Mode::Tensor, &meta, &tensor_payload, limits)?;
+    push_error(
+        &mut vectors,
+        "126_tensor_element_limit",
+        "tensor",
+        &frame,
+        &[],
+        ErrorClass::LimitExceeded,
+        Some(json!({ "max_tensor_elements": 5 })),
+    );
+    let one = vec![0u8; 1];
+    let one_hash = hash_domain(DOMAIN_TENSOR_PAYLOAD, &one);
+    let meta = tensor_meta_value(
+        "u8",
+        &[1, 1, 1, 1, 1, 1, 1, 1, 1],
+        1,
+        1,
+        one_hash.as_bytes(),
+        "row_major",
+        "little",
+    );
+    let frame = ai_frame(Mode::Tensor, &meta, &one, limits)?;
+    push_error(
+        &mut vectors,
+        "127_tensor_rank_limit",
+        "tensor",
+        &frame,
+        &[],
+        ErrorClass::LimitExceeded,
+        Some(json!({ "max_tensor_rank": 8 })),
+    );
+
+    // Token count, encoding, canonicality, and hash errors.
+    let token_ids = vec![1u64, 2, 3];
+    let token_payload = modes::encode_token_payload(&token_ids, limits)?;
+    let token_hash = hash_domain(DOMAIN_TOKENS_PAYLOAD, &token_payload);
+    let meta = token_meta_value(
+        "weft.test.vocab.v1",
+        modes::TOKEN_ENCODING,
+        2,
+        token_payload.len() as u64,
+        token_hash.as_bytes(),
+    );
+    let frame = ai_frame(Mode::TokenSequence, &meta, &token_payload, limits)?;
+    push_error(
+        &mut vectors,
+        "130_tokens_count_mismatch",
+        "tokens",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+    let meta = token_meta_value(
+        "weft.test.vocab.v1",
+        "u32-fixed-little",
+        3,
+        token_payload.len() as u64,
+        token_hash.as_bytes(),
+    );
+    let frame = ai_frame(Mode::TokenSequence, &meta, &token_payload, limits)?;
+    push_error(
+        &mut vectors,
+        "131_tokens_encoding_not_implemented",
+        "tokens",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+    let non_minimal = vec![0x81u8, 0x00];
+    let nm_hash = hash_domain(DOMAIN_TOKENS_PAYLOAD, &non_minimal);
+    let meta = token_meta_value(
+        "weft.test.vocab.v1",
+        modes::TOKEN_ENCODING,
+        1,
+        2,
+        nm_hash.as_bytes(),
+    );
+    let frame = ai_frame(Mode::TokenSequence, &meta, &non_minimal, limits)?;
+    push_error(
+        &mut vectors,
+        "132_tokens_non_minimal_varint",
+        "tokens",
+        &frame,
+        &[],
+        ErrorClass::NonCanonical,
+        None,
+    );
+    let trailing = vec![0x01u8, 0x02];
+    let tr_hash = hash_domain(DOMAIN_TOKENS_PAYLOAD, &trailing);
+    let meta = token_meta_value(
+        "weft.test.vocab.v1",
+        modes::TOKEN_ENCODING,
+        1,
+        2,
+        tr_hash.as_bytes(),
+    );
+    let frame = ai_frame(Mode::TokenSequence, &meta, &trailing, limits)?;
+    push_error(
+        &mut vectors,
+        "133_tokens_trailing_bytes",
+        "tokens",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+    let meta = token_meta_value(
+        "weft.test.vocab.v1",
+        modes::TOKEN_ENCODING,
+        3,
+        token_payload.len() as u64,
+        &[0u8; 32],
+    );
+    let frame = ai_frame(Mode::TokenSequence, &meta, &token_payload, limits)?;
+    push_error(
+        &mut vectors,
+        "134_tokens_payload_hash_mismatch",
+        "tokens",
+        &frame,
+        &[],
+        ErrorClass::Corrupt,
+        None,
+    );
+    let meta = token_meta_value(
+        "weft.test.vocab.v1",
+        modes::TOKEN_ENCODING,
+        3,
+        token_payload.len() as u64,
+        token_hash.as_bytes(),
+    );
+    let frame = ai_frame(Mode::TokenSequence, &meta, &token_payload, limits)?;
+    push_error(
+        &mut vectors,
+        "135_tokens_count_limit",
+        "tokens",
+        &frame,
+        &[],
+        ErrorClass::LimitExceeded,
+        Some(json!({ "max_tokens": 2 })),
+    );
+
+    // --- Newly allocated AI modes (WEFT-AI-CODEC) -------------------------
+    let tensor_f32 = pattern(24, 0x1357_9bdf_2468_ace0);
+    let frame = modes::encode_tensor(&tensor_f32, modes::TensorDtype::F32, &[2, 3], limits)?;
+    push_ok(&mut vectors, "100_tensor_f32_2x3", &frame, &tensor_f32, &[])?;
+    let tensor_scalar = vec![0x00u8, 0x3cu8]; // f16 1.0, little-endian
+    let frame = modes::encode_tensor(&tensor_scalar, modes::TensorDtype::F16, &[], limits)?;
+    push_ok(
+        &mut vectors,
+        "101_tensor_f16_scalar",
+        &frame,
+        &tensor_scalar,
+        &[],
+    )?;
+    let frame = modes::encode_tensor(b"", modes::TensorDtype::U8, &[0, 4], limits)?;
+    push_ok(&mut vectors, "102_tensor_u8_zero_element", &frame, b"", &[])?;
+    let tokens = vec![0u64, 1, 0, u64::MAX, u64::MAX - 1, 42, 42, 41];
+    let frame = modes::encode_token_sequence(&tokens, "weft.test.vocab.v1", limits)?;
+    let payload = modes::encode_token_payload(&tokens, limits)?;
+    push_ok(
+        &mut vectors,
+        "103_tokens_delta_boundaries",
+        &frame,
+        &payload,
+        &[],
+    )?;
+    let frame = modes::encode_token_sequence(&[], "weft.test.vocab.v1", limits)?;
+    push_ok(&mut vectors, "104_tokens_empty", &frame, b"", &[])?;
 
     for vector in &vectors {
         let file_name = format!("{}.json", vector["name"].as_str().unwrap_or("vector"));

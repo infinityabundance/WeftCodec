@@ -175,3 +175,31 @@ frozen. `causal_exact` uses the same `weft/version/v1` domain over an extended
 record; it is an opt-in identity mode, not a reinterpretation of existing bytes.
 An implementation MUST NOT silently downgrade a `causal_exact` artifact to
 `bytes_only`, and MUST NOT present a `bytes_only` identity as if it were causal.
+
+---
+
+## 10. AI codec mode allocation (additive, v1)
+
+`WEFT-AI-CODEC.md` v1.1.0 allocates two previously reserved payload modes:
+
+| Value | Name | Body |
+|---:|---|---|
+| 6 | `TENSOR` | `u32le(meta_len) || WCB(weft.tensor.v1) || payload` |
+| 7 | `TOKEN_SEQUENCE` | `u32le(meta_len) || WCB(weft.tokens.v1) || payload` |
+
+This is an additive extension of the `weftcodec-format 1.0` mode space, not a
+change to existing modes. Rules:
+
+- A reader that does not implement these modes MUST reject them as
+  `UnsupportedMode`. It MUST NOT treat the payload as opaque bytes.
+- Mode values `8..=127` stay reserved and `128..=255` stay experimental.
+- The new hash domains `weft/tensor/payload/v1` and
+  `weft/tokens/payload/v1` are additive; existing domains are unchanged.
+- Neither mode changes RAW, ZSTD, REFERENCE, DELTA, DICTIONARY, STRUCTURED, the
+  header, the tables, WCB, or selector bytes.
+- Historical vector `017_unknown_mode` asserted that value 6 was unknown. It is
+  retained byte-for-byte and marked `superseded_by`
+  `017_unknown_mode_reserved8`; both replay suites skip superseded vectors.
+  The authoritative reserved-value reject is now mode 8.
+- Because these modes are deterministic, cross-language conformance requires
+  byte-identical frames **and** decode equivalence, unlike ZSTD/DICTIONARY.

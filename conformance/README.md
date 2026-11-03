@@ -57,7 +57,25 @@ the bytes a resolver should return for the listed hash; for deliberately wrong
 hash/length vectors the listed hash/bytes are the wrong values supplied to the
 resolver.
 
-`mode` names are `raw`, `zstd`, `reference`, `delta`, `dictionary`, `structured`.
+`mode` names are `raw`, `zstd`, `reference`, `delta`, `dictionary`,
+`structured`, `tensor`, and `tokens`.
+
+### AI modes (`tensor`, `tokens`)
+
+WEFT-AI-CODEC v1.1.0 allocates mode 6 `TENSOR` and mode 7 `TOKEN_SEQUENCE`.
+Their bodies are `u32le(meta_len) || WCB(meta) || payload`; the frame
+`decoded_len` and `content_hash` cover the payload, and the WCB descriptor binds
+it under `weft/tensor/payload/v1` or `weft/tokens/payload/v1`.
+
+Valid vectors: `100_tensor_f32_2x3`, `101_tensor_f16_scalar`,
+`102_tensor_u8_zero_element`, `103_tokens_delta_boundaries`,
+`104_tokens_empty`. Reject vectors `120`–`135` cover shape/payload/hash/layout/
+dtype/overflow/rank/encoding/canonicality/count limits.
+
+`017_unknown_mode` historically asserted that mode value 6 was unknown. It is
+retained byte-for-byte with `"superseded_by":
+"017_unknown_mode_reserved8"`; replay suites skip superseded vectors. The
+current reserved-value vector is `017_unknown_mode_reserved8` (mode 8).
 
 ### `structured/*.json`
 

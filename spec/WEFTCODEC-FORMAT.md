@@ -47,6 +47,8 @@ encoders may appear on the wire.
 | Object version record | `weft/version/v1` |
 | Object identity seed | `weft/object/v1` |
 | Directory entry identity | `weft/entry/v1` |
+| Tensor element payload binding | `weft/tensor/payload/v1` |
+| Token-sequence payload binding | `weft/tokens/payload/v1` |
 
 A digest is content identity only. It is not a capability, signature, or
 authorization decision.
@@ -137,7 +139,9 @@ A reader MUST reject:
 | 3 | `DELTA` | body is a copy/insert op stream over dependency 0 |
 | 4 | `DICTIONARY` | body is one zstd frame using dependency 0 as raw dictionary |
 | 5 | `STRUCTURED` | body is canonical WCB (see §6); domain MUST be 1 |
-| 6..127 | — | reserved; `UnsupportedMode` |
+| 6 | `TENSOR` | body is `u32le(meta_len) || WCB(meta) || element payload`; WEFT-AI-CODEC §2 |
+| 7 | `TOKEN_SEQUENCE` | body is `u32le(meta_len) || WCB(meta) || token payload`; WEFT-AI-CODEC §3 |
+| 8..127 | — | reserved; `UnsupportedMode` |
 | 128..255 | — | experimental; MUST be rejected for persistence |
 
 Global mode rules:
@@ -154,6 +158,16 @@ Global mode rules:
   body decodes with the dependency bytes as a raw content dictionary.
 - `STRUCTURED`: `domain == 1`, `mode == 5`, `body_len == decoded_len`; body is
   canonical WCB; `dep_count` MUST be `0` in v1; `chunk_count` MUST be `0`.
+- `TENSOR` (6) and `TOKEN_SEQUENCE` (7): `domain == 0`, `dep_count == 0`,
+  `chunk_count == 0`, `flags.DICT_RAW` clear, `body_len >= 4`. The frame's
+  `decoded_len` is the payload length and `content_hash` is
+  `H("weft/chunk/v1", payload)`. The body is exactly
+  `u32le(meta_len) || WCB(meta) || payload`, where the WCB descriptor is
+  canonical and binds the payload with the mode-specific domain from §1.1.
+  Full descriptor validation, dtype tables, and token delta encoding are
+  normative in `WEFT-AI-CODEC.md` §2–§3. A decoder that does not implement
+  these modes MUST reject them as `UnsupportedMode`; it MUST NOT treat the
+  payload as opaque bytes.
 
 Zstd decoding limits: window log ≤ 27, decoded output ≤ `decoded_len`, and
 `decoded_len` MUST be stated before decompression. Implementations MUST fail
@@ -334,6 +348,9 @@ a snapshot, or evidence that any object matches.
 | `max_structured_items` | 1,000,000 |
 | `max_string_bytes` | 256 MiB |
 | `max_delta_ops` | 16,777,216 |
+| `max_tensor_elements` | 4,294,967,296 |
+| `max_tensor_rank` | 8 |
+| `max_tokens` | 16,777,216 |
 
 A decoder MUST enforce every applicable limit before allocating. A frame that
 would exceed a limit is `LimitExceeded`, even if it is otherwise well formed.
@@ -374,12 +391,24 @@ asymmetry, not a hidden fallback.
 `STRUCTURED` canonical bytes MUST be identical across languages for the same
 typed value. Golden vectors freeze them.
 
+`TENSOR` and `TOKEN_SEQUENCE` are deterministic: canonical WCB descriptors and
+minimal-LEB128 payloads mean both implementations MUST emit byte-identical
+frames for the same payload and descriptor, and MUST decode each other's
+frames. Their `content_hash` is over the declared payload bytes, not over the
+compressed or descriptor bytes.
+
 ---
 
 ## 13. Compatibility policy
 
 - Adding an optional field requires a minor version and a default that older
   readers already implement; otherwise it requires a major version.
+- Allocating a previously reserved mode value is an additive extension that
+  old readers must reject as `UnsupportedMode` (fail closed). `TENSOR` (6) and
+  `TOKEN_SEQUENCE` (7) were allocated this way; `WEFT-AI-CODEC.md` is
+  normative for their bodies. Historical vector `017_unknown_mode` asserted
+  that value 6 was unknown; it is retained byte-for-byte and marked
+  `superseded_by` the new reserved-value vector `017_unknown_mode_reserved8`.
 - Unknown critical flags/features/modes fail closed.
 - Frozen v1 vectors are append-only; they are never regenerated to hide a
   change.
