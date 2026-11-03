@@ -371,3 +371,55 @@ comparisons across 3 repos)`.
   `PROVENANCE.json`. They are copied byte-identically into WeftCodec-Go and
   replayed by `bench/scripts/run_decoder_bomb_court.sh`; expected classes are
   identical in both implementations. This is a curated corpus, not fuzzing.
+
+---
+
+## F6 — TENSOR (6) and TOKEN_SEQUENCE (7), 2026-11-03
+
+The earlier statement that AI modes were "specified, not implemented" is
+historical. F6 allocates exactly two modes, both implemented and frozen:
+
+- `TENSOR` (6): `u32le(meta_len) || WCB(weft.tensor.v1) || payload`; dtype
+  `f16|bf16|f32|f64|i8|u8|i16|i32|i64`; row-major little-endian only; checked
+  shape product, element count, payload bytes, and `weft/tensor/payload/v1`
+  hash binding.
+- `TOKEN_SEQUENCE` (7): `u32le(meta_len) || WCB(weft.tokens.v1) || payload`;
+  first token absolute minimal LEB128, later ids wrapping 64-bit zigzag deltas
+  in minimal LEB128; exact count/trailing checks; `weft/tokens/payload/v1`
+  binding.
+
+Every other brainstormed layout/stream/delta mode is `specified, not
+implemented` with no allocated wire value (`spec/WEFT-AI-CODEC.md` §4).
+
+Verification in the Rust court:
+
+```
+$ scripts/docker-court.sh rust "cd WeftCodec && cargo test --all-targets --quiet"
+# 110 tests pass, 0 failed (includes tests/ai_modes.rs: 9 tests)
+$ scripts/docker-court.sh rust "cd WeftCodec && cargo run --quiet -- conformance --dir conformance/v1"
+# 49 codec vectors, including 100-104 valid and 120-135 rejects
+```
+
+Cross-language gate (`WeftCodec-Go/hack/cross.sh`):
+
+```
+PASS rust->go tensor / tokens
+PASS go->rust tensor / tokens
+PASS identical tensor / tokens
+```
+
+Historical `017_unknown_mode` asserted mode 6 was reserved. It is retained
+byte-for-byte with `superseded_by: 017_unknown_mode_reserved8`; the parser now
+rejects mode 8 as `UnsupportedMode`. Both replay suites skip superseded
+vectors.
+
+CLI additions:
+
+```
+weftcodec encode --mode tensor --input PAYLOAD --dtype f32 --shape 2,3
+weftcodec encode --mode tensor --input PAYLOAD --metadata META.json
+weftcodec encode --mode tokens --input TOKENS.json
+```
+
+Limits added: `max_tensor_elements` (2^32), `max_tensor_rank` (8), `max_tokens`
+(2^24).
