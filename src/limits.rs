@@ -38,6 +38,12 @@ pub const DEFAULT_MAX_FIELD_SEGMENTS: u64 = 16;
 pub const DEFAULT_MAX_SELECTOR_OPERANDS: u64 = 4_096;
 /// Default maximum archive entries (1,000,000).
 pub const DEFAULT_MAX_ARCHIVE_ENTRIES: u64 = 1_000_000;
+/// Default maximum causal closure entries (4,096).
+pub const DEFAULT_MAX_CAUSAL_ENTRIES: u64 = 4_096;
+/// Default maximum capability grant-list entries (4,096).
+pub const DEFAULT_MAX_CAPABILITY_ENTRIES: u64 = 4_096;
+/// Default maximum `weft://` URI length (64 KiB).
+pub const DEFAULT_MAX_URI_BYTES: u64 = 64 << 10;
 
 /// Resource limits for encoding and decoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +69,12 @@ pub struct Limits {
     pub max_selector_operands: u64,
     /// Archive container entry count (WEFTCODEC-FORMAT §7).
     pub max_archive_entries: u64,
+    /// Causal closure entries (WEFT-CAUSAL §5).
+    pub max_causal_entries: u64,
+    /// Capability grant-list entries (WEFT-CAPABILITIES §1).
+    pub max_capability_entries: u64,
+    /// `weft://` URI length (WEFT-CONTEXT-ROOT §3.3).
+    pub max_uri_bytes: u64,
 }
 
 impl Default for Limits {
@@ -84,6 +96,9 @@ impl Default for Limits {
             max_field_segments: DEFAULT_MAX_FIELD_SEGMENTS,
             max_selector_operands: DEFAULT_MAX_SELECTOR_OPERANDS,
             max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
+            max_causal_entries: DEFAULT_MAX_CAUSAL_ENTRIES,
+            max_capability_entries: DEFAULT_MAX_CAPABILITY_ENTRIES,
+            max_uri_bytes: DEFAULT_MAX_URI_BYTES,
         }
     }
 }
@@ -156,6 +171,18 @@ impl Limits {
     }
     pub fn with_max_archive_entries(mut self, value: u64) -> Self {
         self.max_archive_entries = value;
+        self
+    }
+    pub fn with_max_causal_entries(mut self, value: u64) -> Self {
+        self.max_causal_entries = value;
+        self
+    }
+    pub fn with_max_capability_entries(mut self, value: u64) -> Self {
+        self.max_capability_entries = value;
+        self
+    }
+    pub fn with_max_uri_bytes(mut self, value: u64) -> Self {
+        self.max_uri_bytes = value;
         self
     }
     /// Alias for [`Limits::with_max_string_bytes`] used by some callers.

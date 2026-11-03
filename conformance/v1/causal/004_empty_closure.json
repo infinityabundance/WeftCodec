@@ -1,0 +1,9 @@
+{
+  "canonical_hex": "08030506736368656d61050e776566742e63617573616c2e76310507636c6f7375726507000507706172656e74730700",
+  "closure": [],
+  "closure_hash": "fe2d8422572489a70dc533dffa9a891fd36d99f496f16aab85254fff147ab7cc",
+  "name": "004_empty_closure",
+  "parents": [],
+  "parents_input": [],
+  "schema": "weft.causal.v1"
+}

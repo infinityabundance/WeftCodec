@@ -82,6 +82,47 @@ WeftQL source, canonical WCB bytes, and selector id.
 }
 ```
 
+### `context/*.json`
+
+Canonical Context Root records (`weft.context-root.v1`), their identity, the
+authoritative URI, and the descriptor spelling. Invalid vectors use
+`record_hex` plus `expect_error`.
+
+```json
+{
+  "name": "001_root_true",
+  "namespace": "default",
+  "selector_source": "select true",
+  "selector_canonical_hex": "<hex>",
+  "selector_id": "<64 hex>",
+  "snapshot": "<64 hex>",
+  "resolver": "weft-resolver-v1",
+  "causal": [],
+  "capability_hash": null,
+  "budget": null,
+  "ordering": "selector_then_object_id",
+  "canonical_hex": "<hex>",
+  "context_root_id": "<64 hex>",
+  "uri": "weft://default/c/<64 hex>",
+  "descriptor": "weft://default/c/select%20true@<64 hex>"
+}
+```
+
+### `causal/*.json`
+
+Canonical causal closure records (`weft.causal.v1`) and their closure hash.
+Invalid vectors use `record_hex` plus `expect_error`.
+
+```json
+{
+  "name": "001_single_parent",
+  "parents": ["<64 hex>"],
+  "closure": ["<64 hex>"],
+  "canonical_hex": "<hex>",
+  "closure_hash": "<64 hex>"
+}
+```
+
 ## Notes
 
 - WCB map ordering is by **full encoded key bytes** (tag + varint length +

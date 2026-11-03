@@ -10,6 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
 use weftcodec::archive;
+use weftcodec::context::{self, Budget, ContextRoot, ContextUri, DEFAULT_RESOLVER};
 use weftcodec::dependency::{DirectoryResolver, MapResolver, Resolver};
 use weftcodec::error::{Error, ErrorClass, Result};
 use weftcodec::frame::{Frame, Mode};
@@ -49,6 +50,16 @@ enum Command {
     Selector {
         #[command(subcommand)]
         command: SelectorCommand,
+    },
+    /// Context Root identity and `weft://` addressing.
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
+    /// Causal closure identity.
+    Causal {
+        #[command(subcommand)]
+        command: CausalCommand,
     },
     /// Conformance vector generation (maintainer tool).
     Conformance(ConformanceArgs),
@@ -148,6 +159,70 @@ enum SelectorCommand {
 }
 
 #[derive(Args, Debug)]
+struct ContextArgs {
+    /// Selector source file, or `-` for stdin.
+    #[arg(long)]
+    selector: String,
+    /// Namespace for the selector and the Context Root.
+    #[arg(long)]
+    namespace: String,
+    /// Pinned snapshot commit hash (64 lowercase hex digits).
+    #[arg(long)]
+    snapshot: String,
+    /// Comma-separated causal closure entries (64 hex digits each).
+    #[arg(long)]
+    causal: Option<String>,
+    /// Resolver/policy version.
+    #[arg(long, default_value = DEFAULT_RESOLVER)]
+    resolver: String,
+    /// Optional capability scope hash (64 hex digits).
+    #[arg(long)]
+    capability_hash: Option<String>,
+    /// Resource budget, e.g. `max_results=10,max_bytes=1000,max_depth=3`.
+    #[arg(long)]
+    budget: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct ContextUriArgs {
+    #[command(flatten)]
+    base: ContextArgs,
+    /// Emit the descriptive URI instead of the authoritative URI.
+    #[arg(long)]
+    descriptor: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum ContextCommand {
+    /// Print the ContextRootId (hex, or JSON).
+    Id(ContextArgs),
+    /// Print the canonical `weft://` address.
+    Uri(ContextUriArgs),
+    /// Parse an authoritative or descriptive `weft://` URI.
+    Parse {
+        /// The URI to parse.
+        uri: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CausalCommand {
+    /// Print the causal closure record hash (hex, or JSON).
+    Id {
+        /// Comma-separated explicit parents (64 hex digits each).
+        #[arg(long)]
+        parents: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Args, Debug)]
 struct ConformanceArgs {
     /// Directory to write vectors into (e.g. conformance/v1).
     #[arg(long)]
@@ -177,6 +252,14 @@ fn run(cli: Cli) -> Result<()> {
         Command::Selector { command } => match command {
             SelectorCommand::Id { input, json } => selector_id(&input, json),
             SelectorCommand::Canonicalize { input } => selector_canonicalize(&input),
+        },
+        Command::Context { command } => match command {
+            ContextCommand::Id(args) => context_id(&args),
+            ContextCommand::Uri(args) => context_uri(&args),
+            ContextCommand::Parse { uri, json } => context_parse(&uri, json),
+        },
+        Command::Causal { command } => match command {
+            CausalCommand::Id { parents, json } => causal_id(&parents, json),
         },
         Command::Conformance(args) => {
             let limits = Limits::default();
@@ -491,6 +574,197 @@ fn selector_canonicalize(input: &str) -> Result<()> {
     let selector = selector::parse_with(source, selector::DEFAULT_NAMESPACE, &limits)?;
     let canonical = selector.canonical_bytes_with_limits(&limits)?;
     println!("{}", hex::encode(canonical));
+    Ok(())
+}
+
+fn hex_list(text: &str, what: &str) -> Result<Vec<weftcodec::Hash32>> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut hashes = Vec::new();
+    for entry in text.split(',') {
+        if entry.is_empty() {
+            return Err(Error::parse(format!("{what} contains an empty entry")));
+        }
+        let hash = weftcodec::Hash32::from_hex(entry)
+            .map_err(|e| Error::parse(format!("{what} entry: {}", e.message())))?;
+        if hash == weftcodec::Hash32::ZERO {
+            return Err(Error::parse(format!("{what} entry must not be all zero")));
+        }
+        hashes.push(hash);
+    }
+    Ok(hashes)
+}
+
+fn optional_hash(text: Option<&str>, what: &str) -> Result<Option<weftcodec::Hash32>> {
+    match text {
+        Some(text) => {
+            let hash = weftcodec::Hash32::from_hex(text)
+                .map_err(|e| Error::parse(format!("{what}: {}", e.message())))?;
+            if hash == weftcodec::Hash32::ZERO {
+                return Err(Error::parse(format!("{what} must not be all zero")));
+            }
+            Ok(Some(hash))
+        }
+        None => Ok(None),
+    }
+}
+
+fn load_context(args: &ContextArgs) -> Result<(ContextRoot, String)> {
+    let limits = Limits::default();
+    let bytes = read_limited(&args.selector, limits.max_selector_bytes)?;
+    let source = std::str::from_utf8(&bytes)
+        .map_err(|_| Error::parse("selector input is not valid UTF-8"))?
+        .to_owned();
+    let causal = match &args.causal {
+        Some(text) => hex_list(text, "causal closure")?,
+        None => Vec::new(),
+    };
+    let capability_hash = optional_hash(args.capability_hash.as_deref(), "capability hash")?;
+    let budget = match &args.budget {
+        Some(spec) => Some(Budget::parse_spec(spec)?),
+        None => None,
+    };
+    let root = context::build_context_root(
+        &source,
+        &args.namespace,
+        &args.snapshot,
+        &args.resolver,
+        &causal,
+        capability_hash,
+        budget,
+    )?;
+    Ok((root, source))
+}
+
+fn context_json(root: &ContextRoot) -> Result<serde_json::Value> {
+    Ok(json!({
+        "schema": context::CONTEXT_ROOT_SCHEMA,
+        "namespace": root.namespace,
+        "selector_id": root.selector_id.to_hex(),
+        "selector_canonical_hex": hex::encode(&root.selector_bytes),
+        "snapshot": root.snapshot.to_hex(),
+        "resolver": root.resolver,
+        "causal": root.causal.iter().map(|hash| hash.to_hex()).collect::<Vec<_>>(),
+        "ordering": root.ordering,
+        "capability_hash": root.capability_hash.map(|hash| hash.to_hex()),
+        "budget": root.budget.as_ref().map(|budget| budget.to_json()),
+        "context_root_id": root.id()?.to_hex(),
+        "uri": root.authoritative_uri()?,
+        "canonical_hex": root.canonical_hex()?,
+    }))
+}
+
+fn context_id(args: &ContextArgs) -> Result<()> {
+    let (root, _) = load_context(args)?;
+    if args.json {
+        let output = context_json(&root)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output)
+                .map_err(|e| Error::io(format!("cannot serialize context root: {e}")))?
+        );
+    } else {
+        println!("{}", root.id()?);
+    }
+    Ok(())
+}
+
+fn context_uri(args: &ContextUriArgs) -> Result<()> {
+    let (root, source) = load_context(&args.base)?;
+    let uri = if args.descriptor {
+        root.descriptor_uri(&source)?
+    } else {
+        root.authoritative_uri()?
+    };
+    if args.base.json {
+        let output = json!({
+            "uri": uri,
+            "context_root_id": root.id()?.to_hex(),
+            "descriptor": root.descriptor_uri(&source)?,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output)
+                .map_err(|e| Error::io(format!("cannot serialize URI: {e}")))?
+        );
+    } else {
+        println!("{uri}");
+    }
+    Ok(())
+}
+
+fn context_parse(input: &str, as_json: bool) -> Result<()> {
+    let limits = Limits::default();
+    let parsed = context::parse_context_uri(input, &limits)?;
+    match &parsed {
+        ContextUri::Authoritative { namespace, id } => {
+            let uri = parsed.canonical_uri(&limits)?;
+            if as_json {
+                let output = json!({
+                    "form": "authoritative",
+                    "namespace": namespace,
+                    "context_root_id": id.to_hex(),
+                    "uri": uri,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output)
+                        .map_err(|e| Error::io(format!("cannot serialize URI: {e}")))?
+                );
+            } else {
+                println!("{uri}");
+            }
+        }
+        ContextUri::Descriptor {
+            namespace,
+            selector_source,
+            ..
+        } => {
+            let root = parsed
+                .to_context_root(&limits)?
+                .ok_or_else(|| Error::non_canonical("descriptor produced no root"))?;
+            let uri = root.authoritative_uri()?;
+            if as_json {
+                let mut output = context_json(&root)?;
+                output["form"] = json!("descriptor");
+                output["namespace"] = json!(namespace);
+                output["selector_source"] = json!(selector_source);
+                output["descriptor"] = json!(input);
+                output["uri"] = json!(uri);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output)
+                        .map_err(|e| Error::io(format!("cannot serialize URI: {e}")))?
+                );
+            } else {
+                println!("{uri}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn causal_id(parents: &str, as_json: bool) -> Result<()> {
+    let parents = hex_list(parents, "causal parents")?;
+    let closure = context::CausalClosure::from_parents(&parents)?;
+    let id = closure.id()?;
+    if as_json {
+        let output = json!({
+            "schema": context::CAUSAL_SCHEMA,
+            "parents": closure.parents.iter().map(|hash| hash.to_hex()).collect::<Vec<_>>(),
+            "closure": closure.closure.iter().map(|hash| hash.to_hex()).collect::<Vec<_>>(),
+            "closure_hash": id.to_hex(),
+            "canonical_hex": hex::encode(closure.canonical_bytes()?),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output)
+                .map_err(|e| Error::io(format!("cannot serialize causal closure: {e}")))?
+        );
+    } else {
+        println!("{id}");
+    }
     Ok(())
 }
 

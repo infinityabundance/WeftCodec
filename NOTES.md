@@ -211,3 +211,140 @@ error vectors spanning `Malformed`, `Corrupt`, `UnsupportedVersion`,
 vectors. `tests/conformance.rs` replays all of them.
 
 No benchmark or performance claim is made here.
+
+---
+
+## F1 — Context Root, causal closure, and `weft://` (implemented)
+
+Status: **implemented and tested** in this crate for the data layer. Resolver
+and capability *enforcement* are specified but not implemented here (F2/F3).
+The AI codec is design-only and has no code.
+
+### What is implemented
+
+- **`context` module** (`src/context.rs`):
+  - `Budget` with strict canonical parsing (`max_results`, `max_bytes`,
+    `max_depth`, `max_work`; non-empty, ≥1, canonical decimal), WCB encode/
+    decode, and query rendering.
+  - `IdentityMode` (`bytes_only`, `causal_exact`).
+  - `CausalClosure` (`weft.causal.v1`): explicit parents, closure superset,
+    strictly ascending/unique/nonzero, canonical bytes, `CausalClosureId =
+    H("weft/causal/v1", bytes)`.
+  - `CapabilityScope` (`weft.capability.v1`): principal, sorted namespaces,
+    sorted roots, predicate allowlist, optional budget/expiry, `CapabilityHash =
+    H("weft/capability/v1", bytes)`.
+  - `ContextRoot` (`weft.context-root.v1`): canonical selector bytes + selector
+    id binding, nonzero pinned snapshot, resolver version, causal closure, fixed
+    `selector_then_object_id` ordering, optional capability hash and budget.
+    `ContextRootId = H("weft/context-root/v1", bytes)`.
+  - Authoritative `weft://<namespace>/c/<64hex>` formatting/parsing and
+    descriptor URIs with strict uppercase percent-encoding, canonical query
+    parameter order, and rejection of non-canonical spellings.
+- **Hash domains** `weft/context-root/v1`, `weft/causal/v1`,
+  `weft/capability/v1` exported from `hash`.
+- **Limits** `max_causal_entries` (4,096), `max_capability_entries` (4,096),
+  `max_uri_bytes` (64 KiB), all configurable downward.
+- **CLI**: `context id`, `context uri [--descriptor]`, `context parse <uri>
+  [--json]`, `causal id --parents a,b [--json]`.
+- **Vectors**: `conformance/v1/context/` (6 canonical + 10 rejection = 16) and
+  `conformance/v1/causal/` (4 canonical + 6 rejection = 10), replayed by
+  `tests/context.rs`.
+
+Golden `ContextRootId` values (also in the vectors):
+
+| Vector | ContextRootId |
+|---|---|
+| `001_root_true` | `53f70ff51a49496af01dc87e7002fa7ef7fe1ab5c192bdb326d0868b1f01a41a` |
+| `002_root_filter_budget` | `190b59a2510cf402fe0e4c8a3e8bc8a72d2b60e5c0ee4ed9ca8ce2787bc56af2` |
+| `003_root_causal_capability` | `ce702e74220a98d9b3b36e007860b20ee2404ef0f735085c8f942c9b29acfc02` |
+| `004_root_descriptor_escaping` | `dc6433a13d94842a972b37ab141f1911d02f533a043e7f662c57571b403b7e5a` |
+| `005_root_custom_resolver` | `f4d84a7e21f100e7e01d4788bd538b0a50db11b1b0b9a4293e510c12e31bbc26` |
+| `006_root_empty_causal` | `b61f96f46c6231f057b2dc64fcb602c5a48622a855d99fb4b600e075e10209be` |
+
+Golden causal closure hashes:
+
+| Vector | CausalClosureId |
+|---|---|
+| `001_single_parent` | `77475fa35f898c07f43c6ca1b6a8b30da44468825e0dcd8a0249442ba86ec15c` |
+| `002_two_parents_unsorted_input` | `58f09b15991e2de83a8f689327a928d31e3df8c80cf44562293377316b6c92ae` |
+| `003_three_parents` | `41c5d31f9a62e7bc57e52a5aafbac806830aae08265b8f99ea330a70c46f2100` |
+| `004_empty_closure` | `fe2d8422572489a70dc533dffa9a891fd36d99f496f16aab85254fff147ab7cc` |
+
+### Rules chosen where the spec leaves room (recorded as normative here)
+
+1. **Causal array is always present.** An empty closure encodes as `array(0)`;
+   the encoder never omits the field. Decoders require it.
+2. **`ordering` is required and fixed** to `selector_then_object_id` in v1.
+   An unknown value is `UnsupportedVersion`, not a default.
+3. **`resolver` is required**; `weft-resolver-v1` is the default the CLI uses.
+   Descriptor URIs omit `resolver` only when it is the default.
+4. **Descriptor normalization is one-way.** Descriptor parsing sorts and
+   deduplicates `closure`; canonical record decoding rejects unsorted/duplicate
+   arrays. This is deliberate: human spellings normalize, machine records are
+   strict.
+5. **Lowercase hex in URIs only.** Authoritative URIs and descriptor snapshot/
+   closure/capability hex require lowercase; uppercase is `Parse`. Record bytes
+   are unaffected (hex is only a display form outside WCB).
+6. **Percent-encoding is canonical only.** Raw bytes outside the unreserved set,
+   lowercase escapes, and escapes of unreserved characters are `Parse`.
+7. **Selector binding is checked twice:** the embedded selector must decode as
+   canonical `weft.selector.v1`, re-encode identically, hash to `selector_id`,
+   and have the same namespace as the record.
+
+### Verification record (exact commands and observed results)
+
+Environment: Docker court `weft/rust-court:1` (image id
+`sha256:c96472367ec767612a78d1809c2a8c8cf9244c4ed9757dbe1bd821eb3a723b9d`),
+launched only through `scripts/docker-court.sh rust`; hard limits unchanged
+(3 GiB memory/swap, 1024 pids, 4 CPUs, bounded `/tmp`, no-new-privileges,
+`--cap-drop=ALL`).
+
+```sh
+scripts/docker-court.sh rust "cd WeftCodec && cargo test --all-targets --quiet"
+# Observed: 35 + 0 + 8 + 4 + 5 + 12 + 8 + 9 + 7 + 7 + 4 = 99 passed, 0 failed
+# (the new 5 are tests/context.rs; 7 new unit tests are in src/context.rs)
+
+scripts/docker-court.sh rust "cd WeftCodec && cargo run --quiet -- conformance --dir /work/.docker-cache/vectors"
+# Observed: wrote conformance vectors to /work/.docker-cache/vectors
+# Only the new context/ and causal/ directories were copied into the repo;
+# existing codec/structured/selectors vectors were not touched.
+
+scripts/docker-court.sh rust "cd WeftCodec && cargo fmt --all && cargo test --all-targets --quiet"
+# Observed: same 99 passed, 0 failed after formatting.
+```
+
+Cross-language Context Root gate (run in the courts, exact commands):
+
+```sh
+scripts/docker-court.sh rust "cd WeftCodec && cargo build --release --quiet && cd /work/WeftCodec-Go && bash hack/context-cross.sh rust-gen"
+# -> rust-gen: wrote 4 context cases and one causal case
+scripts/docker-court.sh go "cd WeftCodec-Go && bash hack/context-cross.sh go-build && bash hack/context-cross.sh go-gen && bash hack/context-cross.sh go-parse-rust"
+# -> go-build: wrote /work/.docker-cache/weftcodec-go
+# -> go-gen: wrote 4 context cases and one causal case
+# -> ... parsed 4 rust descriptors -> go-parsed
+scripts/docker-court.sh rust "cd /work/WeftCodec-Go && bash hack/context-cross.sh rust-parse-go"
+# -> ... parsed 4 go descriptors -> rust-parsed
+scripts/docker-court.sh go "cd WeftCodec-Go && bash hack/context-cross.sh compare"
+# Observed: 4/4 ContextRootId PASS, 4/4 URI PASS, 4/4 descriptor PASS,
+#           4/4 go-parse-rust PASS, 4/4 rust-parse-go PASS, causal hash PASS,
+#           causal canonical bytes PASS. All checks passed.
+```
+
+Earlier existing codec cross-language gate re-run after these changes: all 8
+modes decoded in both directions, all 6 deterministic frame modes byte-identical,
+ZSTD/DICTIONARY differing bytes allowed by format §12. No regression.
+
+`bash scripts/check-spec-drift.sh` in the rust court: `spec drift: OK (24 file
+comparisons across 3 repos)`.
+
+### Not implemented in this crate (labelled precisely)
+
+- Resolver execution, snapshot existence/organization checks, authorization
+  enforcement, budgets enforcement, evidence filtering, and materialization:
+  **specified, not implemented** here (F2/F3; the store already has its own
+  selector/materialization paths).
+- Capability revocation records and enforcement points: **specified, not
+  implemented** (F2). The `CapabilityScope` type and hash are implemented.
+- AI tensor/token/KV/delta modes: **specified, not implemented**
+  (`spec/WEFT-AI-CODEC.md`); no wire mode values were allocated.
+- No performance claim and no model-checking claim for the new identities.

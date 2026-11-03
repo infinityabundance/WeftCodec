@@ -377,3 +377,68 @@ On open (writer):
 
 Recovery is read-only until `verify --repair` explicitly requests a destructive
 action; repair defaults to quarantine, not deletion.
+
+---
+
+## 9. Context Roots, causal identity, and capabilities (additive)
+
+This section is additive to the frozen v1 model above. It introduces no change
+to any existing v1 byte, identity, or commit record. The normative definitions
+live in `spec/WEFT-CONTEXT-ROOT.md`, `spec/WEFT-CAUSAL.md`, and
+`spec/WEFT-CAPABILITIES.md`.
+
+### 9.1 New entities
+
+| Entity | Definition | Stability |
+|---|---|---|
+| `ContextRootId` | `H("weft/context-root/v1", WCB(context-root record))` | immutable selection identity |
+| `CausalClosureId` | `H("weft/causal/v1", WCB(causal record))` | immutable ancestry identity |
+| `CapabilityHash` | `H("weft/capability/v1", WCB(capability record))` | immutable grant identity |
+
+A Context Root binds a canonical selector, its `SelectorId`, a pinned snapshot
+commit, a resolver/policy version, an ordered causal closure, an optional
+capability hash, an optional budget, and the v1 ordering policy
+`selector_then_object_id`. It denotes a selection, never a result set and never
+the first match.
+
+### 9.2 Version-record causal fields (opt-in only)
+
+`WEFT-CAUSAL.md` §2 defines two identity modes. `bytes_only` is the **v1
+default and is byte-identical to §2.3.1 above**; its version record carries no
+additional fields. `causal_exact` adds exactly two fields to the version
+record:
+
+```
+"identity_mode": "causal_exact",
+"causal_hash":   bytes32
+```
+
+and derives `VersionId = H("weft/version/v1", WCB(record))` over the extended
+record. `ContentId`, `ManifestId`, and every existing frozen vector are
+unchanged. An implementation that does not implement `causal_exact` MUST reject
+it with `UnsupportedVersion`; it MUST NOT ignore the fields.
+
+### 9.3 Reserved attributes
+
+`weft.causal.parents`, `weft.causal.closure`, `weft.causal.hash`, and
+`weft.identity.mode` are reserved `weft.*` attribute keys and are not exposed
+through xattr calls (§2.5). Their encodings and validation are defined in
+`WEFT-CAUSAL.md` §3.
+
+### 9.4 Invariants (additive)
+
+- **I9 Root pinning:** a `ContextRootId` always resolves at exactly its named
+  snapshot; it never follows a tag or the live head.
+- **I10 Root cardinality:** a Context Root exposes the authorized cardinality of
+  its selection and never collapses n>1 to one result.
+- **I11 Identity separation:** content identity does not imply selection
+  identity, and selection identity does not imply content existence.
+- **I12 Causal graphs may cycle; codec dependency graphs must not.**
+- **I13 Capability narrowing:** a capability context can only narrow, never
+  widen, the authorization already enforced by §6.
+
+`I9`/`I10` are implemented by the codec-level canonicalization and specified for
+resolution in F2/F3; `I11` is tested by F1 vectors; `I12` is normative here and
+in both code docs; `I13` is specified for F2. No property in this section is
+claimed model-checked until the corresponding artifact is named in
+`CLAIM_LEDGER`.

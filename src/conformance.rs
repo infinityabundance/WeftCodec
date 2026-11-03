@@ -6,11 +6,13 @@
 //! non-canonical rejects. `selectors/*.json` freezes canonical selector bytes
 //! and ids.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use serde_json::{json, Value as Json};
 
+use crate::context::{self, Budget, CausalClosure, ContextRoot, DEFAULT_RESOLVER};
 use crate::error::{Error, ErrorClass, Result};
 use crate::frame::{
     encode_frame, Dependency, Frame, FrameParts, Mode, DEP_DOMAIN_DICTIONARY, DEP_DOMAIN_PAYLOAD,
@@ -29,7 +31,15 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let codec_dir = dir.join("codec");
     let structured_dir = dir.join("structured");
     let selectors_dir = dir.join("selectors");
-    for sub in [&codec_dir, &structured_dir, &selectors_dir] {
+    let context_dir = dir.join("context");
+    let causal_dir = dir.join("causal");
+    for sub in [
+        &codec_dir,
+        &structured_dir,
+        &selectors_dir,
+        &context_dir,
+        &causal_dir,
+    ] {
         fs::create_dir_all(sub)
             .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
     }
@@ -37,6 +47,8 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_codec_vectors(&codec_dir, limits)?;
     write_structured_vectors(&structured_dir, limits)?;
     write_selector_vectors(&selectors_dir, limits)?;
+    write_context_vectors(&context_dir, limits)?;
+    write_causal_vectors(&causal_dir, limits)?;
     Ok(())
 }
 
@@ -741,4 +753,438 @@ fn slug(source: &str) -> String {
         }
     }
     out.trim_matches('_').to_owned()
+}
+
+fn hash_hex(byte: u8) -> String {
+    format!("{:02x}", byte).repeat(32)
+}
+
+fn context_map(root: &ContextRoot) -> BTreeMap<String, Value> {
+    match root.to_wcb_value() {
+        Value::Map(map) => map,
+        _ => unreachable!("context root encodes as a map"),
+    }
+}
+
+fn write_context_error(
+    dir: &Path,
+    name: &str,
+    record: Value,
+    expected: &str,
+    limits: &Limits,
+) -> Result<()> {
+    let bytes = wcb::encode(&record, limits)?;
+    let error = ContextRoot::from_canonical_bytes(&bytes, limits)
+        .expect_err("rejection vector unexpectedly decoded");
+    if error.class().as_str() != expected {
+        return Err(Error::io(format!(
+            "{name}: expected class {expected}, generated {} ({error})",
+            error.class()
+        )));
+    }
+    write_json(
+        &dir.join(format!("{name}.json")),
+        &json!({
+            "name": name,
+            "record_hex": hexs(&bytes),
+            "expect_error": expected,
+        }),
+    )
+}
+
+fn write_context_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    struct Case {
+        name: &'static str,
+        source: &'static str,
+        namespace: &'static str,
+        snapshot: u8,
+        resolver: &'static str,
+        causal: &'static [u8],
+        capability: Option<u8>,
+        budget: Option<&'static str>,
+    }
+
+    let cases = [
+        Case {
+            name: "001_root_true",
+            source: "select true",
+            namespace: "default",
+            snapshot: 0x11,
+            resolver: DEFAULT_RESOLVER,
+            causal: &[],
+            capability: None,
+            budget: None,
+        },
+        Case {
+            name: "002_root_filter_budget",
+            source: "select attrs.project == \"demo\" limit 10",
+            namespace: "default",
+            snapshot: 0x22,
+            resolver: DEFAULT_RESOLVER,
+            causal: &[],
+            capability: None,
+            budget: Some("max_results=10,max_bytes=1048576"),
+        },
+        Case {
+            name: "003_root_causal_capability",
+            source: "select attrs.project == \"demo\" and tag(\"reviewed\")",
+            namespace: "proj",
+            snapshot: 0x33,
+            resolver: DEFAULT_RESOLVER,
+            causal: &[0xBB, 0xAA],
+            capability: Some(0x44),
+            budget: Some("max_results=8,max_depth=2"),
+        },
+        Case {
+            name: "004_root_descriptor_escaping",
+            source: "select attrs.e == \"\\u00e9\\uD83D\\uDE00\\n\\t\\\"\\\\\\/\"",
+            namespace: "agents.prod-1",
+            snapshot: 0x55,
+            resolver: DEFAULT_RESOLVER,
+            causal: &[0x11],
+            capability: None,
+            budget: Some("max_depth=3"),
+        },
+        Case {
+            name: "005_root_custom_resolver",
+            source: "select relation(derived_from, obj:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff)",
+            namespace: "default",
+            snapshot: 0x66,
+            resolver: "weft-resolver-experimental-1",
+            causal: &[0xAA, 0xBB, 0xCC],
+            capability: None,
+            budget: None,
+        },
+        Case {
+            name: "006_root_empty_causal",
+            source: "select false",
+            namespace: "_internal",
+            snapshot: 0x77,
+            resolver: DEFAULT_RESOLVER,
+            causal: &[],
+            capability: None,
+            budget: Some("max_work=1"),
+        },
+    ];
+
+    for case in cases {
+        let causal: Vec<Hash32> = case
+            .causal
+            .iter()
+            .map(|byte| Hash32::from_hex(&hash_hex(*byte)).unwrap())
+            .collect();
+        let capability_hash = case
+            .capability
+            .map(|byte| Hash32::from_hex(&hash_hex(byte)).unwrap());
+        let budget = match case.budget {
+            Some(spec) => Some(Budget::parse_spec(spec)?),
+            None => None,
+        };
+        let root = context::build_context_root(
+            case.source,
+            case.namespace,
+            &hash_hex(case.snapshot),
+            case.resolver,
+            &causal,
+            capability_hash,
+            budget,
+        )?;
+        let record = root.canonical_bytes_with_limits(limits)?;
+        let decoded = ContextRoot::from_canonical_bytes(&record, limits)?;
+        if decoded != root {
+            return Err(Error::io(format!(
+                "{}: context root did not round-trip",
+                case.name
+            )));
+        }
+        let id = root.id()?;
+        let uri = root.authoritative_uri()?;
+        let descriptor = root.descriptor_uri(case.source)?;
+        let parsed = context::parse_context_uri(&descriptor, limits)?;
+        if parsed.canonical_uri(limits)? != uri {
+            return Err(Error::io(format!(
+                "{}: descriptor did not canonicalize to the authoritative URI",
+                case.name
+            )));
+        }
+        let vector = json!({
+            "name": case.name,
+            "schema": context::CONTEXT_ROOT_SCHEMA,
+            "namespace": root.namespace,
+            "selector_source": case.source,
+            "selector_canonical_hex": hexs(&root.selector_bytes),
+            "selector_id": root.selector_id.to_hex(),
+            "snapshot": root.snapshot.to_hex(),
+            "resolver": root.resolver,
+            "causal": root.causal.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+            "capability_hash": root.capability_hash.map(|h| h.to_hex()),
+            "budget": root.budget.as_ref().map(|b| b.to_json()),
+            "ordering": root.ordering,
+            "canonical_hex": hexs(&record),
+            "context_root_id": id.to_hex(),
+            "uri": uri,
+            "descriptor": descriptor,
+        });
+        write_json(&dir.join(format!("{}.json", case.name)), &vector)?;
+    }
+
+    // Rejection vectors. Each one is a valid WCB map with exactly one broken
+    // context-root invariant.
+    let base = context::build_context_root(
+        "select true",
+        "default",
+        &hash_hex(0x11),
+        DEFAULT_RESOLVER,
+        &[],
+        None,
+        None,
+    )?;
+    let a = Hash32::from_hex(&hash_hex(0xAA)).unwrap();
+    let b = Hash32::from_hex(&hash_hex(0xBB)).unwrap();
+
+    let mut map = context_map(&base);
+    map.insert(
+        "causal".to_owned(),
+        Value::Array(vec![bytes_value(b), bytes_value(a)]),
+    );
+    write_context_error(
+        dir,
+        "101_unsorted_causal",
+        Value::Map(map),
+        "NonCanonical",
+        limits,
+    )?;
+
+    let mut map = context_map(&base);
+    map.insert(
+        "causal".to_owned(),
+        Value::Array(vec![bytes_value(a), bytes_value(a)]),
+    );
+    write_context_error(
+        dir,
+        "102_duplicate_causal",
+        Value::Map(map),
+        "NonCanonical",
+        limits,
+    )?;
+
+    let mut map = context_map(&base);
+    map.insert("snapshot".to_owned(), bytes_value(Hash32::ZERO));
+    write_context_error(
+        dir,
+        "103_zero_snapshot",
+        Value::Map(map),
+        "NonCanonical",
+        limits,
+    )?;
+
+    let mut map = context_map(&base);
+    map.insert("selector_id".to_owned(), bytes_value(b));
+    write_context_error(
+        dir,
+        "104_selector_id_mismatch",
+        Value::Map(map),
+        "NonCanonical",
+        limits,
+    )?;
+
+    let mut map = context_map(&base);
+    map.insert("namespace".to_owned(), Value::Str("other".to_owned()));
+    write_context_error(
+        dir,
+        "105_namespace_mismatch",
+        Value::Map(map),
+        "NonCanonical",
+        limits,
+    )?;
+
+    let mut map = context_map(&base);
+    map.insert(
+        "namespace".to_owned(),
+        Value::Str("bad namespace".to_owned()),
+    );
+    write_context_error(
+        dir,
+        "106_bad_namespace",
+        Value::Map(map),
+        "NonCanonical",
+        limits,
+    )?;
+
+    let mut map = context_map(&base);
+    map.insert(
+        "schema".to_owned(),
+        Value::Str("weft.context-root.v2".to_owned()),
+    );
+    write_context_error(
+        dir,
+        "107_unknown_schema",
+        Value::Map(map),
+        "UnknownSchema",
+        limits,
+    )?;
+
+    let mut map = context_map(&base);
+    map.insert(
+        "budget".to_owned(),
+        Value::map([("max_results", Value::U64(0))]),
+    );
+    write_context_error(
+        dir,
+        "108_bad_budget_zero",
+        Value::Map(map),
+        "NonCanonical",
+        limits,
+    )?;
+
+    let mut map = context_map(&base);
+    map.insert(
+        "ordering".to_owned(),
+        Value::Str("object_id_asc".to_owned()),
+    );
+    write_context_error(
+        dir,
+        "109_unknown_ordering",
+        Value::Map(map),
+        "UnsupportedVersion",
+        limits,
+    )?;
+
+    let mut map = context_map(&base);
+    map.insert("extra".to_owned(), Value::Bool(true));
+    write_context_error(
+        dir,
+        "110_unknown_key",
+        Value::Map(map),
+        "NonCanonical",
+        limits,
+    )?;
+
+    Ok(())
+}
+
+fn bytes_value(hash: Hash32) -> Value {
+    Value::Bytes(hash.as_bytes().to_vec())
+}
+
+fn write_causal_error(
+    dir: &Path,
+    name: &str,
+    record: Value,
+    expected: &str,
+    limits: &Limits,
+) -> Result<()> {
+    let bytes = wcb::encode(&record, limits)?;
+    let error = CausalClosure::from_canonical_bytes(&bytes, limits)
+        .expect_err("causal rejection vector unexpectedly decoded");
+    if error.class().as_str() != expected {
+        return Err(Error::io(format!(
+            "{name}: expected class {expected}, generated {} ({error})",
+            error.class()
+        )));
+    }
+    write_json(
+        &dir.join(format!("{name}.json")),
+        &json!({
+            "name": name,
+            "record_hex": hexs(&bytes),
+            "expect_error": expected,
+        }),
+    )
+}
+
+fn write_causal_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    let a = Hash32::from_hex(&hash_hex(0xAA)).unwrap();
+    let b = Hash32::from_hex(&hash_hex(0xBB)).unwrap();
+    let c = Hash32::from_hex(&hash_hex(0xCC)).unwrap();
+
+    let cases: [(&str, Vec<Hash32>); 4] = [
+        ("001_single_parent", vec![a]),
+        ("002_two_parents_unsorted_input", vec![b, a]),
+        ("003_three_parents", vec![c, a, b]),
+        ("004_empty_closure", vec![]),
+    ];
+    for (name, parents) in cases {
+        let closure = CausalClosure::from_parents(&parents)?;
+        let record = closure.canonical_bytes_with_limits(limits)?;
+        let decoded = CausalClosure::from_canonical_bytes(&record, limits)?;
+        if decoded != closure {
+            return Err(Error::io(format!(
+                "{name}: causal closure did not round-trip"
+            )));
+        }
+        let vector = json!({
+            "name": name,
+            "schema": context::CAUSAL_SCHEMA,
+            "parents_input": parents.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+            "parents": closure.parents.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+            "closure": closure.closure.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+            "canonical_hex": hexs(&record),
+            "closure_hash": closure.id()?.to_hex(),
+        });
+        write_json(&dir.join(format!("{name}.json")), &vector)?;
+    }
+
+    let unsorted = Value::map([
+        ("schema", Value::Str(context::CAUSAL_SCHEMA.to_owned())),
+        (
+            "parents",
+            Value::Array(vec![bytes_value(b), bytes_value(a)]),
+        ),
+        (
+            "closure",
+            Value::Array(vec![bytes_value(b), bytes_value(a)]),
+        ),
+    ]);
+    write_causal_error(dir, "101_unsorted", unsorted, "NonCanonical", limits)?;
+
+    let duplicate = Value::map([
+        ("schema", Value::Str(context::CAUSAL_SCHEMA.to_owned())),
+        (
+            "parents",
+            Value::Array(vec![bytes_value(a), bytes_value(a)]),
+        ),
+        (
+            "closure",
+            Value::Array(vec![bytes_value(a), bytes_value(a)]),
+        ),
+    ]);
+    write_causal_error(dir, "102_duplicate", duplicate, "NonCanonical", limits)?;
+
+    let missing = Value::map([
+        ("schema", Value::Str(context::CAUSAL_SCHEMA.to_owned())),
+        ("parents", Value::Array(vec![bytes_value(a)])),
+        ("closure", Value::Array(vec![bytes_value(b)])),
+    ]);
+    write_causal_error(
+        dir,
+        "103_closure_missing_parent",
+        missing,
+        "NonCanonical",
+        limits,
+    )?;
+
+    let zero = Value::map([
+        ("schema", Value::Str(context::CAUSAL_SCHEMA.to_owned())),
+        ("parents", Value::Array(vec![bytes_value(Hash32::ZERO)])),
+        ("closure", Value::Array(vec![bytes_value(Hash32::ZERO)])),
+    ]);
+    write_causal_error(dir, "104_zero_entry", zero, "NonCanonical", limits)?;
+
+    let schema = Value::map([
+        ("schema", Value::Str("weft.causal.v2".to_owned())),
+        ("parents", Value::Array(vec![])),
+        ("closure", Value::Array(vec![])),
+    ]);
+    write_causal_error(dir, "105_unknown_schema", schema, "UnknownSchema", limits)?;
+
+    let extra = Value::map([
+        ("schema", Value::Str(context::CAUSAL_SCHEMA.to_owned())),
+        ("parents", Value::Array(vec![])),
+        ("closure", Value::Array(vec![])),
+        ("extra", Value::Bool(true)),
+    ]);
+    write_causal_error(dir, "106_unknown_key", extra, "NonCanonical", limits)?;
+
+    Ok(())
 }

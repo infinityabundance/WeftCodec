@@ -12,6 +12,7 @@
 //! * [`dependency`] — resolvers, frame sources, recursive DAG decoding.
 //! * [`archive`] — the self-contained WFA1 transport container.
 //! * [`selector`] — WeftQL parser, normalization, canonical selector identity.
+//! * [`context`] — Context Root, causal closure, capability scope, `weft://`.
 //! * [`stream`] — chunked encoding and random-range reads.
 //!
 //! All parsing of untrusted input returns `Result`; the crate forbids unsafe
@@ -21,6 +22,7 @@
 
 pub mod archive;
 pub mod conformance;
+pub mod context;
 pub mod dependency;
 pub mod error;
 pub mod frame;

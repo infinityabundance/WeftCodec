@@ -250,3 +250,35 @@ Golden bytes live in `conformance/v1/selectors/`.
 No joins, transitive closure, aggregation, full-text search, embeddings,
 arithmetic expressions, or user-defined predicates. These may be added only
 under a new selector schema with explicit cost and determinism analysis.
+
+---
+
+## 9. Cross-reference: binding to a pinned Context Root (additive)
+
+This section is additive and does not change any v1 selector byte or
+`SelectorId`. It records how selectors are used by `spec/WEFT-CONTEXT-ROOT.md`.
+
+- `SelectorId` identifies the expression only. It never includes the snapshot,
+  resolver version, causal closure, capability scope, or budget.
+- A **Context Root** (`weft.context-root.v1`) embeds the canonical selector
+  bytes and their `SelectorId`, and adds the pinned snapshot, resolver version,
+  causal closure, optional capability hash, optional budget, and the ordering
+  policy `selector_then_object_id`.
+- The Context Root's embedded selector MUST be canonical bytes that re-encode
+  identically, and its `SelectorId` MUST equal
+  `H("weft/selector/v1", selector bytes)`. A mismatch is `NonCanonical`.
+- The Context Root namespace MUST equal the selector namespace. A selector
+  framed under another namespace is rejected; it is not re-scoped silently.
+- Resolution of a Context Root evaluates this selector at the pinned snapshot
+  with the pinned resolver version, applies authorization before evaluation and
+  counting, then applies the selector's `order` list and always the
+  `object_id` ascending tie-break (§3 step 5).
+- A live result of the selector text MUST NOT be presented as the result of a
+  Context Root, and vice versa. They are different identities with different
+  stability guarantees.
+- Selector equivalence is not claimed. Two logically equivalent expressions
+  remain distinct identities; the Context Root inherits that distinction.
+
+Error classes remain those of §5; a Context Root layer adds the classes in
+`WEFT-CONTEXT-ROOT.md` §8 (snapshot, budget, materialization, capability) and
+never reinterprets a selector error as success.

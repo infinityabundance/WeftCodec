@@ -35,6 +35,12 @@ pub const DOMAIN_RELATION: &str = "weft/relation/v1";
 pub const DOMAIN_VERSION: &str = "weft/version/v1";
 /// Object identity seed.
 pub const DOMAIN_OBJECT: &str = "weft/object/v1";
+/// Context Root record (WEFT-CONTEXT-ROOT §1.2).
+pub const DOMAIN_CONTEXT_ROOT: &str = "weft/context-root/v1";
+/// Causal closure record (WEFT-CAUSAL §1.2).
+pub const DOMAIN_CAUSAL: &str = "weft/causal/v1";
+/// Capability scope record (WEFT-CAPABILITIES §1.1).
+pub const DOMAIN_CAPABILITY: &str = "weft/capability/v1";
 
 /// A 32-byte Weft digest.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
