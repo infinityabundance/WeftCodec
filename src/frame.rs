@@ -539,7 +539,10 @@ impl<'a> Frame<'a> {
         // Parse the dependency table.
         let mut dependencies = Vec::with_capacity(dep_count as usize);
         for index in 0..dep_count as usize {
-            let off = HEADER_LEN + index * DEP_ENTRY_LEN;
+            let off = index
+                .checked_mul(DEP_ENTRY_LEN)
+                .and_then(|value| HEADER_LEN.checked_add(value))
+                .ok_or_else(|| Error::malformed("dependency table offset overflow"))?;
             let hash = Hash32::from_slice(&bytes[off..off + HASH_LEN])?;
             let dep_len = le_u64(bytes, off + 32);
             let dep_domain = bytes[off + 40];
@@ -577,10 +580,16 @@ impl<'a> Frame<'a> {
         }
 
         // Parse the chunk table.
-        let chunk_table_start = HEADER_LEN + dep_count as usize * DEP_ENTRY_LEN;
+        let chunk_table_start = (dep_count as usize)
+            .checked_mul(DEP_ENTRY_LEN)
+            .and_then(|value| HEADER_LEN.checked_add(value))
+            .ok_or_else(|| Error::malformed("chunk table offset overflow"))?;
         let mut chunks = Vec::with_capacity(chunk_count as usize);
         for index in 0..chunk_count as usize {
-            let off = chunk_table_start + index * CHUNK_ENTRY_LEN;
+            let off = index
+                .checked_mul(CHUNK_ENTRY_LEN)
+                .and_then(|value| chunk_table_start.checked_add(value))
+                .ok_or_else(|| Error::malformed("chunk entry offset overflow"))?;
             let encoded_off = le_u64(bytes, off);
             let encoded_len = le_u32(bytes, off + 8);
             let chunk_decoded_len = le_u32(bytes, off + 12);

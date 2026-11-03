@@ -191,6 +191,21 @@ mod tests {
     }
 
     #[test]
+    fn domain_validation() {
+        assert!(try_hash_domain(DOMAIN_CHUNK, b"x").is_ok());
+        assert_eq!(
+            try_hash_domain("bad\0domain", b"x").unwrap_err().class(),
+            crate::ErrorClass::Malformed
+        );
+        assert_eq!(
+            try_hash_domain("non-ascii-\u{e9}", b"x")
+                .unwrap_err()
+                .class(),
+            crate::ErrorClass::Malformed
+        );
+    }
+
+    #[test]
     fn hand_computed_domain_prefix() {
         // The prefix bytes are exactly u32le(10) || "weft/chunk/v1".
         let mut manual = Vec::new();

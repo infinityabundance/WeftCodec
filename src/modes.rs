@@ -461,7 +461,7 @@ pub fn encode_delta_ops(target: &[u8], base: &[u8], limits: &Limits) -> Result<V
     let mut table: HashMap<u32, MatchChain> = HashMap::new();
     if indexable && base.len() >= 4 {
         let mut pos = 0usize;
-        while pos + 4 <= base.len() {
+        while base.len() - pos >= 4 {
             if pos % stride == 0 {
                 let key =
                     u32::from_le_bytes([base[pos], base[pos + 1], base[pos + 2], base[pos + 3]]);
@@ -481,7 +481,7 @@ pub fn encode_delta_ops(target: &[u8], base: &[u8], limits: &Limits) -> Result<V
     while i < target.len() {
         let mut best_len = 0usize;
         let mut best_pos = 0usize;
-        if indexable && i + 4 <= target.len() {
+        if indexable && target.len() - i >= 4 {
             let key = u32::from_le_bytes([target[i], target[i + 1], target[i + 2], target[i + 3]]);
             if let Some(chain) = table.get(&key) {
                 for index in 0..chain.len as usize {

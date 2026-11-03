@@ -201,7 +201,7 @@ pub fn parse_archive<'a>(bytes: &'a [u8], limits: &Limits) -> Result<Archive<'a>
     let mut pos = ARCHIVE_HEADER_LEN;
     let mut entries = Vec::with_capacity((entry_count as usize).min(1024));
     for index in 0..entry_count as usize {
-        if pos + 8 > crc_at {
+        if pos.checked_add(8).map(|end| end > crc_at).unwrap_or(true) {
             return Err(Error::malformed(format!(
                 "archive entry {index} is truncated"
             )));

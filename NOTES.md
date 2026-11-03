@@ -179,7 +179,7 @@ scripts/docker-court.sh rust "rustup component add rustfmt && cd WeftCodec && ca
 # Full test suite.
 scripts/docker-court.sh rust "cd WeftCodec && cargo test --all-targets"
 # Observed:
-#   unittests src/lib.rs      27 passed; 0 failed
+#   unittests src/lib.rs      28 passed; 0 failed
 #   unittests src/main.rs      0 passed; 0 failed
 #   tests/cli.rs               8 passed; 0 failed
 #   tests/conformance.rs       4 passed; 0 failed
@@ -189,11 +189,13 @@ scripts/docker-court.sh rust "cd WeftCodec && cargo test --all-targets"
 #   tests/roundtrip.rs         7 passed; 0 failed
 #   tests/selectors.rs         7 passed; 0 failed
 #   tests/stream.rs            4 passed; 0 failed
-#   total 86 passed, 0 failed (10 test binaries)
+#   total 87 passed, 0 failed (10 test binaries)
 
 # Release build.
 scripts/docker-court.sh rust "cd WeftCodec && cargo build --release"
-# Observed: Finished `release` profile [optimized] target(s) in 16.55s.
+# Observed: Finished `release` profile [optimized] target(s) in 16.55s
+# (the final incremental release build after the arithmetic-hardening change
+# finished in 2.24s; both were run in the court).
 
 # Conformance vector generation (files committed under conformance/v1).
 scripts/docker-court.sh rust "cd WeftCodec && cargo run --quiet -- conformance --dir conformance/v1"
