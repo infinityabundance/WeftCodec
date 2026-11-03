@@ -1,0 +1,6 @@
+{
+  "canonical_hex": "070300030101",
+  "description": "canonical WCB value: Array([Null, U64(1), Bool(false)])",
+  "expect": "ok",
+  "name": "array"
+}

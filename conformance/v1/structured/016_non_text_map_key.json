@@ -1,0 +1,5 @@
+{
+  "expect_error": "NonCanonical",
+  "hex": "080103010302",
+  "name": "non_text_map_key"
+}

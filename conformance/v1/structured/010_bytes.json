@@ -1,0 +1,6 @@
+{
+  "canonical_hex": "0604000102ff",
+  "description": "canonical WCB value: Bytes([0, 1, 2, 255])",
+  "expect": "ok",
+  "name": "bytes"
+}

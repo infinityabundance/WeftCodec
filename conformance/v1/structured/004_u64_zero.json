@@ -1,0 +1,6 @@
+{
+  "canonical_hex": "0300",
+  "description": "canonical WCB value: U64(0)",
+  "expect": "ok",
+  "name": "u64_zero"
+}

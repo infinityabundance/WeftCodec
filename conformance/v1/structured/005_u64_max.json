@@ -1,0 +1,6 @@
+{
+  "canonical_hex": "03ffffffffffffffffff01",
+  "description": "canonical WCB value: U64(18446744073709551615)",
+  "expect": "ok",
+  "name": "u64_max"
+}

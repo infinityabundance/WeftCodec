@@ -1,0 +1,6 @@
+{
+  "canonical_hex": "09aab4aed8c7bfce972f",
+  "description": "canonical WCB value: Timestamp(1700000000123456789)",
+  "expect": "ok",
+  "name": "timestamp"
+}

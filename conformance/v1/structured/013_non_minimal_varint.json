@@ -1,0 +1,5 @@
+{
+  "expect_error": "NonCanonical",
+  "hex": "038000",
+  "name": "non_minimal_varint"
+}
