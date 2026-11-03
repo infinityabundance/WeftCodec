@@ -149,6 +149,8 @@ chosen and is recorded here.
 - Selector evaluation is intentionally absent; the filesystem layer evaluates
   the public AST. Selector source is limited to 64 KiB and 64 nesting levels by
   default.
+- The CLI's `--mode structured` input is canonical WCB bytes (validated before
+  framing); it is not JSON.
 - ZSTD/DICTIONARY frames are decode-equivalent across zstd library versions, not
   byte-identical; conformance records the encoder identity implicitly (crate
   `zstd 0.13.4`, zstd 1.5.7).

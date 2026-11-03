@@ -34,7 +34,9 @@ weftcodec selector canonicalize --input QUERY
 ```
 
 Dependency directories contain plaintext files named by the lowercase hex
-digest (`H("weft/chunk/v1", bytes)`).
+digest (`H("weft/chunk/v1", bytes)`). For `--mode structured`, the input must
+already be canonical WCB bytes; the CLI validates it and rejects non-canonical
+input.
 
 ## Build and test
 
