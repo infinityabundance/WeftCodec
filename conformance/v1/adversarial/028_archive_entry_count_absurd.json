@@ -1,0 +1,7 @@
+{
+  "description": "Archive header declares 4,294,967,295 entries with no table.",
+  "expect_class": "LimitExceeded",
+  "input_hex": "5746413101000000ffffffff536cdaad",
+  "name": "archive_entry_count_absurd",
+  "verb": "archive-decode"
+}

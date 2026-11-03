@@ -388,14 +388,17 @@ fn compress_with_dictionary(data: &[u8], dict: &[u8], level: i32) -> Result<Vec<
         .map_err(|e| Error::malformed(format!("zstd compression failed: {e}")))
 }
 
-/// Decompress one zstd frame with an exact output bound.
-pub fn decompress(body: &[u8], declared_len: u64) -> Result<Vec<u8>> {
-    let capacity = usize::try_from(declared_len)
-        .map_err(|_| Error::limit_exceeded("decoded length does not fit usize"))?;
-    let mut decompressor = zstd::bulk::Decompressor::new()
-        .map_err(|e| Error::corrupt(format!("zstd decompressor init failed: {e}")))?;
-    let out = decompressor
-        .decompress(body, capacity)
+/// Read exactly `declared_len` bytes from a zstd stream, never preallocating
+/// the declared length. A tiny frame that *claims* a huge output therefore
+/// costs only the bytes it actually produces.
+fn read_exact_zstd<R: std::io::Read>(reader: R, declared_len: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let bound = declared_len.saturating_add(1);
+    let mut out = Vec::new();
+    reader
+        .take(bound)
+        .read_to_end(&mut out)
         .map_err(|e| Error::corrupt(format!("zstd decompression failed: {e}")))?;
     if out.len() as u64 != declared_len {
         return Err(Error::corrupt(format!(
@@ -406,23 +409,19 @@ pub fn decompress(body: &[u8], declared_len: u64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Decompress one zstd frame with an exact output bound.
+pub fn decompress(body: &[u8], declared_len: u64) -> Result<Vec<u8>> {
+    let decoder = zstd::stream::read::Decoder::new(body)
+        .map_err(|e| Error::corrupt(format!("zstd decompressor init failed: {e}")))?;
+    read_exact_zstd(decoder, declared_len)
+}
+
 /// Decompress one zstd frame using a raw-content dictionary, with an exact
 /// output bound.
 pub fn decompress_with_dictionary(body: &[u8], declared_len: u64, dict: &[u8]) -> Result<Vec<u8>> {
-    let capacity = usize::try_from(declared_len)
-        .map_err(|_| Error::limit_exceeded("decoded length does not fit usize"))?;
-    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict)
+    let decoder = zstd::stream::read::Decoder::with_dictionary(body, dict)
         .map_err(|e| Error::corrupt(format!("zstd dictionary init failed: {e}")))?;
-    let out = decompressor
-        .decompress(body, capacity)
-        .map_err(|e| Error::corrupt(format!("zstd decompression failed: {e}")))?;
-    if out.len() as u64 != declared_len {
-        return Err(Error::corrupt(format!(
-            "zstd output length {} differs from declared {declared_len}",
-            out.len()
-        )));
-    }
-    Ok(out)
+    read_exact_zstd(decoder, declared_len)
 }
 
 const MIN_MATCH: usize = 8;

@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adversarial;
 pub mod archive;
 pub mod conformance;
 pub mod context;

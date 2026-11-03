@@ -1,0 +1,7 @@
+{
+  "description": "body_len u64::MAX overflows the header-derived frame length.",
+  "expect_class": "Malformed",
+  "input_hex": "5746543101000000000000000000000000000000ffffffffffffffff00000000000000000000000000000000000000000000000000000000000000000000000000000000000000002adce746000000000000000000000000000000000000000055da020c",
+  "name": "length_arithmetic_overflow",
+  "verb": "decode"
+}

@@ -1,0 +1,7 @@
+{
+  "description": "Declared decoded length is 10 GiB; default max_decoded_bytes (4 GiB) must reject before allocation.",
+  "expect_class": "LimitExceeded",
+  "input_hex": "574654310100000100000300000000800200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000dbe06a9100000000000000000000000000000000000000004cff4cd4",
+  "name": "declared_10gib",
+  "verb": "decode"
+}

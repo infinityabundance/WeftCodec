@@ -11,11 +11,13 @@ use serde_json::json;
 
 use weftcodec::archive;
 use weftcodec::context::{self, Budget, ContextRoot, ContextUri, DEFAULT_RESOLVER};
-use weftcodec::dependency::{DirectoryResolver, MapResolver, Resolver};
+use weftcodec::dependency::{
+    decode_frame_dag, DirectoryFrameSource, DirectoryResolver, MapResolver, Resolver,
+};
 use weftcodec::error::{Error, ErrorClass, Result};
 use weftcodec::frame::{Frame, Mode};
 use weftcodec::hash::hash_domain;
-use weftcodec::limits::Limits;
+use weftcodec::limits::{self, Limits};
 use weftcodec::modes;
 use weftcodec::selector;
 use weftcodec::wcb;
@@ -94,15 +96,77 @@ struct EncodeArgs {
     chunk_size: Option<usize>,
 }
 
+/// Decoder resource limits. Defaults are the normative v1 values; every flag
+/// can only lower the corresponding bound.
+#[derive(Args, Debug, Clone)]
+struct LimitArgs {
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_FRAME_BYTES)]
+    max_frame_bytes: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_DECODED_BYTES)]
+    max_decoded_bytes: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_DEPENDENCY_DEPTH)]
+    max_dependency_depth: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_DEPENDENCY_COUNT)]
+    max_dependency_count: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_TOTAL_FETCHED_BYTES)]
+    max_total_fetched_bytes: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_CHUNKS)]
+    max_chunks: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_DICTIONARY_BYTES)]
+    max_dictionary_bytes: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_DELTA_OPS)]
+    max_delta_ops: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_STRUCTURED_DEPTH)]
+    max_structured_depth: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_STRUCTURED_ITEMS)]
+    max_structured_items: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_SELECTOR_BYTES)]
+    max_selector_bytes: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_SELECTOR_DEPTH)]
+    max_selector_depth: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_SELECTOR_OPERANDS)]
+    max_selector_operands: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_ARCHIVE_ENTRIES)]
+    max_archive_entries: u64,
+}
+
+impl LimitArgs {
+    fn to_limits(&self) -> Limits {
+        Limits {
+            max_frame_bytes: self.max_frame_bytes,
+            max_decoded_bytes: self.max_decoded_bytes,
+            max_dependency_depth: self.max_dependency_depth,
+            max_dependency_count: self.max_dependency_count,
+            max_total_fetched_bytes: self.max_total_fetched_bytes,
+            max_chunks: self.max_chunks,
+            max_dictionary_bytes: self.max_dictionary_bytes,
+            max_delta_ops: self.max_delta_ops,
+            max_structured_depth: self.max_structured_depth,
+            max_structured_items: self.max_structured_items,
+            max_selector_bytes: self.max_selector_bytes,
+            max_selector_depth: self.max_selector_depth,
+            max_selector_operands: self.max_selector_operands,
+            max_archive_entries: self.max_archive_entries,
+            ..Limits::default()
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 struct DecodeArgs {
     #[arg(long)]
     input: String,
     #[arg(long)]
     output: String,
-    /// Directory of dependency files named by lowercase hex digest.
+    /// Directory of dependency plaintext files named by lowercase hex digest.
     #[arg(long)]
     deps: Option<String>,
+    /// Directory of dependency *frames* named by content hash. When present,
+    /// decode walks the dependency DAG (depth, cycle, and fetch limits apply).
+    #[arg(long)]
+    frame_source: Option<String>,
+    #[command(flatten)]
+    limits: LimitArgs,
 }
 
 #[derive(Args, Debug)]
@@ -139,6 +203,8 @@ enum ArchiveCommand {
         input: String,
         #[arg(long)]
         out_dir: String,
+        #[command(flatten)]
+        limits: LimitArgs,
     },
 }
 
@@ -150,11 +216,15 @@ enum SelectorCommand {
         input: String,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        limits: LimitArgs,
     },
     /// Print canonical WCB bytes as lowercase hex.
     Canonicalize {
         #[arg(long)]
         input: String,
+        #[command(flatten)]
+        limits: LimitArgs,
     },
 }
 
@@ -227,6 +297,9 @@ struct ConformanceArgs {
     /// Directory to write vectors into (e.g. conformance/v1).
     #[arg(long)]
     dir: String,
+    /// Write only the adversarial decoder-bomb vectors into `<dir>/adversarial`.
+    #[arg(long)]
+    adversarial: bool,
 }
 
 fn main() -> ExitCode {
@@ -247,11 +320,21 @@ fn run(cli: Cli) -> Result<()> {
         Command::Verify(args) => verify(args),
         Command::Archive { command } => match command {
             ArchiveCommand::Create { output, frames } => archive_create(&output, &frames),
-            ArchiveCommand::Decode { input, out_dir } => archive_decode(&input, &out_dir),
+            ArchiveCommand::Decode {
+                input,
+                out_dir,
+                limits,
+            } => archive_decode(&input, &out_dir, &limits.to_limits()),
         },
         Command::Selector { command } => match command {
-            SelectorCommand::Id { input, json } => selector_id(&input, json),
-            SelectorCommand::Canonicalize { input } => selector_canonicalize(&input),
+            SelectorCommand::Id {
+                input,
+                json,
+                limits,
+            } => selector_id(&input, json, &limits.to_limits()),
+            SelectorCommand::Canonicalize { input, limits } => {
+                selector_canonicalize(&input, &limits.to_limits())
+            }
         },
         Command::Context { command } => match command {
             ContextCommand::Id(args) => context_id(&args),
@@ -263,8 +346,13 @@ fn run(cli: Cli) -> Result<()> {
         },
         Command::Conformance(args) => {
             let limits = Limits::default();
-            weftcodec::conformance::generate_v1(Path::new(&args.dir), &limits)?;
-            eprintln!("wrote conformance vectors to {}", args.dir);
+            if args.adversarial {
+                weftcodec::adversarial::generate(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote adversarial vectors to {}/adversarial", args.dir);
+            } else {
+                weftcodec::conformance::generate_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote conformance vectors to {}", args.dir);
+            }
             Ok(())
         }
     }
@@ -387,10 +475,18 @@ fn encode_auto(
 }
 
 fn decode(args: DecodeArgs) -> Result<()> {
-    let limits = Limits::default();
+    let limits = args.limits.to_limits();
     let frame_bytes = read_limited(&args.input, limits.max_frame_bytes)?;
-    let resolver = resolver_for(args.deps.as_deref());
-    let plaintext = modes::decode_bytes(&frame_bytes, resolver.as_ref(), &limits)?;
+    let plaintext = match args.frame_source.as_deref() {
+        Some(dir) => {
+            let source = DirectoryFrameSource::new(dir, limits.max_frame_bytes);
+            decode_frame_dag(&source, &frame_bytes, &limits)?
+        }
+        None => {
+            let resolver = resolver_for(args.deps.as_deref());
+            modes::decode_bytes(&frame_bytes, resolver.as_ref(), &limits)?
+        }
+    };
     write_output(&args.output, &plaintext)
 }
 
@@ -525,10 +621,9 @@ fn archive_create(output: &str, frame_paths: &[String]) -> Result<()> {
     write_output(output, &archive)
 }
 
-fn archive_decode(input: &str, out_dir: &str) -> Result<()> {
-    let limits = Limits::default();
+fn archive_decode(input: &str, out_dir: &str, limits: &Limits) -> Result<()> {
     let bytes = read_limited(input, limits.max_total_fetched_bytes)?;
-    let entries = archive::decode_archive(&bytes, &limits)?;
+    let entries = archive::decode_archive(&bytes, limits)?;
     fs::create_dir_all(out_dir).map_err(|e| Error::io(format!("cannot create {out_dir}: {e}")))?;
     for entry in &entries {
         let path = Path::new(out_dir).join(entry.content_hash.to_hex());
@@ -539,8 +634,7 @@ fn archive_decode(input: &str, out_dir: &str) -> Result<()> {
     Ok(())
 }
 
-fn selector_id(input: &str, as_json: bool) -> Result<()> {
-    let limits = Limits::default();
+fn selector_id(input: &str, as_json: bool, limits: &Limits) -> Result<()> {
     let bytes = read_limited(input, limits.max_selector_bytes)?;
     let source = std::str::from_utf8(&bytes)
         .map_err(|_| Error::parse("selector input is not valid UTF-8"))?;
@@ -566,8 +660,7 @@ fn selector_id(input: &str, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-fn selector_canonicalize(input: &str) -> Result<()> {
-    let limits = Limits::default();
+fn selector_canonicalize(input: &str, limits: &Limits) -> Result<()> {
     let bytes = read_limited(input, limits.max_selector_bytes)?;
     let source = std::str::from_utf8(&bytes)
         .map_err(|_| Error::parse("selector input is not valid UTF-8"))?;

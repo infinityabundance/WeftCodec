@@ -168,6 +168,52 @@ pub trait FrameSource {
     fn get_frame(&self, content_hash: &Hash32) -> Result<Option<Vec<u8>>>;
 }
 
+/// Frame source backed by a directory of complete frames, each named by its
+/// lowercase content hash. Files are read lazily so the DAG fetch bound counts
+/// only frames actually traversed.
+#[derive(Clone, Debug)]
+pub struct DirectoryFrameSource {
+    dir: PathBuf,
+    max_frame_bytes: u64,
+}
+
+impl DirectoryFrameSource {
+    pub fn new(dir: impl Into<PathBuf>, max_frame_bytes: u64) -> Self {
+        DirectoryFrameSource {
+            dir: dir.into(),
+            max_frame_bytes,
+        }
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl FrameSource for DirectoryFrameSource {
+    fn get_frame(&self, content_hash: &Hash32) -> Result<Option<Vec<u8>>> {
+        let path = self.dir.join(content_hash.to_hex());
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(Error::io(format!(
+                    "cannot stat frame {}: {err}",
+                    path.display()
+                )))
+            }
+        };
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        check_len(metadata.len(), self.max_frame_bytes, "dependency frame")?;
+        let bytes = fs::read(&path)
+            .map_err(|err| Error::io(format!("cannot read frame {}: {err}", path.display())))?;
+        check_len(bytes.len() as u64, self.max_frame_bytes, "dependency frame")?;
+        Ok(Some(bytes))
+    }
+}
+
 /// In-memory frame source keyed by frame content hash.
 #[derive(Clone, Debug, Default)]
 pub struct MapFrameSource {

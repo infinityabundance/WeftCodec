@@ -1,0 +1,7 @@
+{
+  "description": "Frame input truncated below the 100-byte minimum.",
+  "expect_class": "Malformed",
+  "input_hex": "5746543101000000000000001300000000000000130000000000000000000000000000000000000061f9b4e453bd41143002",
+  "name": "033_truncated_frame_50",
+  "verb": "decode"
+}
