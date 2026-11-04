@@ -173,6 +173,14 @@ Zstd decoding limits: window log ≤ 27, decoded output ≤ `decoded_len`, and
 `decoded_len` MUST be stated before decompression. Implementations MUST fail
 closed if the decompressor yields a different length.
 
+Zstd framing rules (apply to `ZSTD`, `DICTIONARY`, and every chunk of a
+`CHUNKED` ZSTD frame): the body MUST be a complete, well-formed zstd stream. An
+empty body is `Malformed`, even when `decoded_len == 0`; the encoder emits a
+valid minimal zstd frame for empty plaintext. If the zstd frame header declares
+a content size, that size MUST equal `decoded_len` (`Corrupt` otherwise), even
+when the actual decompressed byte count equals `decoded_len`. The actual
+decompressed length MUST equal `decoded_len` (`Corrupt` otherwise).
+
 ---
 
 ## 4. DELTA op stream (mode 3)

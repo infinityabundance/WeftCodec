@@ -415,8 +415,32 @@ fn read_exact_zstd<R: std::io::Read>(reader: R, declared_len: u64) -> Result<Vec
     Ok(out)
 }
 
+/// Validate the zstd frame preamble shared by `ZSTD`, `DICTIONARY`, and
+/// chunked `ZSTD` payloads before decompression.
+///
+/// An empty payload is structural (`Malformed`): a zstd frame is never zero
+/// bytes, even for empty plaintext. If the frame header declares a content
+/// size, it MUST equal the Weft `decoded_len` (`Corrupt` on disagreement), so a
+/// stream cannot declare a different length than the frame embedding it.
+fn check_zstd_preamble(body: &[u8], declared_len: u64) -> Result<()> {
+    if body.is_empty() {
+        return Err(Error::malformed(
+            "zstd payload is empty; a zstd frame is never zero bytes",
+        ));
+    }
+    if let Ok(Some(frame_len)) = zstd::zstd_safe::get_frame_content_size(body) {
+        if frame_len != declared_len {
+            return Err(Error::corrupt(format!(
+                "zstd frame declares content size {frame_len}, Weft header declares {declared_len}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Decompress one zstd frame with an exact output bound.
 pub fn decompress(body: &[u8], declared_len: u64) -> Result<Vec<u8>> {
+    check_zstd_preamble(body, declared_len)?;
     let decoder = zstd::stream::read::Decoder::new(body)
         .map_err(|e| Error::corrupt(format!("zstd decompressor init failed: {e}")))?;
     read_exact_zstd(decoder, declared_len)
@@ -425,6 +449,7 @@ pub fn decompress(body: &[u8], declared_len: u64) -> Result<Vec<u8>> {
 /// Decompress one zstd frame using a raw-content dictionary, with an exact
 /// output bound.
 pub fn decompress_with_dictionary(body: &[u8], declared_len: u64, dict: &[u8]) -> Result<Vec<u8>> {
+    check_zstd_preamble(body, declared_len)?;
     let decoder = zstd::stream::read::Decoder::with_dictionary(body, dict)
         .map_err(|e| Error::corrupt(format!("zstd dictionary init failed: {e}")))?;
     read_exact_zstd(decoder, declared_len)
