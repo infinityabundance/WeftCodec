@@ -1,0 +1,22 @@
+{
+  "body_len": 1,
+  "chunk_count": 0,
+  "content_hash": "ed16b611e50be935121ea4c9334d86f722bb1dc04f3fe40e30186ca9ef9dabdb",
+  "decoded_len": 1,
+  "dependencies": [],
+  "domain": 0,
+  "expect": {
+    "ok": true
+  },
+  "features": 0,
+  "flags": 0,
+  "format_major": 1,
+  "format_minor": 0,
+  "frame_hex": "57465431010000000000000001000000000000000100000000000000000000000000000000000000ed16b611e50be935121ea4c9334d86f722bb1dc04f3fe40e30186ca9ef9dabdbb63c7aa00000000000000000000000000000000000000000414241b910",
+  "frame_len": 101,
+  "mode": "raw",
+  "mode_value": 0,
+  "name": "002_raw_one_byte",
+  "plaintext_hash": "ed16b611e50be935121ea4c9334d86f722bb1dc04f3fe40e30186ca9ef9dabdb",
+  "plaintext_hex": "41"
+}

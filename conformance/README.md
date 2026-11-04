@@ -1,0 +1,153 @@
+# WeftCodec v1 conformance vectors
+
+These files freeze the `weftcodec-format 1.0` and `weft-selectors 1.0` bytes.
+They are **append-only**: never regenerate, rewrite, reorder, or "fix" an
+existing vector to match a later implementation change. If an implementation
+disagrees with a committed vector, the implementation is wrong (or the vector
+must be superseded by a new schema version with new files).
+
+The vectors were produced by:
+
+```sh
+scripts/docker-court.sh rust "cd WeftCodec && cargo run --quiet -- conformance --dir conformance/v1"
+```
+
+`cargo test --all-targets` replays every vector (`tests/conformance.rs`).
+
+## Layout
+
+### `codec/*.json`
+
+One complete WFT1 frame per file.
+
+```json
+{
+  "name": "006_raw_chunked_1024",
+  "mode": "raw",
+  "mode_value": 0,
+  "format_major": 1,
+  "format_minor": 0,
+  "domain": 0,
+  "flags": 1,
+  "features": 2,
+  "decoded_len": 5000,
+  "body_len": 5000,
+  "frame_len": 5396,
+  "chunk_count": 5,
+  "content_hash": "<64 hex>",
+  "plaintext_hex": "<hex>",
+  "plaintext_hash": "<64 hex>",
+  "frame_hex": "<hex>",
+  "dependencies": [
+    {
+      "hash": "<64 hex>",
+      "decoded_len": 123,
+      "dep_domain": 0,
+      "bytes_hex": "<hex>"
+    }
+  ],
+  "expect": { "ok": true }
+}
+```
+
+Error vectors use `"expect": { "error": "<Class>" }` and may include a
+`"limits"` object with lowered limits (for example `{"max_decoded_bytes":
+1024}`). Decoders MUST fail with exactly that class. Dependency entries provide
+the bytes a resolver should return for the listed hash; for deliberately wrong
+hash/length vectors the listed hash/bytes are the wrong values supplied to the
+resolver.
+
+`mode` names are `raw`, `zstd`, `reference`, `delta`, `dictionary`,
+`structured`, `tensor`, and `tokens`.
+
+### AI modes (`tensor`, `tokens`)
+
+WEFT-AI-CODEC v1.1.0 allocates mode 6 `TENSOR` and mode 7 `TOKEN_SEQUENCE`.
+Their bodies are `u32le(meta_len) || WCB(meta) || payload`; the frame
+`decoded_len` and `content_hash` cover the payload, and the WCB descriptor binds
+it under `weft/tensor/payload/v1` or `weft/tokens/payload/v1`.
+
+Valid vectors: `100_tensor_f32_2x3`, `101_tensor_f16_scalar`,
+`102_tensor_u8_zero_element`, `103_tokens_delta_boundaries`,
+`104_tokens_empty`. Reject vectors `120`–`135` cover shape/payload/hash/layout/
+dtype/overflow/rank/encoding/canonicality/count limits.
+
+`017_unknown_mode` historically asserted that mode value 6 was unknown. It is
+retained byte-for-byte with `"superseded_by":
+"017_unknown_mode_reserved8"`; replay suites skip superseded vectors. The
+current reserved-value vector is `017_unknown_mode_reserved8` (mode 8).
+
+### `structured/*.json`
+
+Canonical WCB values and non-canonical rejects.
+
+```json
+{ "name": "map", "description": "...", "canonical_hex": "<hex>", "expect": "ok" }
+{ "name": "unsorted_map_keys", "hex": "<hex>", "expect_error": "NonCanonical" }
+```
+
+### `selectors/*.json`
+
+WeftQL source, canonical WCB bytes, and selector id.
+
+```json
+{
+  "name": "1_select_true",
+  "source": "select true",
+  "namespace": "default",
+  "canonical_hex": "<hex>",
+  "selector_id": "<64 hex>"
+}
+```
+
+### `context/*.json`
+
+Canonical Context Root records (`weft.context-root.v1`), their identity, the
+authoritative URI, and the descriptor spelling. Invalid vectors use
+`record_hex` plus `expect_error`.
+
+```json
+{
+  "name": "001_root_true",
+  "namespace": "default",
+  "selector_source": "select true",
+  "selector_canonical_hex": "<hex>",
+  "selector_id": "<64 hex>",
+  "snapshot": "<64 hex>",
+  "resolver": "weft-resolver-v1",
+  "causal": [],
+  "capability_hash": null,
+  "budget": null,
+  "ordering": "selector_then_object_id",
+  "canonical_hex": "<hex>",
+  "context_root_id": "<64 hex>",
+  "uri": "weft://default/c/<64 hex>",
+  "descriptor": "weft://default/c/select%20true@<64 hex>"
+}
+```
+
+### `causal/*.json`
+
+Canonical causal closure records (`weft.causal.v1`) and their closure hash.
+Invalid vectors use `record_hex` plus `expect_error`.
+
+```json
+{
+  "name": "001_single_parent",
+  "parents": ["<64 hex>"],
+  "closure": ["<64 hex>"],
+  "canonical_hex": "<hex>",
+  "closure_hash": "<64 hex>"
+}
+```
+
+## Notes
+
+- WCB map ordering is by **full encoded key bytes** (tag + varint length +
+  bytes), per WEFTCODEC-FORMAT §8.2. This is not lexicographic key-string
+  ordering; see `../NOTES.md`.
+- ZSTD and DICTIONARY frames are frozen as decode-equivalence vectors. Their
+  bytes depend on the zstd library version and level; RAW, REFERENCE, DELTA, and
+  STRUCTURED encodings are byte-deterministic and are re-encoded by the tests.
+- Plaintext is arbitrary bytes. Nothing here implies UTF-8 except WCB text and
+  selector source strings.

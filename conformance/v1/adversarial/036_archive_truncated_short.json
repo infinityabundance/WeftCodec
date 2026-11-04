@@ -1,0 +1,7 @@
+{
+  "description": "Archive shorter than its header and trailer.",
+  "expect_class": "Malformed",
+  "input_hex": "574641310100000000000000",
+  "name": "archive_truncated_short",
+  "verb": "archive-decode"
+}

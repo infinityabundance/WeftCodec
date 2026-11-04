@@ -1,0 +1,10 @@
+{
+  "description": "A valid frame above --max-frame-bytes 50.",
+  "expect_class": "LimitExceeded",
+  "flags": {
+    "--max-frame-bytes": "50"
+  },
+  "input_hex": "5746543101000000000000001300000000000000130000000000000000000000000000000000000061f9b4e453bd411430024d917d75edec3d9c5472d2c8ce740532fb67c495c01afb221c9d00000000000000000000000000000000000000007472756e636174696f6e2d626f756e64617279124fa1ac",
+  "name": "frame_size_limit",
+  "verb": "decode"
+}

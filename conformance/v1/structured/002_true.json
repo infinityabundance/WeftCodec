@@ -1,0 +1,6 @@
+{
+  "canonical_hex": "02",
+  "description": "canonical WCB value: Bool(true)",
+  "expect": "ok",
+  "name": "true"
+}

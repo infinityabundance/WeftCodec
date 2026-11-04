@@ -1,0 +1,6 @@
+{
+  "canonical_hex": "00",
+  "description": "canonical WCB value: Null",
+  "expect": "ok",
+  "name": "null"
+}

@@ -1,0 +1,6 @@
+{
+  "canonical_hex": "04ffffffffffffffffff01",
+  "description": "canonical WCB value: I64(-9223372036854775808)",
+  "expect": "ok",
+  "name": "i64_min"
+}

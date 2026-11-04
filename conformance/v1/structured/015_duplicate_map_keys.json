@@ -1,0 +1,5 @@
+{
+  "expect_error": "NonCanonical",
+  "hex": "080205016103010501610302",
+  "name": "duplicate_map_keys"
+}

@@ -1,0 +1,6 @@
+{
+  "canonical_hex": "0401",
+  "description": "canonical WCB value: I64(-1)",
+  "expect": "ok",
+  "name": "i64_neg_one"
+}

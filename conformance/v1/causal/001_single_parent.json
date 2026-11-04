@@ -1,0 +1,15 @@
+{
+  "canonical_hex": "08030506736368656d61050e776566742e63617573616c2e76310507636c6f7375726507010620aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0507706172656e747307010620aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "closure": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  "closure_hash": "77475fa35f898c07f43c6ca1b6a8b30da44468825e0dcd8a0249442ba86ec15c",
+  "name": "001_single_parent",
+  "parents": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  "parents_input": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  "schema": "weft.causal.v1"
+}

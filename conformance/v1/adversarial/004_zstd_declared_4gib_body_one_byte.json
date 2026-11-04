@@ -1,0 +1,7 @@
+{
+  "description": "Tiny zstd body declares a 4 GiB output. Must fail Corrupt without preallocating the declared length.",
+  "expect_class": "Corrupt",
+  "input_hex": "57465431010000010000030000000000010000000a000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e23ae0a9000000000000000000000000000000000000000028b52ffd200109000078de960d0f",
+  "name": "zstd_declared_4gib_body_one_byte",
+  "verb": "decode"
+}

@@ -1,0 +1,5 @@
+{
+  "expect_error": "NonCanonical",
+  "name": "103_closure_missing_parent",
+  "record_hex": "08030506736368656d61050e776566742e63617573616c2e76310507636c6f7375726507010620bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0507706172656e747307010620aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

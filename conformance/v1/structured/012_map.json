@@ -1,0 +1,6 @@
+{
+  "canonical_hex": "08030501610301050162050374776f05016300",
+  "description": "canonical WCB value: Map({\"a\": U64(1), \"b\": Str(\"two\"), \"c\": Null})",
+  "expect": "ok",
+  "name": "map"
+}

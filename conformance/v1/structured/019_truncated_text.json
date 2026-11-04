@@ -1,0 +1,5 @@
+{
+  "expect_error": "Malformed",
+  "hex": "050561",
+  "name": "truncated_text"
+}
