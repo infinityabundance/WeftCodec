@@ -1,6 +1,6 @@
 # WEFT-AI-CODEC v1.1.0 — AI-native codec modes
 
-**Status: PARTIALLY IMPLEMENTED.** Exactly three AI-native modes are normative
+**Status: PARTIALLY IMPLEMENTED.** Exactly four AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 
 | Value | Name | Status | Frozen vectors |
@@ -8,6 +8,7 @@ and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 | 6 | `TENSOR` | **implemented** | `100_tensor_f32_2x3`, `101_tensor_f16_scalar`, `102_tensor_u8_zero_element` + rejects |
 | 7 | `TOKEN_SEQUENCE` (CLI `tokens`) | **implemented** | `103_tokens_delta_boundaries`, `104_tokens_empty` + rejects |
 | 8 | `QUANTIZED_TENSOR` (CLI `quantized`) | **implemented** | `105_quantized_i8_2x3`, `106_quantized_u8_zero_element`, `107_quantized_i8_scalar` + rejects |
+| 9 | `FLOAT_TENSOR` (CLI `float-tensor`) | **implemented** | `108_float_bf16_2x2`, `109_float_fp16_3d`, `110_float_fp32_4d` + rejects |
 
 Every other mode below is `specified, not implemented` and has **no allocated
 wire value**. Nothing in this document is a compression or performance claim.
@@ -295,7 +296,121 @@ to 0.
 
 ---
 
-## 5. Specified, not implemented (no wire values)
+## 5. Mode 9 — `FLOAT_TENSOR` (implemented)
+
+### 5.1 Frame shape
+
+Identical to §2.1, with `mode = 9`. The body is
+
+```
+u32le(meta_len) || WCB(weft.ai.float_tensor.v1) || exponent_plane || mantissa_plane
+```
+
+`decoded_len` is the length of the **reconstructed element bytes**, not the
+stored payload length: `element_count * (sign_bits + exponent_bits +
+mantissa_bits) / 8`. `content_hash` is `H("weft/chunk/v1", reconstructed
+bytes)`, so decoding yields the original little-endian element bytes exactly.
+Frame `domain` is `0`; no dependencies and no chunks are permitted.
+
+The descriptor additionally binds the stored payload under
+`weft/float-tensor/payload/v1` (§1.3). Compressing the exponent plane therefore
+never changes element identity, and swapping planes or descriptors is caught.
+
+### 5.2 Descriptor
+
+The WCB descriptor is a map with exactly these keys:
+
+| Key | WCB type | Value |
+|---|---|---|
+| `schema` | text | exactly `weft.ai.float_tensor.v1` |
+| `dtype` | text | one of `bf16`, `fp16`, `fp32`, `fp8-e4m3`, `fp8-e5m2` |
+| `shape` | array of u64 | rank 1..=`max_tensor_rank`; every dimension > 0 |
+| `element_count` | u64 | product of `shape` |
+| `exponent_bits` | u64 | fixed per dtype, `0..=255` (WCB has no u8 tag) |
+| `mantissa_bits` | u64 | fixed per dtype, `0..=255` |
+| `sign_bits` | u64 | fixed per dtype, `0..=255` |
+| `exponent_plane_len` | u64 | length of the **zstd-compressed** exponent plane |
+| `mantissa_plane_len` | u64 | length of the raw sign+mantissa plane |
+| `payload_hash` | bytes(32) | `H("weft/float-tensor/payload/v1", stored payload)` |
+
+WCB has no unsigned-byte tag, so the three bit-width fields are carried as u64
+values restricted to `0..=255`. The fixed widths are:
+
+| `dtype` | `sign_bits` | `exponent_bits` | `mantissa_bits` | element bytes |
+|---|---:|---:|---:|---:|
+| `bf16` | 1 | 8 | 7 | 2 |
+| `fp16` | 1 | 5 | 10 | 2 |
+| `fp32` | 1 | 8 | 23 | 4 |
+| `fp8-e4m3` | 1 | 4 | 3 | 1 |
+| `fp8-e5m2` | 1 | 5 | 2 | 1 |
+
+All five dtypes are byte-aligned (`sign_bits + exponent_bits + mantissa_bits` is
+a multiple of 8). A dtype that is not byte-aligned is not implemented and MUST
+be rejected.
+
+### 5.3 Payload encoding — exact definition
+
+Input elements are the little-endian element words in row-major order. For
+dtype `E = exponent_bits`, `M = mantissa_bits`, `S = sign_bits`:
+
+- **Exponent plane.** `element_count` bytes; byte `i` is element `i`'s exponent
+  field, in element order, and MUST be `< 2^E`. This plane is zstd-compressed as
+  one standard frame (RFC 8878); `exponent_plane_len` is the compressed length.
+  The encoder always compresses (level 3 is the reference setting, informational
+  like the frame `level` field). The shared zstd strictness rule applies: the
+  plane is non-empty, a declared frame content size MUST equal `element_count`,
+  and the actual decompressed length MUST equal `element_count`.
+- **Mantissa plane.** For each element in order, emit the sign bit (`S` bits)
+  followed by the mantissa bits (`M` bits, most significant first). Pack these
+  `element_count * (S + M)` bits contiguously, MSB-first: bit 7 of the first
+  byte is the first emitted bit. The plane is exactly
+  `ceil(element_count * (S + M) / 8)` bytes; unused low bits of the final byte
+  MUST be zero. The plane is stored raw.
+
+Decoding reverses this exactly: element `i`'s word is
+`(sign << (E + M)) | (exponent << M) | mantissa`, written as an `S+E+M`-bit
+little-endian word. Every bit pattern round-trips, including NaNs with non-zero
+payloads, signalling/quiet bits, infinities, signed zeros, and denormals. The
+codec never converts, canonicalizes, or interprets a value.
+
+### 5.4 Validation order (normative for error classes)
+
+1. Body split / `meta_len` bounds → `Malformed`.
+2. WCB canonical decode → `NonCanonical`, `Malformed`, or `LimitExceeded`.
+3. Descriptor key set, `schema` → `Malformed`.
+4. Unknown `dtype` → `Malformed`; a bit-width field that is not `0..=255` or
+   disagrees with the dtype table → `Malformed`; a non-byte-aligned total →
+   `Malformed`.
+5. `shape` rank 0 or any dimension 0 → `Malformed`; rank > `max_tensor_rank`,
+   product overflow, or product > `max_tensor_elements` → `LimitExceeded`.
+6. `element_count` ≠ shape product → `Malformed`.
+7. `decoded_len` arithmetic overflow or `> max_decoded_bytes` →
+   `LimitExceeded`; `decoded_len` ≠ `element_count * element_bytes` →
+   `Corrupt`.
+8. `mantissa_plane_len` ≠ `ceil(element_count * (S + M) / 8)` → `Malformed`;
+   `exponent_plane_len + mantissa_plane_len` overflow → `LimitExceeded`;
+   the sum ≠ stored payload length → `Malformed`.
+9. Exponent plane empty → `Malformed`; not a decodable zstd frame, a declared
+   content size ≠ `element_count`, or actual length ≠ `element_count` →
+   `Corrupt` (the shared zstd rule of §2.1/ZSTD).
+10. An exponent byte ≥ `2^E` → `Corrupt`; non-zero mantissa padding bits →
+    `Corrupt`.
+11. `payload_hash` length ≠ 32 → `Malformed`; value mismatch → `Corrupt`.
+
+### 5.5 CLI
+
+```
+weftcodec encode --mode float-tensor --input PAYLOAD --output FRAME \
+    --dtype fp32 --shape 2,3
+```
+
+`--metadata META.json` accepts `{"dtype":"fp32","shape":[2,3]}`. `--shape`
+is required (rank ≥ 1); an omitted or empty `--shape` is a rank-0 reject.
+`inspect` reports `mode=float_tensor`.
+
+---
+
+## 6. Specified, not implemented (no wire values)
 
 These designs have **no allocated mode value and no wire representation**.
 They are recorded so a future version cannot silently invent them by reusing a
@@ -320,12 +435,12 @@ vectors, and the same cross-language gates.
 
 ---
 
-## 6. Limits (added by this document)
+## 7. Limits (added by this document)
 
 | Limit | Default | Applies to |
 |---|---:|---|
-| `max_tensor_elements` | 4,294,967,296 | TENSOR shape product |
-| `max_tensor_rank` | 8 | TENSOR shape length |
+| `max_tensor_elements` | 4,294,967,296 | TENSOR/FLOAT_TENSOR shape product |
+| `max_tensor_rank` | 8 | TENSOR/FLOAT_TENSOR shape length |
 | `max_tokens` | 16,777,216 | TOKEN_SEQUENCE `token_count` |
 
 Existing limits also apply: `max_decoded_bytes` (payload), `max_frame_bytes`,
@@ -335,7 +450,7 @@ header rules reject them first).
 
 ---
 
-## 7. Acceptance tests (both implementations)
+## 8. Acceptance tests (both implementations)
 
 The committed suites and vectors cover:
 
@@ -357,8 +472,18 @@ The committed suites and vectors cover:
    exact f64 scale bit preservation, dtype-range zero-point checks, non-finite/
    non-positive scale rejection, payload/hash/length rejects, and checked shape
    limits.
-9. **Cross-language**: Rust→Go and Go→Rust decode equivalence plus
-   byte-identical frames for all three modes (`WeftCodec-Go/hack/cross.sh`).
+9. **Float tensors**: every dtype round-trips bit-exactly; exponent-plane
+   zstd binding; mantissa MSB-first packing and zero padding; NaN payloads,
+   infinities, signed zeros, and denormals; unknown dtype, bit-width mismatch,
+   rank 0, zero dimension, plane-length overflow, non-zstd exponent plane, and
+   decoded-length mismatch rejects; element/rank/decoded-byte limits.
+10. **Cross-language**: Rust→Go and Go→Rust decode equivalence plus
+   byte-identical frames for TENSOR, TOKEN_SEQUENCE, and QUANTIZED_TENSOR
+   (`WeftCodec-Go/hack/cross.sh`). `FLOAT_TENSOR` frames embed a zstd frame
+   produced by each implementation's zstd library; the gate asserts decode
+   equivalence in both directions and, because zstd encoders may differ,
+   reports the byte comparison as an observed property rather than a promise.
+   The frozen vectors are generated once and replayed by both implementations.
 
 Frozen vector names live in both codec repositories under
 `conformance/v1/codec/`. The Rust generator is
@@ -367,7 +492,7 @@ files without modification.
 
 ---
 
-## 8. Explicit non-goals and non-claims
+## 9. Explicit non-goals and non-claims
 
 - No training, inference, gradient computation, tokenization, dequantization,
   layout conversion, or model evaluation.

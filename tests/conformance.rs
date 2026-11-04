@@ -203,6 +203,8 @@ fn vectors_are_not_empty_and_cover_modes() {
         "structured",
         "tensor",
         "tokens",
+        "quantized_tensor",
+        "float_tensor",
     ] {
         assert!(modes_seen.contains(mode), "missing mode vector: {mode}");
     }

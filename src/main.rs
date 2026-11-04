@@ -79,7 +79,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -420,6 +420,9 @@ fn encode(args: EncodeArgs) -> Result<()> {
     } else if args.mode == "quantized" || args.mode == "quantized_tensor" {
         let (dtype, shape, scale, zero_point) = quantized_metadata_args(&args)?;
         modes::encode_quantized_tensor(&data, dtype, &shape, scale, zero_point, &limits)?
+    } else if args.mode == "float_tensor" || args.mode == "float-tensor" {
+        let (dtype, shape) = float_tensor_metadata_args(&args)?;
+        modes::encode_float_tensor(&data, dtype, &shape, &limits)?
     } else if args.mode == "tokens" {
         let input: TokensInput = serde_json::from_slice(&data).map_err(|err| {
             Error::malformed(format!(
@@ -489,6 +492,9 @@ fn encode_mode(
         )),
         Mode::QuantizedTensor => Err(Error::malformed(
             "QUANTIZED_TENSOR encoding requires the dedicated CLI path with --dtype/--shape/--scale/--zero-point",
+        )),
+        Mode::FloatTensor => Err(Error::malformed(
+            "FLOAT_TENSOR encoding requires the dedicated CLI path with --dtype/--shape/--metadata",
         )),
     }
 }
@@ -589,6 +595,42 @@ fn quantized_metadata_args(args: &EncodeArgs) -> Result<(modes::TensorDtype, Vec
             .collect::<Result<Vec<u64>>>()?,
     };
     Ok((dtype, shape, scale, args.zero_point))
+}
+
+/// Parse the FLOAT_TENSOR descriptor from `--metadata` or `--dtype`/`--shape`.
+fn float_tensor_metadata_args(args: &EncodeArgs) -> Result<(modes::FloatDtype, Vec<u64>)> {
+    if let Some(path) = &args.metadata {
+        if args.dtype.is_some() || args.shape.is_some() {
+            return Err(Error::malformed(
+                "--metadata cannot be combined with --dtype or --shape",
+            ));
+        }
+        let bytes = read_limited(path, Limits::default().max_string_bytes)?;
+        let input: TensorMetaInput = serde_json::from_slice(&bytes).map_err(|err| {
+            Error::malformed(format!(
+                "float tensor metadata must be JSON {{\"dtype\":string,\"shape\":[u64,...]}}: {err}"
+            ))
+        })?;
+        let dtype = modes::FloatDtype::from_name(&input.dtype)?;
+        return Ok((dtype, input.shape));
+    }
+    let dtype = args
+        .dtype
+        .as_deref()
+        .ok_or_else(|| Error::malformed("FLOAT_TENSOR encoding requires --dtype or --metadata"))?;
+    let dtype = modes::FloatDtype::from_name(dtype)?;
+    let shape = match args.shape.as_deref() {
+        None | Some("") => Vec::new(),
+        Some(text) => text
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<u64>()
+                    .map_err(|err| Error::malformed(format!("bad --shape extent `{part}`: {err}")))
+            })
+            .collect::<Result<Vec<u64>>>()?,
+    };
+    Ok((dtype, shape))
 }
 
 fn encode_auto(

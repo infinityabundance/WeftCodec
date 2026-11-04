@@ -19,8 +19,8 @@ use crate::frame::{
     DOMAIN_PAYLOAD, DOMAIN_STRUCTURED, FORMAT_MAJOR, FORMAT_MINOR,
 };
 use crate::hash::{
-    hash_domain, Hash32, DOMAIN_CHUNK, DOMAIN_QUANTIZED_TENSOR_PAYLOAD, DOMAIN_SELECTOR,
-    DOMAIN_TENSOR_PAYLOAD, DOMAIN_TOKENS_PAYLOAD,
+    hash_domain, Hash32, DOMAIN_CHUNK, DOMAIN_FLOAT_TENSOR_PAYLOAD,
+    DOMAIN_QUANTIZED_TENSOR_PAYLOAD, DOMAIN_SELECTOR, DOMAIN_TENSOR_PAYLOAD, DOMAIN_TOKENS_PAYLOAD,
 };
 use crate::limits::Limits;
 use crate::modes;
@@ -258,6 +258,56 @@ fn token_meta_value(
     ])
 }
 
+fn float_tensor_meta_value(
+    dtype: &str,
+    shape: &[u64],
+    count: u64,
+    sign_bits: u64,
+    exponent_bits: u64,
+    mantissa_bits: u64,
+    exponent_plane_len: u64,
+    mantissa_plane_len: u64,
+    payload_hash: &[u8],
+) -> Value {
+    Value::map([
+        ("schema", Value::Str("weft.ai.float_tensor.v1".to_owned())),
+        ("dtype", Value::Str(dtype.to_owned())),
+        (
+            "shape",
+            Value::Array(shape.iter().map(|d| Value::U64(*d)).collect()),
+        ),
+        ("element_count", Value::U64(count)),
+        ("sign_bits", Value::U64(sign_bits)),
+        ("exponent_bits", Value::U64(exponent_bits)),
+        ("mantissa_bits", Value::U64(mantissa_bits)),
+        ("exponent_plane_len", Value::U64(exponent_plane_len)),
+        ("mantissa_plane_len", Value::U64(mantissa_plane_len)),
+        ("payload_hash", Value::Bytes(payload_hash.to_vec())),
+    ])
+}
+
+/// Build a FLOAT_TENSOR frame whose decoded length is the reconstructed element
+/// length, independent of the stored plane length.
+fn float_ai_frame(
+    meta: &Value,
+    stored: &[u8],
+    decoded_len: u64,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let body = ai_body(meta, stored, limits)?;
+    let plaintext = vec![0u8; decoded_len as usize];
+    build_frame(
+        Mode::FloatTensor,
+        DOMAIN_PAYLOAD,
+        0,
+        decoded_len,
+        hash_domain(DOMAIN_CHUNK, &plaintext),
+        &[],
+        &body,
+        limits,
+    )
+}
+
 fn build_frame(
     mode: Mode,
     domain: u8,
@@ -452,11 +502,11 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     );
 
     let mut unknown_mode = good.clone();
-    unknown_mode[7] = 9;
+    unknown_mode[7] = 10;
     refix_header_and_trailer(&mut unknown_mode);
     push_error(
         &mut vectors,
-        &name("unknown_mode_reserved9"),
+        &name("unknown_mode_reserved10"),
         "raw",
         &unknown_mode,
         &[],
@@ -1024,6 +1074,51 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
         &[],
     )?;
 
+    // --- FLOAT_TENSOR (mode 9) --------------------------------------------
+    // bf16 rank 2: +0, -0, smallest denormal, and a NaN with a non-zero
+    // payload (all-zero exponent plane, all-ones exponent for the NaN).
+    let bf16_payload: Vec<u8> = [0x0000u16, 0x8000, 0x0001, 0x7fc1]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let frame =
+        modes::encode_float_tensor(&bf16_payload, modes::FloatDtype::Bf16, &[2, 2], limits)?;
+    push_ok(
+        &mut vectors,
+        "108_float_bf16_2x2",
+        &frame,
+        &bf16_payload,
+        &[],
+    )?;
+    // fp16 rank 3: +inf, -inf, a denormal, and a NaN with a non-zero payload.
+    let fp16_payload: Vec<u8> = [0x7c00u16, 0xfc00, 0x0001, 0x7e01]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let frame =
+        modes::encode_float_tensor(&fp16_payload, modes::FloatDtype::F16, &[2, 1, 2], limits)?;
+    push_ok(
+        &mut vectors,
+        "109_float_fp16_3d",
+        &frame,
+        &fp16_payload,
+        &[],
+    )?;
+    // fp32 rank 4: signed zeros, +inf, and a NaN with a non-zero payload.
+    let fp32_payload: Vec<u8> = [0x0000_0000u32, 0x8000_0000, 0x7f80_0000, 0x7f80_0001]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let frame =
+        modes::encode_float_tensor(&fp32_payload, modes::FloatDtype::F32, &[2, 1, 1, 2], limits)?;
+    push_ok(
+        &mut vectors,
+        "110_float_fp32_4d",
+        &frame,
+        &fp32_payload,
+        &[],
+    )?;
+
     let q_hash = hash_domain(DOMAIN_QUANTIZED_TENSOR_PAYLOAD, &quant_payload);
     let scale_bits = 0.25f64.to_bits().to_le_bytes();
     let q_layout = "row_major";
@@ -1206,6 +1301,188 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
         &frame,
         &[],
         ErrorClass::Malformed,
+        None,
+    );
+
+    // --- FLOAT_TENSOR rejects (mode 9) ------------------------------------
+    let fp32_two: Vec<u8> = [0x3f80_0000u32, 0x7f80_0001]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let (exp_plane, mant_plane) =
+        modes::split_float_tensor_payload(&fp32_two, modes::FloatDtype::F32, 2)?;
+    let mut float_stored = exp_plane.clone();
+    float_stored.extend_from_slice(&mant_plane);
+    let float_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &float_stored);
+    let exp_len = exp_plane.len() as u64;
+    let mant_len = mant_plane.len() as u64;
+
+    let meta = float_tensor_meta_value(
+        "fp64",
+        &[2],
+        2,
+        1,
+        8,
+        23,
+        exp_len,
+        mant_len,
+        float_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &float_stored, 8, limits)?;
+    push_error(
+        &mut vectors,
+        "140_float_tensor_unknown_dtype",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let meta = float_tensor_meta_value(
+        "fp32",
+        &[2],
+        3,
+        1,
+        8,
+        23,
+        exp_len,
+        mant_len,
+        float_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &float_stored, 8, limits)?;
+    push_error(
+        &mut vectors,
+        "141_float_tensor_element_count_mismatch",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let meta = float_tensor_meta_value(
+        "fp32",
+        &[],
+        1,
+        1,
+        8,
+        23,
+        exp_len,
+        mant_len,
+        float_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &float_stored, 8, limits)?;
+    push_error(
+        &mut vectors,
+        "142_float_tensor_rank_zero",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let meta = float_tensor_meta_value(
+        "fp32",
+        &[2, 0],
+        0,
+        1,
+        8,
+        23,
+        exp_len,
+        mant_len,
+        float_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &float_stored, 8, limits)?;
+    push_error(
+        &mut vectors,
+        "143_float_tensor_zero_dimension",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let meta = float_tensor_meta_value(
+        "fp16",
+        &[2],
+        2,
+        1,
+        8,
+        7,
+        exp_len,
+        mant_len,
+        float_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &float_stored, 8, limits)?;
+    push_error(
+        &mut vectors,
+        "144_float_tensor_field_widths_mismatch",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let meta = float_tensor_meta_value("fp8-e4m3", &[2], 2, 1, 4, 3, u64::MAX, 1, &[0u8; 32]);
+    let frame = float_ai_frame(&meta, b"", 2, limits)?;
+    push_error(
+        &mut vectors,
+        "145_float_tensor_plane_length_overflow",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::LimitExceeded,
+        None,
+    );
+
+    let mut garbage = vec![0xffu8; 3];
+    garbage.extend_from_slice(&mant_plane);
+    let garbage_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &garbage);
+    let meta = float_tensor_meta_value(
+        "fp32",
+        &[2],
+        2,
+        1,
+        8,
+        23,
+        3,
+        mant_len,
+        garbage_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &garbage, 8, limits)?;
+    push_error(
+        &mut vectors,
+        "146_float_tensor_exponent_plane_not_zstd",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::Corrupt,
+        None,
+    );
+
+    let meta = float_tensor_meta_value(
+        "fp32",
+        &[2],
+        2,
+        1,
+        8,
+        23,
+        exp_len,
+        mant_len,
+        float_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &float_stored, 7, limits)?;
+    push_error(
+        &mut vectors,
+        "147_float_tensor_decoded_len_mismatch",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::Corrupt,
         None,
     );
 

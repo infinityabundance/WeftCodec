@@ -77,6 +77,9 @@ pub enum Mode {
     TokenSequence = 7,
     /// Affine quantized tensor (i8/u8) with WCB descriptor (WEFT-AI-CODEC §4).
     QuantizedTensor = 8,
+    /// Split float tensor: zstd exponent plane plus raw sign+mantissa plane
+    /// with WCB descriptor (WEFT-AI-CODEC §5).
+    FloatTensor = 9,
 }
 
 impl Mode {
@@ -92,7 +95,8 @@ impl Mode {
             6 => Ok(Mode::Tensor),
             7 => Ok(Mode::TokenSequence),
             8 => Ok(Mode::QuantizedTensor),
-            9..=127 => Err(Error::unsupported_mode(format!(
+            9 => Ok(Mode::FloatTensor),
+            10..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -118,6 +122,7 @@ impl Mode {
             Mode::Tensor => "tensor",
             Mode::TokenSequence => "tokens",
             Mode::QuantizedTensor => "quantized_tensor",
+            Mode::FloatTensor => "float_tensor",
         }
     }
 
@@ -133,6 +138,7 @@ impl Mode {
             "tensor" => Ok(Mode::Tensor),
             "tokens" | "token_sequence" => Ok(Mode::TokenSequence),
             "quantized" | "quantized_tensor" => Ok(Mode::QuantizedTensor),
+            "float_tensor" | "float-tensor" => Ok(Mode::FloatTensor),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -755,10 +761,10 @@ fn validate_mode_rules(
                 return Err(Error::malformed("DELTA must not be chunked"));
             }
         }
-        Mode::Tensor | Mode::TokenSequence | Mode::QuantizedTensor => {
+        Mode::Tensor | Mode::TokenSequence | Mode::QuantizedTensor | Mode::FloatTensor => {
             if header.domain != DOMAIN_PAYLOAD {
                 return Err(Error::malformed(
-                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR frames must use the payload domain",
+                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR/FLOAT_TENSOR frames must use the payload domain",
                 ));
             }
             if dict_flag {
@@ -766,17 +772,17 @@ fn validate_mode_rules(
             }
             if header.dep_count != 0 {
                 return Err(Error::malformed(
-                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR frames must not have dependencies in v1",
+                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR/FLOAT_TENSOR frames must not have dependencies in v1",
                 ));
             }
             if header.chunk_count != 0 {
                 return Err(Error::malformed(
-                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR frames must not be chunked",
+                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR/FLOAT_TENSOR frames must not be chunked",
                 ));
             }
             if header.body_len < 4 {
                 return Err(Error::malformed(
-                    "TENSOR/TOKEN_SEQUENCE body is shorter than its 4-byte metadata length",
+                    "AI-mode body is shorter than its 4-byte metadata length",
                 ));
             }
         }

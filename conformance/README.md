@@ -58,31 +58,39 @@ hash/length vectors the listed hash/bytes are the wrong values supplied to the
 resolver.
 
 `mode` names are `raw`, `zstd`, `reference`, `delta`, `dictionary`,
-`structured`, `tensor`, `tokens`, and `quantized_tensor`.
+`structured`, `tensor`, `tokens`, `quantized_tensor`, and `float_tensor`.
 
-### AI modes (`tensor`, `tokens`, `quantized_tensor`)
+### AI modes (`tensor`, `tokens`, `quantized_tensor`, `float_tensor`)
 
-WEFT-AI-CODEC v1.1.0 allocates mode 6 `TENSOR`, mode 7 `TOKEN_SEQUENCE`, and
-mode 8 `QUANTIZED_TENSOR`. Their bodies are `u32le(meta_len) || WCB(meta) ||
-payload`; the frame `decoded_len` and `content_hash` cover the payload, and the
-WCB descriptor binds it under `weft/tensor/payload/v1`,
-`weft/tokens/payload/v1`, or `weft/quantized-tensor/payload/v1`.
+WEFT-AI-CODEC v1.1.0 allocates mode 6 `TENSOR`, mode 7 `TOKEN_SEQUENCE`,
+mode 8 `QUANTIZED_TENSOR`, and mode 9 `FLOAT_TENSOR`. Their bodies are
+`u32le(meta_len) || WCB(meta) || payload`; the frame `decoded_len` and
+`content_hash` cover the decoded bytes, and the WCB descriptor binds the stored
+payload under `weft/tensor/payload/v1`, `weft/tokens/payload/v1`,
+`weft/quantized-tensor/payload/v1`, or `weft/float-tensor/payload/v1`.
+`FLOAT_TENSOR` stores a zstd-compressed exponent plane plus a raw
+sign+mantissa plane, while `decoded_len` is the reconstructed element length.
 
 Valid vectors: `100_tensor_f32_2x3`, `101_tensor_f16_scalar`,
 `102_tensor_u8_zero_element`, `103_tokens_delta_boundaries`,
 `104_tokens_empty`, `105_quantized_i8_2x3`,
-`106_quantized_u8_zero_element`, `107_quantized_i8_scalar`. Reject vectors
+`106_quantized_u8_zero_element`, `107_quantized_i8_scalar`,
+`108_float_bf16_2x2`, `109_float_fp16_3d`, `110_float_fp32_4d`. Reject vectors
 `120`–`135` cover shape/payload/hash/layout/dtype/overflow/rank/encoding/
 canonicality/count limits; `030`–`037` cover quantized dtype, scale, zero
-point, layout, payload-length, and hash rejects.
+point, layout, payload-length, and hash rejects; `140`–`147` cover float-tensor
+dtype, shape/count, rank 0, zero dimension, field widths, plane-length
+overflow, non-zstd exponent plane, and decoded-length rejects.
 
 `017_unknown_mode` historically asserted that mode value 6 was unknown. It is
 retained byte-for-byte with `"superseded_by":
 "017_unknown_mode_reserved8"`; replay suites skip superseded vectors.
-`017_unknown_mode_reserved8` is itself retained byte-for-byte and marked
+`017_unknown_mode_reserved8` is retained and marked
 `"superseded_by": "017_unknown_mode_reserved9"` because mode 8 is now
-`QUANTIZED_TENSOR`. The current reserved-value vector is
-`017_unknown_mode_reserved9` (mode 9).
+`QUANTIZED_TENSOR`; `017_unknown_mode_reserved9` is retained and marked
+`"superseded_by": "017_unknown_mode_reserved10"` because mode 9 is now
+`FLOAT_TENSOR`. The current reserved-value vector is
+`017_unknown_mode_reserved10` (mode 10).
 
 ### `structured/*.json`
 

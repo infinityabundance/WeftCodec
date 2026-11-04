@@ -14,8 +14,8 @@ use crate::frame::{
     DEP_DOMAIN_PAYLOAD, DOMAIN_PAYLOAD, DOMAIN_STRUCTURED, FORMAT_MAJOR, FORMAT_MINOR,
 };
 use crate::hash::{
-    hash_domain, DOMAIN_CHUNK, DOMAIN_QUANTIZED_TENSOR_PAYLOAD, DOMAIN_TENSOR_PAYLOAD,
-    DOMAIN_TOKENS_PAYLOAD,
+    hash_domain, DOMAIN_CHUNK, DOMAIN_FLOAT_TENSOR_PAYLOAD, DOMAIN_QUANTIZED_TENSOR_PAYLOAD,
+    DOMAIN_TENSOR_PAYLOAD, DOMAIN_TOKENS_PAYLOAD,
 };
 use crate::limits::{check_len, Limits};
 use crate::varint;
@@ -218,6 +218,7 @@ pub fn decode_bytes(
         Mode::Tensor => decode_tensor(&frame, limits)?,
         Mode::TokenSequence => decode_token_sequence(&frame, limits)?,
         Mode::QuantizedTensor => decode_quantized_tensor(&frame, limits)?,
+        Mode::FloatTensor => decode_float_tensor(&frame, limits)?,
     };
 
     if plaintext.len() as u64 != frame.header.decoded_len {
@@ -877,6 +878,20 @@ fn build_ai_body(meta: &Value, payload: &[u8], limits: &Limits) -> Result<Vec<u8
 }
 
 fn split_ai_body<'a>(body: &'a [u8], decoded_len: u64) -> Result<(&'a [u8], &'a [u8])> {
+    let (descriptor, payload) = split_ai_body_prefix(body)?;
+    if payload.len() as u64 != decoded_len {
+        return Err(Error::malformed(format!(
+            "AI payload length {} differs from decoded_len {decoded_len}",
+            payload.len()
+        )));
+    }
+    Ok((descriptor, payload))
+}
+
+/// Split the descriptor prefix from the stored payload without assuming the
+/// stored payload length equals `decoded_len`. FLOAT_TENSOR needs this because
+/// the stored planes are smaller than the reconstructed element bytes.
+fn split_ai_body_prefix(body: &[u8]) -> Result<(&[u8], &[u8])> {
     if body.len() < 4 {
         return Err(Error::malformed(
             "AI body is shorter than its 4-byte metadata length",
@@ -889,14 +904,7 @@ fn split_ai_body<'a>(body: &'a [u8], decoded_len: u64) -> Result<(&'a [u8], &'a 
     if meta_end > body.len() {
         return Err(Error::malformed("AI metadata extends past the frame body"));
     }
-    let payload = &body[meta_end..];
-    if payload.len() as u64 != decoded_len {
-        return Err(Error::malformed(format!(
-            "AI payload length {} differs from decoded_len {decoded_len}",
-            payload.len()
-        )));
-    }
-    Ok((&body[4..meta_end], payload))
+    Ok((&body[4..meta_end], &body[meta_end..]))
 }
 
 /// Encode a canonical tensor payload (WEFT-AI-CODEC §2).
@@ -1288,6 +1296,535 @@ fn parse_quantized_tensor_body<'a>(
             zero_point,
         },
         payload,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// FLOAT_TENSOR (mode 9, WEFT-AI-CODEC §5)
+// ---------------------------------------------------------------------------
+
+/// Canonical float-tensor schema.
+pub const FLOAT_TENSOR_SCHEMA: &str = "weft.ai.float_tensor.v1";
+/// The reference exponent-plane zstd level (informational, like frame `level`).
+pub const FLOAT_TENSOR_ZSTD_LEVEL: i32 = 3;
+
+/// Float element dtypes implemented in v1. All are byte-aligned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatDtype {
+    Bf16,
+    F16,
+    F32,
+    Fp8E4m3,
+    Fp8E5m2,
+}
+
+impl FloatDtype {
+    /// Parse the canonical dtype name.
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "bf16" => Ok(FloatDtype::Bf16),
+            "fp16" => Ok(FloatDtype::F16),
+            "fp32" => Ok(FloatDtype::F32),
+            "fp8-e4m3" => Ok(FloatDtype::Fp8E4m3),
+            "fp8-e5m2" => Ok(FloatDtype::Fp8E5m2),
+            other => Err(Error::malformed(format!(
+                "unknown float tensor dtype `{other}` (v1 allows bf16, fp16, fp32, fp8-e4m3, fp8-e5m2)"
+            ))),
+        }
+    }
+
+    /// Canonical dtype name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FloatDtype::Bf16 => "bf16",
+            FloatDtype::F16 => "fp16",
+            FloatDtype::F32 => "fp32",
+            FloatDtype::Fp8E4m3 => "fp8-e4m3",
+            FloatDtype::Fp8E5m2 => "fp8-e5m2",
+        }
+    }
+
+    /// Field widths `(sign, exponent, mantissa)`.
+    pub fn field_bits(self) -> (u64, u64, u64) {
+        match self {
+            FloatDtype::Bf16 => (1, 8, 7),
+            FloatDtype::F16 => (1, 5, 10),
+            FloatDtype::F32 => (1, 8, 23),
+            FloatDtype::Fp8E4m3 => (1, 4, 3),
+            FloatDtype::Fp8E5m2 => (1, 5, 2),
+        }
+    }
+
+    pub fn sign_bits(self) -> u64 {
+        self.field_bits().0
+    }
+
+    pub fn exponent_bits(self) -> u64 {
+        self.field_bits().1
+    }
+
+    pub fn mantissa_bits(self) -> u64 {
+        self.field_bits().2
+    }
+
+    /// Total element width in bits. Byte-aligned for every v1 dtype.
+    pub fn element_bits(self) -> u64 {
+        let (sign, exponent, mantissa) = self.field_bits();
+        sign + exponent + mantissa
+    }
+
+    /// Element width in bytes; only valid for byte-aligned dtypes.
+    pub fn element_size(self) -> u64 {
+        self.element_bits() / 8
+    }
+}
+
+/// Float-tensor descriptor recovered from a frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloatTensorMeta {
+    pub dtype: FloatDtype,
+    pub shape: Vec<u64>,
+    pub element_count: u64,
+    pub sign_bits: u64,
+    pub exponent_bits: u64,
+    pub mantissa_bits: u64,
+    pub exponent_plane_len: u64,
+    pub mantissa_plane_len: u64,
+}
+
+fn meta_byte_field(map: &BTreeMap<String, Value>, key: &str) -> Result<u64> {
+    let value = meta_u64(map, key)?;
+    if value > u64::from(u8::MAX) {
+        return Err(Error::malformed(format!(
+            "float tensor `{key}` must fit an unsigned byte, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
+fn float_tensor_product(shape: &[u64], limits: &Limits) -> Result<u64> {
+    if shape.is_empty() {
+        return Err(Error::malformed(
+            "float tensor shape rank must be at least 1",
+        ));
+    }
+    if shape.len() as u64 > limits.max_tensor_rank {
+        return Err(Error::limit_exceeded(format!(
+            "float tensor rank {} exceeds limit {}",
+            shape.len(),
+            limits.max_tensor_rank
+        )));
+    }
+    let mut product: u64 = 1;
+    for dim in shape {
+        if *dim == 0 {
+            return Err(Error::malformed(
+                "float tensor shape dimensions must be greater than zero",
+            ));
+        }
+        product = product
+            .checked_mul(*dim)
+            .ok_or_else(|| Error::limit_exceeded("float tensor shape product overflows u64"))?;
+    }
+    if product > limits.max_tensor_elements {
+        return Err(Error::limit_exceeded(format!(
+            "float tensor element count {product} exceeds limit {}",
+            limits.max_tensor_elements
+        )));
+    }
+    Ok(product)
+}
+
+/// Append `count` low bits of `value`, most significant first, at the current
+/// bit position. `out` grows by one byte whenever a new byte is started.
+fn push_bits(out: &mut Vec<u8>, bit_len: &mut usize, value: u64, count: usize) {
+    for shift in (0..count).rev() {
+        let bit = ((value >> shift) & 1) as u8;
+        let byte_index = *bit_len / 8;
+        if byte_index == out.len() {
+            out.push(0);
+        }
+        out[byte_index] |= bit << (7 - (*bit_len % 8));
+        *bit_len += 1;
+    }
+}
+
+/// Read `count` bits, most significant first, from `plane` at `pos`.
+fn take_bits(plane: &[u8], pos: &mut usize, count: usize) -> u64 {
+    let mut value = 0u64;
+    for _ in 0..count {
+        let bit = (plane[*pos / 8] >> (7 - (*pos % 8))) & 1;
+        value = (value << 1) | u64::from(bit);
+        *pos += 1;
+    }
+    value
+}
+
+/// Split a little-endian float tensor payload into its two planes.
+///
+/// Returns `(exponent_plane_compressed, mantissa_plane)`.
+pub fn split_float_tensor_payload(
+    payload: &[u8],
+    dtype: FloatDtype,
+    element_count: u64,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let expected_bytes = element_count
+        .checked_mul(dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("float tensor decoded byte count overflows u64"))?;
+    if payload.len() as u64 != expected_bytes {
+        return Err(Error::malformed(format!(
+            "float tensor payload is {} bytes but the descriptor requires {expected_bytes}",
+            payload.len()
+        )));
+    }
+    let element_bytes = usize::try_from(dtype.element_size())
+        .map_err(|_| Error::limit_exceeded("float tensor element size does not fit usize"))?;
+    let count = usize::try_from(element_count)
+        .map_err(|_| Error::limit_exceeded("float tensor element count does not fit usize"))?;
+    let sign_bits = dtype.sign_bits() as usize;
+    let exponent_bits = dtype.exponent_bits() as usize;
+    let mantissa_bits = dtype.mantissa_bits() as usize;
+    let mantissa_mask = (1u64 << mantissa_bits) - 1;
+    let exponent_mask = (1u64 << exponent_bits) - 1;
+
+    let mut exponent_plane = Vec::with_capacity(count.min(1 << 20));
+    let mut mantissa_plane = Vec::new();
+    let mut bit_len = 0usize;
+    for chunk in payload.chunks_exact(element_bytes) {
+        let mut word = 0u64;
+        for (index, byte) in chunk.iter().enumerate() {
+            word |= u64::from(*byte) << (8 * index);
+        }
+        let exponent = (word >> mantissa_bits) & exponent_mask;
+        let mantissa = word & mantissa_mask;
+        let sign = (word >> (exponent_bits + mantissa_bits)) & 1;
+        exponent_plane.push(exponent as u8);
+        push_bits(&mut mantissa_plane, &mut bit_len, sign, sign_bits);
+        push_bits(&mut mantissa_plane, &mut bit_len, mantissa, mantissa_bits);
+    }
+    Ok((
+        compress(&exponent_plane, FLOAT_TENSOR_ZSTD_LEVEL)?,
+        mantissa_plane,
+    ))
+}
+
+/// Reconstruct the exact little-endian element bytes from the two planes.
+pub fn join_float_tensor_payload(
+    exponent_plane: &[u8],
+    mantissa_plane: &[u8],
+    dtype: FloatDtype,
+    element_count: u64,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let count = usize::try_from(element_count)
+        .map_err(|_| Error::limit_exceeded("float tensor element count does not fit usize"))?;
+    if exponent_plane.len() != count {
+        return Err(Error::corrupt(format!(
+            "float tensor exponent plane has {} bytes but element_count is {element_count}",
+            exponent_plane.len()
+        )));
+    }
+    let element_bytes = usize::try_from(dtype.element_size())
+        .map_err(|_| Error::limit_exceeded("float tensor element size does not fit usize"))?;
+    let decoded_bytes = element_count
+        .checked_mul(dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("float tensor decoded byte count overflows u64"))?;
+    check_len(
+        decoded_bytes,
+        limits.max_decoded_bytes,
+        "float tensor decoded bytes",
+    )?;
+    let sign_bits = dtype.sign_bits() as usize;
+    let exponent_bits = dtype.exponent_bits() as usize;
+    let mantissa_bits = dtype.mantissa_bits() as usize;
+    let expected_mantissa_bits = element_count
+        .checked_mul((sign_bits + mantissa_bits) as u64)
+        .ok_or_else(|| Error::limit_exceeded("float tensor mantissa bit count overflows u64"))?;
+    let expected_mantissa_bytes = expected_mantissa_bits
+        .checked_add(7)
+        .ok_or_else(|| Error::limit_exceeded("float tensor mantissa length overflows u64"))?
+        / 8;
+    if mantissa_plane.len() as u64 != expected_mantissa_bytes {
+        return Err(Error::corrupt(format!(
+            "float tensor mantissa plane has {} bytes but descriptor arithmetic requires {expected_mantissa_bytes}",
+            mantissa_plane.len()
+        )));
+    }
+
+    let capacity = usize::try_from(decoded_bytes)
+        .map_err(|_| Error::limit_exceeded("float tensor decoded bytes do not fit usize"))?;
+    let mut out = Vec::with_capacity(capacity.min(1 << 20));
+    let mut bit_pos = 0usize;
+    for &exponent_byte in exponent_plane.iter() {
+        if u64::from(exponent_byte) >> exponent_bits != 0 {
+            return Err(Error::corrupt(
+                "float tensor exponent byte exceeds the dtype exponent width",
+            ));
+        }
+        let sign = take_bits(mantissa_plane, &mut bit_pos, sign_bits);
+        let mantissa = take_bits(mantissa_plane, &mut bit_pos, mantissa_bits);
+        let word = (sign << (exponent_bits + mantissa_bits))
+            | (u64::from(exponent_byte) << mantissa_bits)
+            | mantissa;
+        out.extend_from_slice(&word.to_le_bytes()[..element_bytes]);
+    }
+
+    // Unused low bits of the final mantissa byte are canonical zero padding.
+    let used_bytes_bits = mantissa_plane.len() * 8;
+    let padding = used_bytes_bits - bit_pos;
+    if padding > 0 {
+        let last = *mantissa_plane.last().expect("non-empty mantissa plane");
+        let mask = (1u8 << padding) - 1;
+        if last & mask != 0 {
+            return Err(Error::corrupt(
+                "float tensor mantissa padding bits must be zero",
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Encode a FLOAT_TENSOR frame (WEFT-AI-CODEC §5).
+///
+/// The exponent plane is zstd-compressed at level 3; the sign+mantissa plane is
+/// stored raw. Every element bit pattern round-trips, including NaN payloads.
+pub fn encode_float_tensor(
+    payload: &[u8],
+    dtype: FloatDtype,
+    shape: &[u64],
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    check_len(
+        payload.len() as u64,
+        limits.max_decoded_bytes,
+        "float tensor payload",
+    )?;
+    let element_bits = dtype.element_bits();
+    if element_bits % 8 != 0 {
+        return Err(Error::malformed(format!(
+            "float tensor dtype `{}` is not byte-aligned",
+            dtype.as_str()
+        )));
+    }
+    let element_count = float_tensor_product(shape, limits)?;
+    let decoded_bytes = element_count
+        .checked_mul(dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("float tensor decoded byte count overflows u64"))?;
+    check_len(
+        decoded_bytes,
+        limits.max_decoded_bytes,
+        "float tensor decoded bytes",
+    )?;
+    if decoded_bytes != payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "float tensor payload is {} bytes but shape {:?} x {} is {decoded_bytes} bytes",
+            payload.len(),
+            shape,
+            dtype.as_str()
+        )));
+    }
+
+    let (exponent_plane, mantissa_plane) =
+        split_float_tensor_payload(payload, dtype, element_count)?;
+    let mut stored = Vec::with_capacity(exponent_plane.len() + mantissa_plane.len());
+    stored.extend_from_slice(&exponent_plane);
+    stored.extend_from_slice(&mantissa_plane);
+
+    let meta = Value::map([
+        ("schema", Value::Str(FLOAT_TENSOR_SCHEMA.to_owned())),
+        ("dtype", Value::Str(dtype.as_str().to_owned())),
+        (
+            "shape",
+            Value::Array(shape.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        ("element_count", Value::U64(element_count)),
+        ("sign_bits", Value::U64(dtype.sign_bits())),
+        ("exponent_bits", Value::U64(dtype.exponent_bits())),
+        ("mantissa_bits", Value::U64(dtype.mantissa_bits())),
+        (
+            "exponent_plane_len",
+            Value::U64(exponent_plane.len() as u64),
+        ),
+        (
+            "mantissa_plane_len",
+            Value::U64(mantissa_plane.len() as u64),
+        ),
+        (
+            "payload_hash",
+            Value::Bytes(
+                hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &stored)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ),
+    ]);
+    let body = build_ai_body(&meta, &stored, limits)?;
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::FloatTensor,
+        flags: 0,
+        level: FLOAT_TENSOR_ZSTD_LEVEL as u16,
+        decoded_len: decoded_bytes,
+        content_hash: hash_domain(DOMAIN_CHUNK, payload),
+        dependencies: &[],
+        chunks: &[],
+        body: &body,
+    };
+    encode_frame(&parts, limits)
+}
+
+/// Validate and decode a FLOAT_TENSOR frame, returning the reconstructed
+/// little-endian element bytes.
+pub fn decode_float_tensor(frame: &Frame<'_>, limits: &Limits) -> Result<Vec<u8>> {
+    let (_, bytes) = parse_float_tensor_body(frame, limits)?;
+    Ok(bytes)
+}
+
+/// Parse and validate a FLOAT_TENSOR descriptor, returning it with the
+/// reconstructed element bytes.
+pub fn float_tensor_metadata(frame: &Frame<'_>, limits: &Limits) -> Result<FloatTensorMeta> {
+    let (meta, _) = parse_float_tensor_body(frame, limits)?;
+    Ok(meta)
+}
+
+fn parse_float_tensor_body(
+    frame: &Frame<'_>,
+    limits: &Limits,
+) -> Result<(FloatTensorMeta, Vec<u8>)> {
+    let (descriptor_bytes, stored) = split_ai_body_prefix(frame.body)?;
+    let value = wcb::decode(descriptor_bytes, limits)?;
+    let map = ai_map(&value, "float tensor")?;
+    check_exact_keys(
+        map,
+        &[
+            "schema",
+            "dtype",
+            "shape",
+            "element_count",
+            "sign_bits",
+            "exponent_bits",
+            "mantissa_bits",
+            "exponent_plane_len",
+            "mantissa_plane_len",
+            "payload_hash",
+        ],
+        "float tensor",
+    )?;
+    let schema = meta_text(map, "schema")?;
+    if schema != FLOAT_TENSOR_SCHEMA {
+        return Err(Error::malformed(format!(
+            "unsupported float tensor schema `{schema}`"
+        )));
+    }
+    let dtype = FloatDtype::from_name(meta_text(map, "dtype")?)?;
+    let sign_bits = meta_byte_field(map, "sign_bits")?;
+    let exponent_bits = meta_byte_field(map, "exponent_bits")?;
+    let mantissa_bits = meta_byte_field(map, "mantissa_bits")?;
+    if (sign_bits, exponent_bits, mantissa_bits) != dtype.field_bits() {
+        return Err(Error::malformed(format!(
+            "float tensor sub-field widths {}, {}, {} disagree with dtype `{}` ({}, {}, {})",
+            sign_bits,
+            exponent_bits,
+            mantissa_bits,
+            dtype.as_str(),
+            dtype.sign_bits(),
+            dtype.exponent_bits(),
+            dtype.mantissa_bits()
+        )));
+    }
+    let element_bits = sign_bits + exponent_bits + mantissa_bits;
+    if element_bits % 8 != 0 {
+        return Err(Error::malformed(
+            "float tensor element width is not byte-aligned",
+        ));
+    }
+    let element_size = element_bits / 8;
+    let shape = meta_shape(map)?;
+    let declared_count = meta_u64(map, "element_count")?;
+    let expected_count = float_tensor_product(&shape, limits)?;
+    if declared_count != expected_count {
+        return Err(Error::malformed(format!(
+            "float tensor element_count {declared_count} does not match shape product {expected_count}"
+        )));
+    }
+    let decoded_bytes = declared_count
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::limit_exceeded("float tensor decoded byte count overflows u64"))?;
+    check_len(
+        decoded_bytes,
+        limits.max_decoded_bytes,
+        "float tensor decoded bytes",
+    )?;
+    if decoded_bytes != frame.header.decoded_len {
+        return Err(Error::corrupt(format!(
+            "float tensor decoded_len is {} but the descriptor requires {decoded_bytes}",
+            frame.header.decoded_len
+        )));
+    }
+
+    let mantissa_bit_total = declared_count
+        .checked_mul(sign_bits + mantissa_bits)
+        .ok_or_else(|| Error::limit_exceeded("float tensor mantissa bit count overflows u64"))?;
+    let expected_mantissa_bytes = mantissa_bit_total
+        .checked_add(7)
+        .ok_or_else(|| Error::limit_exceeded("float tensor mantissa length overflows u64"))?
+        / 8;
+    let declared_mantissa_len = meta_u64(map, "mantissa_plane_len")?;
+    if declared_mantissa_len != expected_mantissa_bytes {
+        return Err(Error::malformed(format!(
+            "float tensor mantissa_plane_len {declared_mantissa_len} does not match element_count x (sign_bits + mantissa_bits) / 8 {expected_mantissa_bytes}"
+        )));
+    }
+    let declared_exponent_len = meta_u64(map, "exponent_plane_len")?;
+    let stored_len = declared_exponent_len
+        .checked_add(declared_mantissa_len)
+        .ok_or_else(|| Error::limit_exceeded("float tensor plane lengths overflow u64"))?;
+    if stored_len != stored.len() as u64 {
+        return Err(Error::malformed(format!(
+            "float tensor stored payload is {} bytes but the descriptor declares {stored_len}",
+            stored.len()
+        )));
+    }
+
+    let exponent_len = usize::try_from(declared_exponent_len).map_err(|_| {
+        Error::limit_exceeded("float tensor exponent plane length does not fit usize")
+    })?;
+    let (exponent_compressed, mantissa_plane) = stored.split_at(exponent_len);
+    let exponent_plane = decompress(exponent_compressed, declared_count)?;
+    let bytes = join_float_tensor_payload(
+        &exponent_plane,
+        mantissa_plane,
+        dtype,
+        declared_count,
+        limits,
+    )?;
+
+    let declared_hash = meta_bytes(map, "payload_hash")?;
+    if declared_hash.len() != 32 {
+        return Err(Error::malformed(format!(
+            "float tensor payload_hash must be 32 bytes, got {}",
+            declared_hash.len()
+        )));
+    }
+    let actual_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, stored);
+    if declared_hash != actual_hash.as_bytes().as_slice() {
+        return Err(Error::corrupt("float tensor payload_hash mismatch"));
+    }
+
+    Ok((
+        FloatTensorMeta {
+            dtype,
+            shape,
+            element_count: declared_count,
+            sign_bits,
+            exponent_bits,
+            mantissa_bits,
+            exponent_plane_len: declared_exponent_len,
+            mantissa_plane_len: declared_mantissa_len,
+        },
+        bytes,
     ))
 }
 

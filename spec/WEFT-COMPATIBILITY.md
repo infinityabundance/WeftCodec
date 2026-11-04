@@ -180,26 +180,32 @@ An implementation MUST NOT silently downgrade a `causal_exact` artifact to
 
 ## 10. AI codec mode allocation (additive, v1)
 
-`WEFT-AI-CODEC.md` v1.1.0 allocates two previously reserved payload modes:
+`WEFT-AI-CODEC.md` v1.1.0 allocates previously reserved payload modes:
 
 | Value | Name | Body |
 |---:|---|---|
 | 6 | `TENSOR` | `u32le(meta_len) || WCB(weft.tensor.v1) || payload` |
 | 7 | `TOKEN_SEQUENCE` | `u32le(meta_len) || WCB(weft.tokens.v1) || payload` |
+| 8 | `QUANTIZED_TENSOR` | `u32le(meta_len) || WCB(weft.quantized-tensor.v1) || payload` |
+| 9 | `FLOAT_TENSOR` | `u32le(meta_len) || WCB(weft.ai.float_tensor.v1) || zstd exponent plane || raw sign+mantissa plane` |
 
 This is an additive extension of the `weftcodec-format 1.0` mode space, not a
 change to existing modes. Rules:
 
 - A reader that does not implement these modes MUST reject them as
   `UnsupportedMode`. It MUST NOT treat the payload as opaque bytes.
-- Mode values `8..=127` stay reserved and `128..=255` stay experimental.
-- The new hash domains `weft/tensor/payload/v1` and
-  `weft/tokens/payload/v1` are additive; existing domains are unchanged.
+- Mode values `10..=127` stay reserved and `128..=255` stay experimental.
+- The new hash domains `weft/tensor/payload/v1`,
+  `weft/tokens/payload/v1`, `weft/quantized-tensor/payload/v1`, and
+  `weft/float-tensor/payload/v1` are additive; existing domains are unchanged.
 - Neither mode changes RAW, ZSTD, REFERENCE, DELTA, DICTIONARY, STRUCTURED, the
   header, the tables, WCB, or selector bytes.
 - Historical vector `017_unknown_mode` asserted that value 6 was unknown. It is
   retained byte-for-byte and marked `superseded_by`
   `017_unknown_mode_reserved8`; both replay suites skip superseded vectors.
-  The authoritative reserved-value reject is now mode 8.
-- Because these modes are deterministic, cross-language conformance requires
-  byte-identical frames **and** decode equivalence, unlike ZSTD/DICTIONARY.
+  The authoritative reserved-value reject is now mode 10.
+- TENSOR, TOKEN_SEQUENCE, and QUANTIZED_TENSOR are deterministic, so
+  cross-language conformance requires byte-identical frames **and** decode
+  equivalence. FLOAT_TENSOR embeds a zstd exponent plane: decode equivalence is
+  required in both directions, while byte identity depends on the two zstd
+  encoders and is reported as observed evidence, not assumed.

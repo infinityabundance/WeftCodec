@@ -63,10 +63,10 @@ fn structural_header_errors() {
     fix_header_and_trailer(&mut minor);
     assert_eq!(parse(&minor), ErrorClass::UnsupportedVersion);
 
-    // Modes 6, 7, and 8 are allocated (TENSOR, TOKEN_SEQUENCE,
-    // QUANTIZED_TENSOR); 9 is reserved.
+    // Modes 6, 7, 8, and 9 are allocated (TENSOR, TOKEN_SEQUENCE,
+    // QUANTIZED_TENSOR, FLOAT_TENSOR); 10 is reserved.
     let mut mode = good.clone();
-    mode[7] = 9;
+    mode[7] = 10;
     fix_header_and_trailer(&mut mode);
     assert_eq!(parse(&mode), ErrorClass::UnsupportedMode);
 

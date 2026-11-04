@@ -141,7 +141,9 @@ A reader MUST reject:
 | 5 | `STRUCTURED` | body is canonical WCB (see §6); domain MUST be 1 |
 | 6 | `TENSOR` | body is `u32le(meta_len) || WCB(meta) || element payload`; WEFT-AI-CODEC §2 |
 | 7 | `TOKEN_SEQUENCE` | body is `u32le(meta_len) || WCB(meta) || token payload`; WEFT-AI-CODEC §3 |
-| 8..127 | — | reserved; `UnsupportedMode` |
+| 8 | `QUANTIZED_TENSOR` | body is `u32le(meta_len) || WCB(meta) || packed element payload`; WEFT-AI-CODEC §4 |
+| 9 | `FLOAT_TENSOR` | body is `u32le(meta_len) || WCB(meta) || zstd exponent plane || raw sign+mantissa plane`; WEFT-AI-CODEC §5 |
+| 10..127 | — | reserved; `UnsupportedMode` |
 | 128..255 | — | experimental; MUST be rejected for persistence |
 
 Global mode rules:
@@ -412,11 +414,12 @@ compressed or descriptor bytes.
 - Adding an optional field requires a minor version and a default that older
   readers already implement; otherwise it requires a major version.
 - Allocating a previously reserved mode value is an additive extension that
-  old readers must reject as `UnsupportedMode` (fail closed). `TENSOR` (6) and
-  `TOKEN_SEQUENCE` (7) were allocated this way; `WEFT-AI-CODEC.md` is
-  normative for their bodies. Historical vector `017_unknown_mode` asserted
-  that value 6 was unknown; it is retained byte-for-byte and marked
-  `superseded_by` the new reserved-value vector `017_unknown_mode_reserved8`.
+  old readers must reject as `UnsupportedMode` (fail closed). `TENSOR` (6),
+  `TOKEN_SEQUENCE` (7), `QUANTIZED_TENSOR` (8), and `FLOAT_TENSOR` (9) were
+  allocated this way; `WEFT-AI-CODEC.md` is normative for their bodies.
+  Historical vector `017_unknown_mode` asserted that value 6 was unknown; it is
+  retained byte-for-byte and marked `superseded_by` the current reserved-value
+  vector `017_unknown_mode_reserved10`.
 - Unknown critical flags/features/modes fail closed.
 - Frozen v1 vectors are append-only; they are never regenerated to hide a
   change.
