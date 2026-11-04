@@ -30,6 +30,7 @@ use crate::tensor::{self, LayoutDescriptor, LogicalRecord, TensorLayout};
 use crate::tensor_sharded;
 use crate::varint;
 use crate::wcb::{self, Value};
+use crate::weight_delta::{self, WeightDeltaMeta, WeightDtype};
 
 /// Generate every v1 vector into `dir` (creating `codec/`, `structured/`,
 /// `selectors/`, `context/`, `causal/`, and `tensor/`).
@@ -41,6 +42,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let causal_dir = dir.join("causal");
     let tensor_dir = dir.join("tensor");
     let sharded_dir = dir.join("sharded");
+    let weight_delta_dir = dir.join("weight-delta");
     for sub in [
         &codec_dir,
         &structured_dir,
@@ -49,6 +51,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
         &causal_dir,
         &tensor_dir,
         &sharded_dir,
+        &weight_delta_dir,
     ] {
         fs::create_dir_all(sub)
             .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
@@ -61,6 +64,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_causal_vectors(&causal_dir, limits)?;
     write_tensor_vectors(&tensor_dir, limits)?;
     write_sharded_vectors(&sharded_dir, limits)?;
+    write_weight_delta_vectors(&weight_delta_dir, limits)?;
     Ok(())
 }
 
@@ -78,6 +82,15 @@ pub fn generate_sharded_v1(dir: &Path, limits: &Limits) -> Result<()> {
     fs::create_dir_all(&sharded_dir)
         .map_err(|e| Error::io(format!("cannot create {}: {e}", sharded_dir.display())))?;
     write_sharded_vectors(&sharded_dir, limits)
+}
+
+/// Generate only the WEIGHT_DELTA (mode 11) vectors into
+/// `<dir>/weight-delta`.
+pub fn generate_weight_delta_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let weight_delta_dir = dir.join("weight-delta");
+    fs::create_dir_all(&weight_delta_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", weight_delta_dir.display())))?;
+    write_weight_delta_vectors(&weight_delta_dir, limits)
 }
 
 fn write_json(path: &Path, value: &Json) -> Result<()> {
@@ -531,11 +544,11 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     );
 
     let mut unknown_mode = good.clone();
-    unknown_mode[7] = 11;
+    unknown_mode[7] = 12;
     refix_header_and_trailer(&mut unknown_mode);
     push_error(
         &mut vectors,
-        &name("unknown_mode_reserved11"),
+        &name("unknown_mode_reserved12"),
         "raw",
         &unknown_mode,
         &[],
@@ -3041,4 +3054,361 @@ fn write_sharded_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mode 11 WEIGHT_DELTA
+// ---------------------------------------------------------------------------
+
+fn weight_delta_bf16_case(limits: &Limits) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let base_words: [u16; 6] = [0x3F80, 0xC000, 0x0000, 0x7FC0, 0x8000, 0x0001];
+    let mut target_words = base_words;
+    // Exactly one word changes; both byte planes carry a non-zero symbol.
+    target_words[2] = 0x3F80;
+    let mut base_bytes = Vec::with_capacity(12);
+    let mut target_bytes = Vec::with_capacity(12);
+    for word in base_words {
+        base_bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    for word in target_words {
+        target_bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let base_frame = modes::encode_tensor(&base_bytes, modes::TensorDtype::Bf16, &[2, 3], limits)?;
+    Ok((target_bytes, base_bytes, base_frame))
+}
+
+fn weight_delta_fp32_zero_case(limits: &Limits) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let words: [u32; 4] = [0x7FC0_0001, 0x8000_0000, 0x0000_0001, 0x7F80_0000];
+    let mut bytes = Vec::with_capacity(16);
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let base_frame = modes::encode_tensor(&bytes, modes::TensorDtype::F32, &[1, 2, 2], limits)?;
+    Ok((bytes.clone(), bytes, base_frame))
+}
+
+fn weight_delta_q8_case(limits: &Limits) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let base: [u8; 8] = [0x80, 0xFF, 0x00, 0x01, 0x7F, 0x2A, 0xF9, 0x64];
+    let mut target = base;
+    // Mixed signed changes, applied to the raw word representation.
+    target[0] = base[0].wrapping_add(1);
+    target[1] = base[1].wrapping_sub(1);
+    target[3] = base[3].wrapping_add(2);
+    target[4] = base[4].wrapping_sub(1);
+    target[6] = base[6].wrapping_add(1);
+    target[7] = base[7].wrapping_sub(2);
+    let base_frame = modes::encode_tensor(&base, modes::TensorDtype::I8, &[2, 4], limits)?;
+    Ok((target.to_vec(), base.to_vec(), base_frame))
+}
+
+fn write_weight_delta_valid(
+    dir: &Path,
+    name: &str,
+    dtype: WeightDtype,
+    shape: &[u64],
+    base_frame: &[u8],
+    target: &[u8],
+    limits: &Limits,
+) -> Result<()> {
+    let delta_frame = weight_delta::encode_weight_delta(target, dtype, shape, base_frame, limits)?;
+    let parsed = Frame::parse(&delta_frame, limits)?;
+    let meta = weight_delta::weight_delta_metadata(&parsed, limits)?;
+    let decoded = weight_delta::decode_with_base_frame(
+        &parsed,
+        base_frame,
+        &crate::dependency::MapResolver::new(),
+        limits,
+    )?;
+    if decoded != target {
+        return Err(Error::corrupt("WEIGHT_DELTA vector does not reconstruct"));
+    }
+    let vector = json!({
+        "name": name,
+        "schema": weight_delta::WEIGHT_DELTA_SCHEMA,
+        "dtype": meta.dtype.as_str(),
+        "shape": meta.shape,
+        "element_count": meta.element_count,
+        "word_bits": meta.word_bits,
+        "base": meta.base.to_hex(),
+        "base_dtype": meta.base_dtype.as_str(),
+        "base_shape": meta.base_shape,
+        "op": meta.op,
+        "planes": meta.planes,
+        "plane_codec": meta.plane_codec,
+        "delta_root": meta.delta_root.to_hex(),
+        "payload_len": meta.payload_len,
+        "target_hash": blake3_hex(target),
+        "target_hex": hexs(target),
+        "base_frame_hex": hexs(base_frame),
+        "delta_frame_hex": hexs(&delta_frame),
+        "expect": { "ok": true },
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_weight_delta_reject(
+    dir: &Path,
+    name: &str,
+    delta_frame: &[u8],
+    base_frame: Option<&[u8]>,
+    expected: ErrorClass,
+    note: &str,
+    use_frame_source: bool,
+) -> Result<()> {
+    let vector = json!({
+        "name": name,
+        "expect_error": expected.as_str(),
+        "note": note,
+        "base_frame_hex": base_frame.map(hexs),
+        "delta_frame_hex": hexs(delta_frame),
+        "use_frame_source": use_frame_source,
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn weight_delta_frame(
+    meta: &WeightDeltaMeta,
+    payload: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    base_mode: u32,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    weight_delta::encode_descriptor_frame(
+        meta,
+        payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )
+}
+
+fn write_weight_delta_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    // --- valid ------------------------------------------------------------
+    let (bf16_target, _bf16_base, bf16_base_frame) = weight_delta_bf16_case(limits)?;
+    write_weight_delta_valid(
+        dir,
+        "001_bf16_small_changes",
+        WeightDtype::Bf16,
+        &[2, 3],
+        &bf16_base_frame,
+        &bf16_target,
+        limits,
+    )?;
+
+    let (fp32_bytes, _fp32_base, fp32_base_frame) = weight_delta_fp32_zero_case(limits)?;
+    write_weight_delta_valid(
+        dir,
+        "002_fp32_zero_delta",
+        WeightDtype::Fp32,
+        &[1, 2, 2],
+        &fp32_base_frame,
+        &fp32_bytes,
+        limits,
+    )?;
+
+    let (q8_target, _q8_base, q8_base_frame) = weight_delta_q8_case(limits)?;
+    write_weight_delta_valid(
+        dir,
+        "003_q8_0_mixed_changes",
+        WeightDtype::Q8_0,
+        &[2, 4],
+        &q8_base_frame,
+        &q8_target,
+        limits,
+    )?;
+
+    // --- rejects derived from the bf16 case -------------------------------
+    let delta_frame = weight_delta::encode_weight_delta(
+        &bf16_target,
+        WeightDtype::Bf16,
+        &[2, 3],
+        &bf16_base_frame,
+        limits,
+    )?;
+    let parsed = Frame::parse(&delta_frame, limits)?;
+    let meta = weight_delta::weight_delta_metadata(&parsed, limits)?;
+    let payload = {
+        let body = &parsed.body;
+        let meta_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+        body[4 + meta_len..].to_vec()
+    };
+    let content_hash = parsed.header.content_hash;
+    let decoded_len = parsed.header.decoded_len;
+    let base_mode = 6u32;
+
+    let mut unknown_op = meta.clone();
+    unknown_op.op = "xor".to_owned();
+    let frame = weight_delta_frame(
+        &unknown_op,
+        &payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )?;
+    write_weight_delta_reject(
+        dir,
+        "101_base_dtype_mismatch",
+        &{
+            let fp32_base =
+                modes::encode_tensor(&vec![0u8; 24], modes::TensorDtype::F32, &[2, 3], limits)?;
+            let fp32_parsed = Frame::parse(&fp32_base, limits)?;
+            let mut mismatch = meta.clone();
+            mismatch.base = fp32_parsed.header.content_hash;
+            weight_delta_frame(&mismatch, &payload, decoded_len, content_hash, 6, limits)?
+        },
+        Some(&modes::encode_tensor(
+            &vec![0u8; 24],
+            modes::TensorDtype::F32,
+            &[2, 3],
+            limits,
+        )?),
+        ErrorClass::DependencyMismatch,
+        "base frame dtype f32 does not match the declared bf16 dtype",
+        false,
+    )?;
+    write_weight_delta_reject(
+        dir,
+        "102_base_shape_mismatch",
+        &{
+            let bf16_base =
+                modes::encode_tensor(&vec![0u8; 12], modes::TensorDtype::Bf16, &[3, 2], limits)?;
+            let bf16_parsed = Frame::parse(&bf16_base, limits)?;
+            let mut mismatch = meta.clone();
+            mismatch.base = bf16_parsed.header.content_hash;
+            weight_delta_frame(&mismatch, &payload, decoded_len, content_hash, 6, limits)?
+        },
+        Some(&modes::encode_tensor(
+            &vec![0u8; 12],
+            modes::TensorDtype::Bf16,
+            &[3, 2],
+            limits,
+        )?),
+        ErrorClass::DependencyMismatch,
+        "base frame shape [3,2] does not match the declared shape [2,3]",
+        false,
+    )?;
+    write_weight_delta_reject(
+        dir,
+        "103_unknown_op",
+        &frame,
+        Some(&bf16_base_frame),
+        ErrorClass::Malformed,
+        "op xor has no v1 implementation",
+        false,
+    )?;
+
+    let mut word_bits = meta.clone();
+    word_bits.word_bits = 8;
+    let frame = weight_delta_frame(
+        &word_bits,
+        &payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )?;
+    write_weight_delta_reject(
+        dir,
+        "104_word_bits_inconsistent",
+        &frame,
+        Some(&bf16_base_frame),
+        ErrorClass::Malformed,
+        "word_bits 8 disagrees with bf16",
+        false,
+    )?;
+
+    let mut delta_root = meta.clone();
+    let mut flipped = delta_root.delta_root.into_bytes();
+    flipped[0] ^= 0x01;
+    delta_root.delta_root = Hash32::from_bytes(flipped);
+    let frame = weight_delta_frame(
+        &delta_root,
+        &payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )?;
+    write_weight_delta_reject(
+        dir,
+        "105_delta_root_mismatch",
+        &frame,
+        Some(&bf16_base_frame),
+        ErrorClass::Corrupt,
+        "declared delta_root does not match the reconstructed delta words",
+        false,
+    )?;
+
+    let mut payload_len = meta.clone();
+    payload_len.payload_len = payload.len() as u64 + 1;
+    let frame = weight_delta_frame(
+        &payload_len,
+        &payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )?;
+    write_weight_delta_reject(
+        dir,
+        "106_payload_length_mismatch",
+        &frame,
+        Some(&bf16_base_frame),
+        ErrorClass::Malformed,
+        "declared payload_len is one byte larger than the stored payload",
+        false,
+    )?;
+
+    write_weight_delta_reject(
+        dir,
+        "107_missing_base",
+        &delta_frame,
+        None,
+        ErrorClass::DependencyMissing,
+        "no resolver entry and no --base frame was supplied",
+        false,
+    )?;
+
+    // A self-referential base: the descriptor's base equals the frame's own
+    // content hash, so the DAG resolver re-enters the root frame.
+    let zero_target = vec![0u8; 12];
+    let cycle_hash = hash_domain(DOMAIN_CHUNK, &zero_target);
+    let zero_payload = {
+        let planes: [Vec<u8>; 2] = [vec![0u8; 6], vec![0u8; 6]];
+        let mut out = Vec::new();
+        for plane in &planes {
+            out.extend_from_slice(&crate::huffman::encode(plane));
+        }
+        out
+    };
+    let mut cycle_meta = meta.clone();
+    cycle_meta.base = cycle_hash;
+    cycle_meta.delta_root = hash_domain(tensor::DOMAIN_TENSOR_VALUES, &vec![0u8; 12]);
+    cycle_meta.payload_len = zero_payload.len() as u64;
+    let cycle_frame = weight_delta_frame(
+        &cycle_meta,
+        &zero_payload,
+        zero_target.len() as u64,
+        cycle_hash,
+        base_mode,
+        limits,
+    )?;
+    write_weight_delta_reject(
+        dir,
+        "108_dependency_cycle",
+        &cycle_frame,
+        None,
+        ErrorClass::DependencyCycle,
+        "the descriptor base equals the frame's own content hash",
+        true,
+    )?;
+
+    Ok(())
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    hash_domain(DOMAIN_CHUNK, bytes).to_hex()
 }

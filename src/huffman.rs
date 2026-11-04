@@ -231,7 +231,27 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
 }
 
 /// Decode a `huffman-canonical-v1` stream into exactly `expected_len` bytes.
+///
+/// The whole slice is one stream: any trailing byte after the declared output
+/// is `Corrupt`.
 pub fn decode(encoded: &[u8], expected_len: usize) -> Result<Vec<u8>> {
+    let (out, consumed) = decode_prefix(encoded, expected_len)?;
+    if consumed != encoded.len() {
+        return Err(Error::corrupt(
+            "huffman-canonical-v1 bitstream has trailing bytes after the declared output",
+        ));
+    }
+    Ok(out)
+}
+
+/// Decode one `huffman-canonical-v1` stream from the start of `encoded` and
+/// return the bytes it consumed (the 256-byte table plus its own padded
+/// bitstream).
+///
+/// Used where several independently coded streams are concatenated (mode 11
+/// byte planes). The padding bits of the last consumed byte must be zero; any
+/// bytes after the consumed prefix belong to the caller, not to this stream.
+pub fn decode_prefix(encoded: &[u8], expected_len: usize) -> Result<(Vec<u8>, usize)> {
     if encoded.len() < TABLE_BYTES {
         return Err(Error::corrupt(format!(
             "huffman-canonical-v1 stream is {} bytes, shorter than its {TABLE_BYTES}-byte code-length table",
@@ -264,12 +284,7 @@ pub fn decode(encoded: &[u8], expected_len: usize) -> Result<Vec<u8>> {
                 "huffman-canonical-v1 table has no symbols but the descriptor declares a non-empty plane",
             ));
         }
-        if !stream.is_empty() {
-            return Err(Error::corrupt(
-                "huffman-canonical-v1 empty plane has trailing bitstream bytes",
-            ));
-        }
-        return Ok(Vec::new());
+        return Ok((Vec::new(), TABLE_BYTES));
     }
 
     if used == 1 {
@@ -283,11 +298,6 @@ pub fn decode(encoded: &[u8], expected_len: usize) -> Result<Vec<u8>> {
                 "huffman-canonical-v1 non-empty table for an empty plane",
             ));
         }
-        if !stream.is_empty() {
-            return Err(Error::corrupt(
-                "huffman-canonical-v1 single-symbol stream must be empty",
-            ));
-        }
         let symbol = lengths
             .iter()
             .position(|&length| length > 0)
@@ -295,7 +305,7 @@ pub fn decode(encoded: &[u8], expected_len: usize) -> Result<Vec<u8>> {
         let capacity = expected_len.min(1 << 20);
         let mut out = Vec::with_capacity(capacity);
         out.resize(expected_len, symbol);
-        return Ok(out);
+        return Ok((out, TABLE_BYTES));
     }
 
     if expected_len == 0 {
@@ -383,22 +393,20 @@ pub fn decode(encoded: &[u8], expected_len: usize) -> Result<Vec<u8>> {
         bit_pos += 1;
     }
 
-    let remaining = stream.len() * 8 - bit_pos;
-    if remaining >= 8 {
-        return Err(Error::corrupt(
-            "huffman-canonical-v1 bitstream has trailing bytes after the declared output",
-        ));
-    }
-    if remaining > 0 {
-        let last = *stream.last().expect("non-empty trailing byte");
-        let mask = (1u8 << remaining) - 1;
+    // Padding is checked only inside the bytes this stream consumed; any
+    // further bytes belong to the caller (the next plane).
+    let consumed_stream = bit_pos.div_ceil(8);
+    let used_bits_in_last = bit_pos % 8;
+    if used_bits_in_last != 0 {
+        let last = stream[consumed_stream - 1];
+        let mask = (1u8 << (8 - used_bits_in_last)) - 1;
         if last & mask != 0 {
             return Err(Error::corrupt(
                 "huffman-canonical-v1 padding bits must be zero",
             ));
         }
     }
-    Ok(out)
+    Ok((out, TABLE_BYTES + consumed_stream))
 }
 
 #[cfg(test)]

@@ -82,6 +82,8 @@ pub enum Mode {
     FloatTensor = 9,
     /// Sharded quantized tensor shard with WCB descriptor (WEFT-AI-CODEC §11).
     TensorSharded = 10,
+    /// Exact word-wise tensor delta against a base frame (WEFT-AI-CODEC §12).
+    WeightDelta = 11,
 }
 
 impl Mode {
@@ -99,7 +101,8 @@ impl Mode {
             8 => Ok(Mode::QuantizedTensor),
             9 => Ok(Mode::FloatTensor),
             10 => Ok(Mode::TensorSharded),
-            11..=127 => Err(Error::unsupported_mode(format!(
+            11 => Ok(Mode::WeightDelta),
+            12..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -127,6 +130,7 @@ impl Mode {
             Mode::QuantizedTensor => "quantized_tensor",
             Mode::FloatTensor => "float_tensor",
             Mode::TensorSharded => "tensor_sharded",
+            Mode::WeightDelta => "weight_delta",
         }
     }
 
@@ -144,6 +148,7 @@ impl Mode {
             "quantized" | "quantized_tensor" => Ok(Mode::QuantizedTensor),
             "float_tensor" | "float-tensor" => Ok(Mode::FloatTensor),
             "tensor_sharded" | "tensor-sharded" | "sharded" => Ok(Mode::TensorSharded),
+            "weight_delta" | "weight-delta" | "weightdelta" => Ok(Mode::WeightDelta),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -792,6 +797,39 @@ fn validate_mode_rules(
             if header.body_len < 4 {
                 return Err(Error::malformed(
                     "AI-mode body is shorter than its 4-byte metadata length",
+                ));
+            }
+        }
+        Mode::WeightDelta => {
+            if header.domain != DOMAIN_PAYLOAD {
+                return Err(Error::malformed(
+                    "WEIGHT_DELTA frame must use the payload domain",
+                ));
+            }
+            if dict_flag {
+                return Err(Error::malformed("DICT_RAW is only valid for DICTIONARY"));
+            }
+            if header.dep_count != 1 {
+                return Err(Error::malformed(
+                    "WEIGHT_DELTA requires exactly one dependency",
+                ));
+            }
+            if header.chunk_count != 0 {
+                return Err(Error::malformed("WEIGHT_DELTA must not be chunked"));
+            }
+            if header.body_len < 4 {
+                return Err(Error::malformed(
+                    "WEIGHT_DELTA body is shorter than its 4-byte metadata length",
+                ));
+            }
+            if dependencies[0].dep_domain != DEP_DOMAIN_PAYLOAD {
+                return Err(Error::malformed(
+                    "WEIGHT_DELTA dependency must use dep_domain 0 (payload)",
+                ));
+            }
+            if header.decoded_len != dependencies[0].decoded_len {
+                return Err(Error::malformed(
+                    "WEIGHT_DELTA decoded_len must equal the base decoded_len",
                 ));
             }
         }

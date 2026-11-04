@@ -24,6 +24,17 @@ pub trait Resolver {
     /// Implementations should fail with `DependencyMissing` when the bytes are
     /// unknown and `DependencyDenied` when policy refuses them.
     fn resolve(&self, hash: &Hash32, decoded_len: u64, dep_domain: u8) -> Result<Vec<u8>>;
+
+    /// Return the complete frame for `content_hash` when this resolver can
+    /// supply frames as well as plaintext.
+    ///
+    /// Mode 11 uses this to verify the base frame's own dtype/shape
+    /// descriptor. The default reports that frames are unavailable; the DAG
+    /// resolver overrides it. Plaintext resolution still goes through
+    /// [`Resolver::resolve`], which enforces depth, cycle, and hash checks.
+    fn resolve_frame(&self, _content_hash: &Hash32) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 /// In-memory resolver keyed by digest.
@@ -352,6 +363,18 @@ impl Resolver for DagResolver<'_> {
             }
         }
         Ok(decoded)
+    }
+
+    fn resolve_frame(&self, content_hash: &Hash32) -> Result<Option<Vec<u8>>> {
+        let frame = self.source.get_frame(content_hash)?;
+        if let Some(bytes) = &frame {
+            check_len(
+                bytes.len() as u64,
+                self.limits.max_frame_bytes,
+                "dependency frame",
+            )?;
+        }
+        Ok(frame)
     }
 }
 

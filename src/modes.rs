@@ -221,6 +221,7 @@ pub fn decode_bytes(
         Mode::QuantizedTensor => decode_quantized_tensor(&frame, limits)?,
         Mode::FloatTensor => decode_float_tensor(&frame, limits)?,
         Mode::TensorSharded => crate::tensor_sharded::decode_planes(&frame, limits)?,
+        Mode::WeightDelta => crate::weight_delta::decode_frame(&frame, resolver, limits)?,
     };
 
     if plaintext.len() as u64 != frame.header.decoded_len {

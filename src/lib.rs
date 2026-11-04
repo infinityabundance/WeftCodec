@@ -39,6 +39,7 @@ pub mod tensor;
 pub mod tensor_sharded;
 pub mod varint;
 pub mod wcb;
+pub mod weight_delta;
 
 pub use error::{Error, ErrorClass, Result};
 pub use frame::{Dependency, Frame, FrameHeader, Mode};
@@ -52,4 +53,9 @@ pub use tensor::{
 pub use tensor_sharded::{
     assemble_sharded_words, decode_shard_frame, encode_shard_frame, encode_sharded_tensor,
     shard_set_root, DecodedTensorShard, ShardedDtype, ShardedTensorInput, TensorShardedMeta,
+};
+pub use weight_delta::{
+    base_frame_descriptor, decode_frame as decode_weight_delta, decode_with_base_frame,
+    encode_weight_delta, encode_weight_delta_with_resolver, weight_delta_metadata, WeightDeltaMeta,
+    WeightDtype,
 };

@@ -23,6 +23,7 @@ use weftcodec::selector;
 use weftcodec::tensor;
 use weftcodec::tensor_sharded;
 use weftcodec::wcb;
+use weftcodec::weight_delta;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -86,7 +87,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "weight_delta", "weight-delta", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -236,6 +237,9 @@ struct DecodeArgs {
     input: String,
     #[arg(long)]
     output: String,
+    /// Base frame for WEIGHT_DELTA (a tensor-carrying frame).
+    #[arg(long)]
+    base: Option<String>,
     /// Directory of dependency plaintext files named by lowercase hex digest.
     #[arg(long)]
     deps: Option<String>,
@@ -243,6 +247,10 @@ struct DecodeArgs {
     /// decode walks the dependency DAG (depth, cycle, and fetch limits apply).
     #[arg(long)]
     frame_source: Option<String>,
+    /// Resolve a WEIGHT_DELTA base through the frame source (requires
+    /// `--frame-source`) instead of supplying it with `--base`.
+    #[arg(long)]
+    resolve: bool,
     #[command(flatten)]
     limits: LimitArgs,
 }
@@ -481,6 +489,9 @@ struct ConformanceArgs {
     /// Write only the TENSOR_SHARDED (mode 10) vectors into `<dir>/sharded`.
     #[arg(long)]
     sharded_only: bool,
+    /// Write only the WEIGHT_DELTA (mode 11) vectors into `<dir>/weight-delta`.
+    #[arg(long)]
+    weight_delta_only: bool,
 }
 
 fn main() -> ExitCode {
@@ -541,6 +552,9 @@ fn run(cli: Cli) -> Result<()> {
             } else if args.sharded_only {
                 weftcodec::conformance::generate_sharded_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote sharded vectors to {}/sharded", args.dir);
+            } else if args.weight_delta_only {
+                weftcodec::conformance::generate_weight_delta_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote weight-delta vectors to {}/weight-delta", args.dir);
             } else {
                 weftcodec::conformance::generate_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote conformance vectors to {}", args.dir);
@@ -582,6 +596,12 @@ fn encode(args: EncodeArgs) -> Result<()> {
                 .map_err(|e| Error::io(format!("cannot write {}: {e}", path.display())))?;
         }
         return Ok(());
+    } else if args.mode == "weight_delta" || args.mode == "weight-delta" {
+        let (dtype, shape) = weight_delta_metadata_args(&args)?;
+        let base_frame = base
+            .as_deref()
+            .ok_or_else(|| Error::malformed("WEIGHT_DELTA encoding requires --base FRAME"))?;
+        weight_delta::encode_weight_delta(&data, dtype, &shape, base_frame, &limits)?
     } else if args.mode == "tokens" {
         let input: TokensInput = serde_json::from_slice(&data).map_err(|err| {
             Error::malformed(format!(
@@ -657,6 +677,9 @@ fn encode_mode(
         )),
         Mode::TensorSharded => Err(Error::malformed(
             "TENSOR_SHARDED encoding requires the dedicated CLI path with --dtype/--shape/--axis/--shards/--block-size/--scales/--zero-points",
+        )),
+        Mode::WeightDelta => Err(Error::malformed(
+            "WEIGHT_DELTA encoding requires the dedicated CLI path with --base/--dtype/--shape",
         )),
     }
 }
@@ -783,6 +806,35 @@ fn float_tensor_metadata_args(args: &EncodeArgs) -> Result<(modes::FloatDtype, V
     let dtype = modes::FloatDtype::from_name(dtype)?;
     let shape = match args.shape.as_deref() {
         None | Some("") => Vec::new(),
+        Some(text) => text
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<u64>()
+                    .map_err(|err| Error::malformed(format!("bad --shape extent `{part}`: {err}")))
+            })
+            .collect::<Result<Vec<u64>>>()?,
+    };
+    Ok((dtype, shape))
+}
+
+/// Parse the WEIGHT_DELTA descriptor from `--dtype`/`--shape`.
+fn weight_delta_metadata_args(args: &EncodeArgs) -> Result<(weight_delta::WeightDtype, Vec<u64>)> {
+    if args.metadata.is_some() {
+        return Err(Error::malformed(
+            "WEIGHT_DELTA encoding does not accept --metadata; use --dtype/--shape",
+        ));
+    }
+    let dtype = args.dtype.as_deref().ok_or_else(|| {
+        Error::malformed("WEIGHT_DELTA encoding requires --dtype (bf16|fp16|fp32|q8_0|q4_0)")
+    })?;
+    let dtype = weight_delta::WeightDtype::from_name(dtype)?;
+    let shape = match args.shape.as_deref() {
+        None | Some("") => {
+            return Err(Error::malformed(
+                "WEIGHT_DELTA encoding requires --shape (rank >= 1)",
+            ))
+        }
         Some(text) => text
             .split(',')
             .map(|part| {
@@ -975,6 +1027,34 @@ fn encode_auto(
 fn decode(args: DecodeArgs) -> Result<()> {
     let limits = args.limits.to_limits();
     let frame_bytes = read_limited(&args.input, limits.max_frame_bytes)?;
+    let root = Frame::parse(&frame_bytes, &limits)?;
+
+    // `--base` supplies the base frame explicitly. `--resolve` is an explicit
+    // opt-in to the DAG resolver, which also verifies the base frame's own
+    // dtype/shape descriptor.
+    if root.header.mode == Mode::WeightDelta {
+        if args.resolve && args.frame_source.is_none() {
+            return Err(Error::malformed(
+                "WEIGHT_DELTA --resolve requires --frame-source",
+            ));
+        }
+        if let Some(base_path) = args.base.as_deref() {
+            let base_bytes = read_limited(base_path, limits.max_frame_bytes)?;
+            let resolver = resolver_for(args.deps.as_deref());
+            let plaintext = weight_delta::decode_with_base_frame(
+                &root,
+                &base_bytes,
+                resolver.as_ref(),
+                &limits,
+            )?;
+            return write_output(&args.output, &plaintext);
+        }
+    } else if args.resolve {
+        return Err(Error::malformed(
+            "--resolve applies only to WEIGHT_DELTA frames",
+        ));
+    }
+
     let plaintext = match args.frame_source.as_deref() {
         Some(dir) => {
             let source = DirectoryFrameSource::new(dir, limits.max_frame_bytes);
@@ -1062,6 +1142,21 @@ fn inspect(args: InspectArgs) -> Result<()> {
         if header.mode == Mode::FloatTensor {
             output["exponent_coder"] = json!(modes::FLOAT_TENSOR_EXPONENT_CODER);
         }
+        if header.mode == Mode::WeightDelta {
+            let meta = weight_delta::weight_delta_metadata(&frame, &limits)?;
+            output["dtype"] = json!(meta.dtype.as_str());
+            output["shape"] = json!(meta.shape);
+            output["element_count"] = json!(meta.element_count);
+            output["word_bits"] = json!(meta.word_bits);
+            output["base"] = json!(meta.base.to_hex());
+            output["base_dtype"] = json!(meta.base_dtype.as_str());
+            output["base_shape"] = json!(meta.base_shape);
+            output["op"] = json!(meta.op);
+            output["planes"] = json!(meta.planes);
+            output["plane_codec"] = json!(meta.plane_codec);
+            output["delta_root"] = json!(meta.delta_root.to_hex());
+            output["payload_len"] = json!(meta.payload_len);
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&output)
@@ -1084,6 +1179,21 @@ fn inspect(args: InspectArgs) -> Result<()> {
         println!("mode: {} ({})", header.mode.as_str(), header.mode.as_u8());
         if header.mode == Mode::FloatTensor {
             println!("exponent_coder: {}", modes::FLOAT_TENSOR_EXPONENT_CODER);
+        }
+        if header.mode == Mode::WeightDelta {
+            let meta = weight_delta::weight_delta_metadata(&frame, &limits)?;
+            println!("dtype: {}", meta.dtype.as_str());
+            println!("shape: {:?}", meta.shape);
+            println!("element_count: {}", meta.element_count);
+            println!("word_bits: {}", meta.word_bits);
+            println!("base: {}", meta.base);
+            println!("base_dtype: {}", meta.base_dtype.as_str());
+            println!("base_shape: {:?}", meta.base_shape);
+            println!("op: {}", meta.op);
+            println!("planes: {}", meta.planes);
+            println!("plane_codec: {}", meta.plane_codec);
+            println!("delta_root: {}", meta.delta_root);
+            println!("payload_len: {}", meta.payload_len);
         }
         println!("flags: 0x{:04x} {:?}", header.flags, header.flag_names());
         println!(

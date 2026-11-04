@@ -1,6 +1,6 @@
-# WEFT-AI-CODEC v1.1.1 — AI-native codec modes
+# WEFT-AI-CODEC v1.2.0 — AI-native codec modes
 
-**Status: PARTIALLY IMPLEMENTED.** Exactly four AI-native modes are normative
+**Status: PARTIALLY IMPLEMENTED.** Exactly six AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 
 | Value | Name | Status | Frozen vectors |
@@ -10,6 +10,7 @@ and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 | 8 | `QUANTIZED_TENSOR` (CLI `quantized`) | **implemented** | `105_quantized_i8_2x3`, `106_quantized_u8_zero_element`, `107_quantized_i8_scalar` + rejects |
 | 9 | `FLOAT_TENSOR` (CLI `float-tensor`) | **implemented** | `108_float_bf16_2x2`, `109_float_fp16_3d`, `110_float_fp32_4d` + rejects |
 | 10 | `TENSOR_SHARDED` (CLI `tensor-sharded`) | **implemented** | `conformance/v1/sharded/001`–`003` + eight rejects |
+| 11 | `WEIGHT_DELTA` (CLI `weight-delta`) | **implemented** | `conformance/v1/weight-delta/001`–`003` + eight rejects |
 
 Every other mode below is `specified, not implemented` and has **no allocated
 wire value**. Nothing in this document is a compression or performance claim.
@@ -484,7 +485,7 @@ reserved value or an existing descriptor field.
 | Embedding / KV-cache pages | specified, not implemented | No layer/head/position wire form |
 | Vocabulary artifact binding | specified, not implemented | `vocab_schema` is a declaration only; no dependency hash field |
 | Attention masks | specified, not implemented | No mask bits/bytes field |
-| Weight deltas / model deltas | specified, not implemented as a typed mode | The generic `DELTA`/`DICTIONARY` modes already carry exact byte deltas against a dependency; there is no dtype/shape-checked weight-delta descriptor |
+| Weight deltas / model deltas | **implemented as mode 11** | `WEIGHT_DELTA` (§12) carries a dtype/shape-checked, dependency-linked word delta against a base tensor frame |
 | Semantic/structured deltas | specified, not implemented | No canonical patch stream or base-hash field |
 
 A consumer MUST NOT persist an object in any of these forms under a WeftCodec
@@ -497,8 +498,8 @@ vectors, and the same cross-language gates.
 
 | Limit | Default | Applies to |
 |---|---:|---|
-| `max_tensor_elements` | 4,294,967,296 | TENSOR/FLOAT_TENSOR/TENSOR_SHARDED shape product |
-| `max_tensor_rank` | 8 | TENSOR/FLOAT_TENSOR/TENSOR_SHARDED shape length |
+| `max_tensor_elements` | 4,294,967,296 | TENSOR/FLOAT_TENSOR/TENSOR_SHARDED/WEIGHT_DELTA shape product |
+| `max_tensor_rank` | 8 | TENSOR/FLOAT_TENSOR/TENSOR_SHARDED/WEIGHT_DELTA shape length |
 | `max_tokens` | 16,777,216 | TOKEN_SEQUENCE `token_count` |
 | `max_structured_items` | 1,000,000 | TENSOR_SHARDED `scales`/`zero_points` block arrays |
 
@@ -554,6 +555,14 @@ The committed suites and vectors cover:
     count, invalid block size, non-divisible axis, out-of-range index, and a
     malformed Huffman stream rejected with the classes of §11.4; rank, element,
     block-array, and plane-length limits fail closed.
+12. **WEIGHT_DELTA**: bf16, fp16, fp32, q8_0, and q4_0 round-trip bit-exactly
+    (including NaNs, denormals, and signed zeros); an all-zero delta
+    reconstructs exactly; base dtype and shape mismatches are
+    `DependencyMismatch`; a missing base is `DependencyMissing`; a cyclic base
+    is `DependencyCycle`; unknown `op`, inconsistent `word_bits`/`planes`,
+    `payload_len` mismatch, and descriptor key/schema errors are `Malformed`;
+    a wrong `delta_root` is `Corrupt`; a 4 MiB bf16 pair differing in 1% of
+    elements is byte-exact and its logical root matches the original.
 
 Frozen vector names live in both codec repositories under
 `conformance/v1/codec/`. The Rust generator is
@@ -827,3 +836,232 @@ into `DIR`. `--metadata JSON` accepts the same fields as an object.
 `WeftCodec-Go/hack/cross.sh compare` additionally encodes all three sets with
 both CLIs and reports byte-identical frames, decode equivalence, and identical
 logical roots.
+
+---
+
+## 12. Mode 11 — `WEIGHT_DELTA` (implemented)
+
+Mode 11 carries the exact word-wise difference between one tensor generation
+and a base tensor frame. Every operation is on unsigned words:
+
+```
+d_i = (a_i - b_i) mod 2^word_bits
+a_i = (d_i + b_i) mod 2^word_bits
+```
+
+`a_i` is the target element word and `b_i` the base element word. No
+floating-point arithmetic is performed anywhere. Reconstruction is bit-exact
+for every pattern, including NaNs with non-zero payloads, signalling/quiet
+bits, infinities, denormals, and signed zeros, because the codec treats the raw
+element words as unsigned integers.
+
+### 12.1 Frame shape
+
+```
+domain        = 0 (payload)
+mode          = 11
+flags         = 0 (CHUNKED, SELF_CONTAINED, DICT_RAW, ORIGINAL_HASH all clear)
+level         = 0
+dep_count     = 1
+chunk_count   = 0
+decoded_len   = element_count * storage_bytes(dtype)
+content_hash  = H("weft/chunk/v1", reconstructed element bytes)
+body          = u32le(meta_len) || WCB(weft.ai.weight_delta.v1) || payload
+```
+
+The single dependency entry is
+
+```
+hash         = base            # the base frame's content hash
+decoded_len  = decoded_len     # the reconstructed element byte length
+dep_domain   = 0               # payload plaintext
+dep_flags    = REQUIRED
+codec_hint   = the base frame's mode value, or 0 when unknown
+```
+
+For a mode-6, mode-9, or mode-11 base frame, the frame's `content_hash` is
+`H("weft/chunk/v1", decoded element bytes)`, so the same value is both the
+frame content root and the dependency plaintext hash. The decoder therefore
+resolves the base through the existing `Resolver` contract with the same
+depth, cycle, fetch, and decoded-byte limits as every other dependency mode.
+
+### 12.2 Descriptor
+
+The WCB descriptor is a map with exactly these keys:
+
+| Key | WCB type | Value |
+|---|---|---|
+| `schema` | text | exactly `weft.ai.weight_delta.v1` |
+| `dtype` | text | one of `bf16`, `fp16`, `fp32`, `q8_0`, `q4_0` |
+| `shape` | array of u64 | logical extents, rank 1..=`max_tensor_rank`; every dimension > 0 |
+| `element_count` | u64 | product of `shape` |
+| `word_bits` | u64 | fixed per dtype: 16, 16, 32, 8, 4 |
+| `base` | bytes(32) | content root (frame content hash) of the base tensor frame |
+| `base_dtype` | text | MUST equal `dtype` |
+| `base_shape` | array of u64 | MUST equal `shape` |
+| `op` | text | exactly `mod-sub` |
+| `planes` | u64 | fixed per dtype: 2, 2, 4, 1, 1 |
+| `plane_codec` | text | exactly `huffman-canonical-v1` |
+| `delta_root` | bytes(32) | `H("weft/tensor/values/v1", canonical delta words)` |
+| `payload_len` | u64 | length of the stored plane payload |
+
+`WCB` has no `u32` tag, so `planes` and `word_bits` are carried as `u64`.
+`delta_root` binds the decoded delta words; because `huffman-canonical-v1` is
+deterministic and rejects non-canonical tables and padding, it also binds the
+stored payload. The frame `content_hash` binds the reconstructed element bytes.
+
+### 12.3 Element words, planes, and `delta_root`
+
+| `dtype` | `word_bits` | `planes` | storage bytes | word representation |
+|---|---:|---:|---:|---|
+| `bf16` | 16 | 2 | 2 | little-endian u16 |
+| `fp16` | 16 | 2 | 2 | little-endian u16 |
+| `fp32` | 32 | 4 | 4 | little-endian u32 |
+| `q8_0` | 8 | 1 | 1 | one quantized integer byte |
+| `q4_0` | 4 | 1 | 1 | one unpacked nibble byte, value `0..=15` |
+
+`q8_0` and `q4_0` reuse the quantized-integer definitions of §11.3: `q8_0`
+values are `i8` and `q4_0` values are `i4` in `-8..=7`. For mode 11 the
+element bytes are the unsigned word representation: a `q8_0` element is its
+two's-complement byte, and a `q4_0` element is one byte holding its nibble in
+`0..=15`. The codec never dequantizes, converts, or interprets a value.
+
+For each element, the delta word `d_i` is split into its bytes, least
+significant first:
+
+- plane 0 is the least significant byte, plane 1 the next, and so on;
+- each plane is the concatenation of that byte over all elements in canonical
+  row-major order;
+- planes are concatenated in plane order into the payload, and each plane is
+  encoded as its own `huffman-canonical-v1` stream (§5.3.1), including its own
+  256-byte code-length table. There is no padding between streams; the next
+  plane starts at the first byte after the previous stream, whose own padding
+  bits MUST be zero.
+
+For `q4_0`, `word_bits` is 4 and there is a single plane of unpacked nibbles,
+one byte per element with value `0..=15`.
+
+The delta root is
+
+```
+delta_root = H("weft/tensor/values/v1", D)
+```
+
+where `D` is the canonical row-major sequence of delta words written as
+`word_bits` little-endian bytes (2 bytes for 16-bit words, 4 bytes for 32-bit
+words, 1 byte for 8-bit words). For `q4_0`, `D` is one byte per element with
+the nibble value in `0..=15`.
+
+### 12.4 Base resolution and verification
+
+The decoder resolves `base` through the caller's dependency resolver. The
+existing DAG resolver supplies the base frame bytes as well as the plaintext;
+the plaintext resolver supplies only the plaintext. In both cases the decoder:
+
+1. requires the dependency table's single entry to have `hash == base` and
+   `decoded_len == decoded_len`;
+2. resolves the plaintext through the resolver, which enforces hash, length,
+   depth, and cycle rules;
+3. resolves the base frame bytes when the resolver can supply them (explicit
+   `--base` also supplies them) and verifies:
+   - the base frame's `content_hash` equals `base` (`DependencyMismatch`);
+   - the base frame's logical dtype and shape equal `dtype` and `shape`
+     (`DependencyMismatch`);
+   - the base plaintext length equals `element_count * storage_bytes`
+     (`DependencyMismatch`).
+
+The base frame's storage dtype maps to the weight dtype as follows:
+
+| weight `dtype` | accepted base frame storage |
+|---|---|
+| `bf16`, `fp16`, `fp32` | mode 6 / mode 9 / mode 11 with the same logical dtype |
+| `q8_0` | mode 6 `i8`, or mode 11 `q8_0` |
+| `q4_0` | mode 6 `u8`, or mode 11 `q4_0` |
+
+A missing base is `DependencyMissing`; a re-entered frame is
+`DependencyCycle`; a wrong hash, length, dtype, or shape is
+`DependencyMismatch`. A `q4_0` base or target byte outside `0..=15` is
+`Corrupt`. Decode never substitutes a different base and never falls back to
+another mode.
+
+### 12.5 Validation order (normative for error classes)
+
+1. Body split / `meta_len` bounds → `Malformed`.
+2. WCB canonical decode → `NonCanonical`, `Malformed`, or `LimitExceeded`.
+3. Descriptor key set, `schema` → `Malformed`.
+4. Unknown `dtype`, `op` not `mod-sub`, or `plane_codec` not
+   `huffman-canonical-v1` → `Malformed`.
+5. `word_bits` or `planes` not matching the dtype table → `Malformed`;
+   `base_dtype` ≠ `dtype` or `base_shape` ≠ `shape` → `Malformed`.
+6. `shape` rank 0, zero dimension, or product overflow → `Malformed` /
+   `LimitExceeded`; rank or product above the configured limits →
+   `LimitExceeded`.
+7. `element_count` ≠ shape product → `Malformed`.
+8. `base` or `delta_root` not exactly 32 bytes → `Malformed`.
+9. `payload_len` ≠ actual stored payload length → `Malformed`;
+   `decoded_len` ≠ `element_count * storage_bytes` → `Corrupt`.
+10. Dependency count/table fields inconsistent with the descriptor →
+    `Malformed`; dependency resolution failures use the existing dependency
+    classes (`DependencyMissing`, `DependencyDenied`, `DependencyMismatch`,
+    `DependencyCycle`, `LimitExceeded`).
+11. Huffman stream rejects → the classes of §5.3.1.
+12. `delta_root` ≠ the reconstructed delta words → `Corrupt`.
+13. Base frame metadata or content mismatch → `DependencyMismatch`;
+    `q4_0` word out of range → `Corrupt`.
+14. Reconstructed `content_hash` mismatch → `Corrupt`.
+
+### 12.6 Limits
+
+`max_tensor_rank` and `max_tensor_elements` bound the shape. `decoded_len`,
+the stored payload, the body, and the frame are bounded by
+`max_decoded_bytes` and `max_frame_bytes`. The dependency is bounded by
+`max_dependency_depth`, `max_dependency_count`, `max_total_fetched_bytes`, and
+the cumulative decoded-byte limit. Every product and sum is checked; overflow
+is `LimitExceeded` before allocation.
+
+### 12.7 API and CLI (maintainer tools, not wire formats)
+
+Rust (`weftcodec::weight_delta`):
+
+- `encode_weight_delta(target, dtype, shape, base_frame, limits)`
+- `encode_weight_delta_with_resolver(target, dtype, shape, base_frame, resolver, limits)`
+- `decode_frame(frame, resolver, limits)`
+- `decode_with_base_frame(frame, base_frame, resolver, limits)`
+- `weight_delta_metadata(frame, limits)`
+- `base_frame_descriptor(frame, limits)`
+
+Go (`modes` package) exposes the equivalent `EncodeWeightDelta`,
+`EncodeWeightDeltaWithResolver`, `DecodeWeightDeltaFrame`,
+`DecodeWeightDeltaFrameWithBase`, `WeightDeltaMetadata`, and
+`BaseFrameDescriptor`.
+
+```
+weftcodec encode --mode weight-delta --base BASE_FRAME --input TARGET \
+    --output FRAME --dtype bf16|fp16|fp32|q8_0|q4_0 --shape 2,3
+weftcodec decode --input FRAME --output TARGET [--base BASE_FRAME | --resolve --frame-source DIR]
+```
+
+`--base` supplies the base frame explicitly. `--resolve` uses the existing
+frame-source DAG resolver and requires `--frame-source`; it verifies the base
+frame's own dtype/shape descriptor. `inspect` reports `mode=weight_delta`,
+`dtype`, `shape`, `element_count`, `word_bits`, `base`, `base_dtype`,
+`base_shape`, `op`, `planes`, `plane_codec`, `delta_root`, and `payload_len`.
+
+### 12.8 Conformance vectors
+
+`conformance/v1/weight-delta/` is byte-identical in both codec repositories:
+
+- `001_bf16_small_changes`: bf16 base with NaN/infinity/signed-zero/denormal
+  words and exactly one changed word;
+- `002_fp32_zero_delta`: fp32 base and target identical, so every delta word
+  is zero and each plane is a single-symbol Huffman table;
+- `003_q8_0_mixed_changes`: q8_0 words with mixed wrapped changes, backed by a
+  mode-6 `i8` base frame;
+- `101`–`108`: base dtype mismatch, base shape mismatch, unknown op,
+  `word_bits` inconsistent with dtype, delta-root mismatch, payload-length
+  mismatch, missing base, and dependency cycle.
+
+The vector files carry the base frame, the target bytes, the committed delta
+frame, the descriptor fields, and the expected error class. Both
+implementations replay them, decode the valid cases, re-encode them to the
+same bytes, and reject every invalid case with the stated class.
