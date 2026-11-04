@@ -1,6 +1,6 @@
 [package]
 name = "weftcodec"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.74"
 description = "WeftCodec v1: deterministic context-conditioned codec (frame format WFT1, WCB, selectors)"
