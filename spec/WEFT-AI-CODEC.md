@@ -1,4 +1,4 @@
-# WEFT-AI-CODEC v1.1.0 — AI-native codec modes
+# WEFT-AI-CODEC v1.1.1 — AI-native codec modes
 
 **Status: PARTIALLY IMPLEMENTED.** Exactly four AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
@@ -313,8 +313,9 @@ bytes)`, so decoding yields the original little-endian element bytes exactly.
 Frame `domain` is `0`; no dependencies and no chunks are permitted.
 
 The descriptor additionally binds the stored payload under
-`weft/float-tensor/payload/v1` (§1.3). Compressing the exponent plane therefore
+`weft/float-tensor/payload/v1` (§1.3). Encoding the exponent plane therefore
 never changes element identity, and swapping planes or descriptors is caught.
+The frame `level` field is 0 for this mode because no zstd frame is used.
 
 ### 5.2 Descriptor
 
@@ -329,7 +330,8 @@ The WCB descriptor is a map with exactly these keys:
 | `exponent_bits` | u64 | fixed per dtype, `0..=255` (WCB has no u8 tag) |
 | `mantissa_bits` | u64 | fixed per dtype, `0..=255` |
 | `sign_bits` | u64 | fixed per dtype, `0..=255` |
-| `exponent_plane_len` | u64 | length of the **zstd-compressed** exponent plane |
+| `exponent_coder` | text | exactly `huffman-canonical-v1` |
+| `exponent_plane_len` | u64 | length of the **huffman-canonical-v1** exponent plane (256-byte table + bitstream) |
 | `mantissa_plane_len` | u64 | length of the raw sign+mantissa plane |
 | `payload_hash` | bytes(32) | `H("weft/float-tensor/payload/v1", stored payload)` |
 
@@ -354,18 +356,71 @@ Input elements are the little-endian element words in row-major order. For
 dtype `E = exponent_bits`, `M = mantissa_bits`, `S = sign_bits`:
 
 - **Exponent plane.** `element_count` bytes; byte `i` is element `i`'s exponent
-  field, in element order, and MUST be `< 2^E`. This plane is zstd-compressed as
-  one standard frame (RFC 8878); `exponent_plane_len` is the compressed length.
-  The encoder always compresses (level 3 is the reference setting, informational
-  like the frame `level` field). The shared zstd strictness rule applies: the
-  plane is non-empty, a declared frame content size MUST equal `element_count`,
-  and the actual decompressed length MUST equal `element_count`.
+  field, in element order, and MUST be `< 2^E`. This plane is encoded with
+  `huffman-canonical-v1` (§5.3.1); `exponent_plane_len` is the encoded length.
+  The uncompressed exponent-plane length is `element_count` and is carried by
+  the descriptor. The encoder always applies the canonical coder; no zstd
+  frame is used for this mode.
 - **Mantissa plane.** For each element in order, emit the sign bit (`S` bits)
   followed by the mantissa bits (`M` bits, most significant first). Pack these
   `element_count * (S + M)` bits contiguously, MSB-first: bit 7 of the first
   byte is the first emitted bit. The plane is exactly
   `ceil(element_count * (S + M) / 8)` bytes; unused low bits of the final byte
   MUST be zero. The plane is stored raw.
+
+#### 5.3.1 `huffman-canonical-v1`
+
+This is an order-0 canonical Huffman code over the 256 possible exponent-byte
+values. It is normative because Rust and Go MUST emit bit-identical bytes.
+
+**Serialized form.**
+
+```
+u8 code_lengths[256]   # 0 = symbol absent
+|| bitstream           # MSB-first, zero-padded to a byte boundary
+```
+
+**Encoder.**
+
+1. Count byte frequencies over the exponent plane.
+2. Build a binary Huffman tree. When selecting the two least-weighted active
+   nodes, compare `(weight, minimum symbol byte, node index)` ascending;
+   leaves are inserted in ascending symbol order, so the final index fallback
+   is deterministic. A parent's minimum symbol is the minimum of its children.
+3. Sort the used symbols by `(code length, symbol)` and assign increasing
+   canonical codes, starting at 0 and shifting left by the code-length delta.
+   Codes are written most-significant bit first.
+4. If any code length exceeds 24 bits, replace every non-zero frequency `f`
+   with `max(1, f >> 1)` and rebuild the tree; repeat until every length is at
+   most 24. Equal weights produce a tree of depth at most 9 for 256 symbols,
+   so this procedure terminates.
+5. Emit the 256 code lengths as unsigned bytes followed by the bitstream. The
+   final byte is zero-padded. The uncompressed length is `element_count`.
+
+**Canonical edge cases.**
+
+- Empty plane: all 256 lengths are 0 and the bitstream is empty. This is valid
+  only when the declared plane length is 0.
+- Exactly one used symbol: its length is 1 and the bitstream is empty; the
+  decoder emits the declared number of copies. A length-0 code is never
+  emitted, so the form is total.
+
+**Decoder.** Rebuild the canonical table from the 256 lengths and reject, in
+this order:
+
+1. a length greater than 24 → `NonCanonical`;
+2. an over-subscribed or incomplete prefix table (`Kraft` sum with 24-bit
+   resolution not exactly `2^24`) → `NonCanonical`, except the single-symbol
+   form above;
+3. a truncated bitstream (no code before the bits are exhausted) → `Corrupt`;
+4. extra trailing bytes, or padding bits that are not zero → `Corrupt`;
+5. an output length other than the declared `element_count` → `Corrupt`.
+
+The decoder never allocates more than the declared plane length and fails
+closed on every condition above. Both implementations use exactly this class
+mapping. (The exponent plane never has an empty declared length for a valid
+`FLOAT_TENSOR`, because every shape dimension is greater than zero; the empty
+form exists for the coder's own tests and for future callers.)
 
 Decoding reverses this exactly: element `i`'s word is
 `(sign << (E + M)) | (exponent << M) | mantissa`, written as an `S+E+M`-bit
@@ -377,7 +432,7 @@ codec never converts, canonicalizes, or interprets a value.
 
 1. Body split / `meta_len` bounds → `Malformed`.
 2. WCB canonical decode → `NonCanonical`, `Malformed`, or `LimitExceeded`.
-3. Descriptor key set, `schema` → `Malformed`.
+3. Descriptor key set, `schema`, and `exponent_coder` → `Malformed`.
 4. Unknown `dtype` → `Malformed`; a bit-width field that is not `0..=255` or
    disagrees with the dtype table → `Malformed`; a non-byte-aligned total →
    `Malformed`.
@@ -390,9 +445,10 @@ codec never converts, canonicalizes, or interprets a value.
 8. `mantissa_plane_len` ≠ `ceil(element_count * (S + M) / 8)` → `Malformed`;
    `exponent_plane_len + mantissa_plane_len` overflow → `LimitExceeded`;
    the sum ≠ stored payload length → `Malformed`.
-9. Exponent plane empty → `Malformed`; not a decodable zstd frame, a declared
-   content size ≠ `element_count`, or actual length ≠ `element_count` →
-   `Corrupt` (the shared zstd rule of §2.1/ZSTD).
+9. The encoded exponent plane shorter than its 256-byte table, a truncated
+   bitstream, extra trailing bytes, or non-zero padding → `Corrupt`; a code
+   length > 24 or an over-subscribed or incomplete table → `NonCanonical`
+   (§5.3.1).
 10. An exponent byte ≥ `2^E` → `Corrupt`; non-zero mantissa padding bits →
     `Corrupt`.
 11. `payload_hash` length ≠ 32 → `Malformed`; value mismatch → `Corrupt`.
@@ -406,7 +462,8 @@ weftcodec encode --mode float-tensor --input PAYLOAD --output FRAME \
 
 `--metadata META.json` accepts `{"dtype":"fp32","shape":[2,3]}`. `--shape`
 is required (rank ≥ 1); an omitted or empty `--shape` is a rank-0 reject.
-`inspect` reports `mode=float_tensor`.
+`inspect` reports `mode=float_tensor` and `exponent_coder=huffman-canonical-v1`
+(JSON: `"exponent_coder"`).
 
 ---
 
@@ -472,18 +529,21 @@ The committed suites and vectors cover:
    exact f64 scale bit preservation, dtype-range zero-point checks, non-finite/
    non-positive scale rejection, payload/hash/length rejects, and checked shape
    limits.
-9. **Float tensors**: every dtype round-trips bit-exactly; exponent-plane
-   zstd binding; mantissa MSB-first packing and zero padding; NaN payloads,
-   infinities, signed zeros, and denormals; unknown dtype, bit-width mismatch,
-   rank 0, zero dimension, plane-length overflow, non-zstd exponent plane, and
-   decoded-length mismatch rejects; element/rank/decoded-byte limits.
+9. **Float tensors**: every dtype round-trips bit-exactly; the
+   `huffman-canonical-v1` exponent-plane binding (empty plane, one symbol, all
+   256 symbols, skewed, uniform random, 2,000,000 bytes, and length-limited
+   Fibonacci weights); mantissa MSB-first packing and zero padding; NaN
+   payloads, infinities, signed zeros, and denormals; unknown dtype, bit-width
+   mismatch, rank 0, zero dimension, plane-length overflow, unknown exponent
+   coder, decoded-length mismatch, over-subscribed/incomplete/over-long
+   Huffman tables, non-zero padding, and truncated streams; element/rank/
+   decoded-byte limits.
 10. **Cross-language**: Rust→Go and Go→Rust decode equivalence plus
-   byte-identical frames for TENSOR, TOKEN_SEQUENCE, and QUANTIZED_TENSOR
-   (`WeftCodec-Go/hack/cross.sh`). `FLOAT_TENSOR` frames embed a zstd frame
-   produced by each implementation's zstd library; the gate asserts decode
-   equivalence in both directions and, because zstd encoders may differ,
-   reports the byte comparison as an observed property rather than a promise.
-   The frozen vectors are generated once and replayed by both implementations.
+   byte-identical frames for TENSOR, TOKEN_SEQUENCE, QUANTIZED_TENSOR, and
+   FLOAT_TENSOR (`WeftCodec-Go/hack/cross.sh`). `FLOAT_TENSOR` byte identity is
+   mandatory because its exponent plane uses the deterministic
+   `huffman-canonical-v1` coder, not a library zstd frame. The frozen vectors
+   are generated once and replayed by both implementations.
 
 Frozen vector names live in both codec repositories under
 `conformance/v1/codec/`. The Rust generator is

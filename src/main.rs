@@ -744,7 +744,7 @@ fn inspect(args: InspectArgs) -> Result<()> {
                 })
             })
             .collect();
-        let output = json!({
+        let mut output = json!({
             "magic": "WFT1",
             "format_major": header.format_major,
             "format_minor": header.format_minor,
@@ -767,6 +767,9 @@ fn inspect(args: InspectArgs) -> Result<()> {
             "dependencies": dependencies,
             "chunks": chunks,
         });
+        if header.mode == Mode::FloatTensor {
+            output["exponent_coder"] = json!(modes::FLOAT_TENSOR_EXPONENT_CODER);
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&output)
@@ -787,6 +790,9 @@ fn inspect(args: InspectArgs) -> Result<()> {
             }
         );
         println!("mode: {} ({})", header.mode.as_str(), header.mode.as_u8());
+        if header.mode == Mode::FloatTensor {
+            println!("exponent_coder: {}", modes::FLOAT_TENSOR_EXPONENT_CODER);
+        }
         println!("flags: 0x{:04x} {:?}", header.flags, header.flag_names());
         println!(
             "features: 0x{:04x} {:?}",

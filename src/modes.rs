@@ -17,6 +17,7 @@ use crate::hash::{
     hash_domain, DOMAIN_CHUNK, DOMAIN_FLOAT_TENSOR_PAYLOAD, DOMAIN_QUANTIZED_TENSOR_PAYLOAD,
     DOMAIN_TENSOR_PAYLOAD, DOMAIN_TOKENS_PAYLOAD,
 };
+use crate::huffman;
 use crate::limits::{check_len, Limits};
 use crate::varint;
 use crate::wcb::{self, Value};
@@ -1305,8 +1306,10 @@ fn parse_quantized_tensor_body<'a>(
 
 /// Canonical float-tensor schema.
 pub const FLOAT_TENSOR_SCHEMA: &str = "weft.ai.float_tensor.v1";
-/// The reference exponent-plane zstd level (informational, like frame `level`).
-pub const FLOAT_TENSOR_ZSTD_LEVEL: i32 = 3;
+/// The exponent-plane coder (WEFT-AI-CODEC §5).
+pub const FLOAT_TENSOR_EXPONENT_CODER: &str = huffman::CODER_ID;
+/// Frame `level` for FLOAT_TENSOR. No zstd frame is used, so the field is 0.
+pub const FLOAT_TENSOR_LEVEL: u16 = 0;
 
 /// Float element dtypes implemented in v1. All are byte-aligned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1462,7 +1465,8 @@ fn take_bits(plane: &[u8], pos: &mut usize, count: usize) -> u64 {
 
 /// Split a little-endian float tensor payload into its two planes.
 ///
-/// Returns `(exponent_plane_compressed, mantissa_plane)`.
+/// Returns `(exponent_plane_huffman, mantissa_plane)`. The exponent plane is
+/// encoded with `huffman-canonical-v1`; the sign+mantissa plane is raw.
 pub fn split_float_tensor_payload(
     payload: &[u8],
     dtype: FloatDtype,
@@ -1502,10 +1506,7 @@ pub fn split_float_tensor_payload(
         push_bits(&mut mantissa_plane, &mut bit_len, sign, sign_bits);
         push_bits(&mut mantissa_plane, &mut bit_len, mantissa, mantissa_bits);
     }
-    Ok((
-        compress(&exponent_plane, FLOAT_TENSOR_ZSTD_LEVEL)?,
-        mantissa_plane,
-    ))
+    Ok((huffman::encode(&exponent_plane), mantissa_plane))
 }
 
 /// Reconstruct the exact little-endian element bytes from the two planes.
@@ -1586,8 +1587,9 @@ pub fn join_float_tensor_payload(
 
 /// Encode a FLOAT_TENSOR frame (WEFT-AI-CODEC §5).
 ///
-/// The exponent plane is zstd-compressed at level 3; the sign+mantissa plane is
-/// stored raw. Every element bit pattern round-trips, including NaN payloads.
+/// The exponent plane is encoded with the canonical `huffman-canonical-v1`
+/// coder; the sign+mantissa plane is stored raw. Every element bit pattern
+/// round-trips, including NaN payloads.
 pub fn encode_float_tensor(
     payload: &[u8],
     dtype: FloatDtype,
@@ -1642,6 +1644,10 @@ pub fn encode_float_tensor(
         ("exponent_bits", Value::U64(dtype.exponent_bits())),
         ("mantissa_bits", Value::U64(dtype.mantissa_bits())),
         (
+            "exponent_coder",
+            Value::Str(FLOAT_TENSOR_EXPONENT_CODER.to_owned()),
+        ),
+        (
             "exponent_plane_len",
             Value::U64(exponent_plane.len() as u64),
         ),
@@ -1665,7 +1671,7 @@ pub fn encode_float_tensor(
         domain: DOMAIN_PAYLOAD,
         mode: Mode::FloatTensor,
         flags: 0,
-        level: FLOAT_TENSOR_ZSTD_LEVEL as u16,
+        level: FLOAT_TENSOR_LEVEL,
         decoded_len: decoded_bytes,
         content_hash: hash_domain(DOMAIN_CHUNK, payload),
         dependencies: &[],
@@ -1706,6 +1712,7 @@ fn parse_float_tensor_body(
             "sign_bits",
             "exponent_bits",
             "mantissa_bits",
+            "exponent_coder",
             "exponent_plane_len",
             "mantissa_plane_len",
             "payload_hash",
@@ -1719,6 +1726,12 @@ fn parse_float_tensor_body(
         )));
     }
     let dtype = FloatDtype::from_name(meta_text(map, "dtype")?)?;
+    let exponent_coder = meta_text(map, "exponent_coder")?;
+    if exponent_coder != FLOAT_TENSOR_EXPONENT_CODER {
+        return Err(Error::malformed(format!(
+            "unsupported float tensor exponent coder `{exponent_coder}` (v1 allows `{FLOAT_TENSOR_EXPONENT_CODER}`)"
+        )));
+    }
     let sign_bits = meta_byte_field(map, "sign_bits")?;
     let exponent_bits = meta_byte_field(map, "exponent_bits")?;
     let mantissa_bits = meta_byte_field(map, "mantissa_bits")?;
@@ -1792,7 +1805,10 @@ fn parse_float_tensor_body(
         Error::limit_exceeded("float tensor exponent plane length does not fit usize")
     })?;
     let (exponent_compressed, mantissa_plane) = stored.split_at(exponent_len);
-    let exponent_plane = decompress(exponent_compressed, declared_count)?;
+    let exponent_len_usize = usize::try_from(declared_count).map_err(|_| {
+        Error::limit_exceeded("float tensor exponent plane length does not fit usize")
+    })?;
+    let exponent_plane = huffman::decode(exponent_compressed, exponent_len_usize)?;
     let bytes = join_float_tensor_payload(
         &exponent_plane,
         mantissa_plane,

@@ -280,6 +280,10 @@ fn float_tensor_meta_value(
         ("sign_bits", Value::U64(sign_bits)),
         ("exponent_bits", Value::U64(exponent_bits)),
         ("mantissa_bits", Value::U64(mantissa_bits)),
+        (
+            "exponent_coder",
+            Value::Str(modes::FLOAT_TENSOR_EXPONENT_CODER.to_owned()),
+        ),
         ("exponent_plane_len", Value::U64(exponent_plane_len)),
         ("mantissa_plane_len", Value::U64(mantissa_plane_len)),
         ("payload_hash", Value::Bytes(payload_hash.to_vec())),
@@ -1456,11 +1460,36 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     let frame = float_ai_frame(&meta, &garbage, 8, limits)?;
     push_error(
         &mut vectors,
-        "146_float_tensor_exponent_plane_not_zstd",
+        "152_float_tensor_exponent_table_truncated",
         "float_tensor",
         &frame,
         &[],
         ErrorClass::Corrupt,
+        None,
+    );
+
+    let mut meta = float_tensor_meta_value(
+        "fp32",
+        &[2],
+        2,
+        1,
+        8,
+        23,
+        exp_len,
+        mant_len,
+        float_hash.as_bytes(),
+    );
+    if let Value::Map(map) = &mut meta {
+        map.insert("exponent_coder".to_owned(), Value::Str("zstd".to_owned()));
+    }
+    let frame = float_ai_frame(&meta, &float_stored, 8, limits)?;
+    push_error(
+        &mut vectors,
+        "146_float_tensor_unknown_exponent_coder",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
         None,
     );
 
@@ -1479,6 +1508,135 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     push_error(
         &mut vectors,
         "147_float_tensor_decoded_len_mismatch",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::Corrupt,
+        None,
+    );
+
+    // Huffman table and bitstream rejects. Count is 1 for the table-only
+    // vectors; fp8-e4m3 has a one-byte mantissa plane.
+    let one_mantissa = [0u8];
+    let over = {
+        let mut table = vec![1u8; 256];
+        table.extend_from_slice(&one_mantissa);
+        table
+    };
+    let over_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &over);
+    let meta = float_tensor_meta_value("fp8-e4m3", &[1], 1, 1, 4, 3, 256, 1, over_hash.as_bytes());
+    let frame = float_ai_frame(&meta, &over, 1, limits)?;
+    push_error(
+        &mut vectors,
+        "148_float_tensor_exponent_over_subscribed",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::NonCanonical,
+        None,
+    );
+
+    let mut incomplete = vec![0u8; 256];
+    incomplete[0] = 2;
+    incomplete[1] = 2;
+    incomplete.extend_from_slice(&one_mantissa);
+    let incomplete_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &incomplete);
+    let meta = float_tensor_meta_value(
+        "fp8-e4m3",
+        &[1],
+        1,
+        1,
+        4,
+        3,
+        256,
+        1,
+        incomplete_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &incomplete, 1, limits)?;
+    push_error(
+        &mut vectors,
+        "149_float_tensor_exponent_incomplete",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::NonCanonical,
+        None,
+    );
+
+    let mut too_long = vec![0u8; 256];
+    too_long[0] = 25;
+    too_long.extend_from_slice(&one_mantissa);
+    let too_long_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &too_long);
+    let meta = float_tensor_meta_value(
+        "fp8-e4m3",
+        &[1],
+        1,
+        1,
+        4,
+        3,
+        256,
+        1,
+        too_long_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &too_long, 1, limits)?;
+    push_error(
+        &mut vectors,
+        "150_float_tensor_exponent_code_length_too_long",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::NonCanonical,
+        None,
+    );
+
+    let mut padding = vec![0u8; 256];
+    padding[0] = 1;
+    padding[1] = 1;
+    padding.push(0b0100_0000);
+    padding.extend_from_slice(&one_mantissa);
+    let padding_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &padding);
+    let meta = float_tensor_meta_value(
+        "fp8-e4m3",
+        &[1],
+        1,
+        1,
+        4,
+        3,
+        257,
+        1,
+        padding_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &padding, 1, limits)?;
+    push_error(
+        &mut vectors,
+        "151_float_tensor_exponent_nonzero_padding",
+        "float_tensor",
+        &frame,
+        &[],
+        ErrorClass::Corrupt,
+        None,
+    );
+
+    let mut truncated = vec![0u8; 256];
+    truncated[0] = 1;
+    truncated[1] = 1;
+    truncated.extend_from_slice(&one_mantissa);
+    let truncated_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &truncated);
+    let meta = float_tensor_meta_value(
+        "fp8-e4m3",
+        &[2],
+        2,
+        1,
+        4,
+        3,
+        256,
+        1,
+        truncated_hash.as_bytes(),
+    );
+    let frame = float_ai_frame(&meta, &truncated, 2, limits)?;
+    push_error(
+        &mut vectors,
+        "153_float_tensor_exponent_stream_truncated",
         "float_tensor",
         &frame,
         &[],

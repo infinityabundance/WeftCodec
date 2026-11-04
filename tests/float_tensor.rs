@@ -48,6 +48,10 @@ fn float_meta(
         ("sign_bits", Value::U64(sign)),
         ("exponent_bits", Value::U64(exponent)),
         ("mantissa_bits", Value::U64(mantissa)),
+        (
+            "exponent_coder",
+            Value::Str(modes::FLOAT_TENSOR_EXPONENT_CODER.to_owned()),
+        ),
         ("exponent_plane_len", Value::U64(exp_len)),
         ("mantissa_plane_len", Value::U64(mant_len)),
         ("payload_hash", Value::Bytes(payload_hash.to_vec())),
@@ -68,7 +72,7 @@ fn raw_float_frame(meta: &Value, stored: &[u8], decoded_len: u64, limits: &Limit
             domain: DOMAIN_PAYLOAD,
             mode: Mode::FloatTensor,
             flags: 0,
-            level: modes::FLOAT_TENSOR_ZSTD_LEVEL as u16,
+            level: modes::FLOAT_TENSOR_LEVEL,
             decoded_len,
             content_hash: hash_domain(DOMAIN_CHUNK, &plaintext),
             dependencies: &[],
@@ -210,7 +214,7 @@ fn special_values_are_bit_exact() {
 }
 
 #[test]
-fn skewed_exponent_plane_is_compressed_and_reconstructs() {
+fn skewed_exponent_plane_uses_canonical_huffman() {
     let limits = Limits::default();
     // 64 bf16 values: 60 zeros (exponent 0) and four NaNs (exponent 0x7f).
     let mut words: Vec<u32> = vec![0x0000; 60];
@@ -222,11 +226,8 @@ fn skewed_exponent_plane_is_compressed_and_reconstructs() {
     let meta = modes::float_tensor_metadata(&parsed, &limits).expect("metadata");
     assert_eq!(meta.element_count, 64);
     assert_eq!(meta.mantissa_plane_len, 64); // 8 bits per element
-    assert!(
-        meta.exponent_plane_len < 64,
-        "zstd must shrink a skewed 64-byte exponent plane, got {}",
-        meta.exponent_plane_len
-    );
+                                             // Two symbols of equal code length: 256-byte table plus 64 data bits.
+    assert_eq!(meta.exponent_plane_len, 256 + 8);
     assert_eq!(decode(&frame, &limits).expect("decode"), payload);
 }
 
@@ -338,7 +339,7 @@ fn decode_rejects_bad_descriptors() {
         ErrorClass::LimitExceeded
     );
 
-    // Non-zstd exponent plane.
+    // Truncated canonical Huffman table (shorter than 256 bytes).
     let mut garbage = vec![0xffu8; 3];
     garbage.extend_from_slice(&mant_plane);
     let garbage_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &garbage);
@@ -355,7 +356,7 @@ fn decode_rejects_bad_descriptors() {
     );
     let frame = raw_float_frame(&meta, &garbage, 8, &limits);
     assert_eq!(
-        decode(&frame, &limits).expect_err("zstd").class(),
+        decode(&frame, &limits).expect_err("huffman").class(),
         ErrorClass::Corrupt
     );
 
@@ -393,6 +394,27 @@ fn decode_rejects_bad_descriptors() {
     assert_eq!(
         decode(&frame, &limits).expect_err("hash").class(),
         ErrorClass::Corrupt
+    );
+
+    // Unknown exponent coder.
+    let mut meta = float_meta(
+        "fp32",
+        &[2],
+        2,
+        1,
+        8,
+        23,
+        exp_plane.len() as u64,
+        mant_plane.len() as u64,
+        hash.as_bytes(),
+    );
+    if let Value::Map(map) = &mut meta {
+        map.insert("exponent_coder".to_owned(), Value::Str("zstd".to_owned()));
+    }
+    let frame = raw_float_frame(&meta, &stored, 8, &limits);
+    assert_eq!(
+        decode(&frame, &limits).expect_err("coder").class(),
+        ErrorClass::Malformed
     );
 }
 

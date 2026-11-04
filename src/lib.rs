@@ -29,6 +29,7 @@ pub mod error;
 pub mod frame;
 pub mod generated;
 pub mod hash;
+pub mod huffman;
 pub mod limits;
 pub mod modes;
 pub mod selector;

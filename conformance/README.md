@@ -68,7 +68,7 @@ mode 8 `QUANTIZED_TENSOR`, and mode 9 `FLOAT_TENSOR`. Their bodies are
 `content_hash` cover the decoded bytes, and the WCB descriptor binds the stored
 payload under `weft/tensor/payload/v1`, `weft/tokens/payload/v1`,
 `weft/quantized-tensor/payload/v1`, or `weft/float-tensor/payload/v1`.
-`FLOAT_TENSOR` stores a zstd-compressed exponent plane plus a raw
+`FLOAT_TENSOR` stores a `huffman-canonical-v1` exponent plane plus a raw
 sign+mantissa plane, while `decoded_len` is the reconstructed element length.
 
 Valid vectors: `100_tensor_f32_2x3`, `101_tensor_f16_scalar`,
@@ -78,9 +78,10 @@ Valid vectors: `100_tensor_f32_2x3`, `101_tensor_f16_scalar`,
 `108_float_bf16_2x2`, `109_float_fp16_3d`, `110_float_fp32_4d`. Reject vectors
 `120`–`135` cover shape/payload/hash/layout/dtype/overflow/rank/encoding/
 canonicality/count limits; `030`–`037` cover quantized dtype, scale, zero
-point, layout, payload-length, and hash rejects; `140`–`147` cover float-tensor
+point, layout, payload-length, and hash rejects; `140`–`153` cover float-tensor
 dtype, shape/count, rank 0, zero dimension, field widths, plane-length
-overflow, non-zstd exponent plane, and decoded-length rejects.
+overflow, unknown exponent coder, decoded-length, over-subscribed/incomplete/
+over-long Huffman tables, non-zero padding, and truncated exponent streams.
 
 `017_unknown_mode` historically asserted that mode value 6 was unknown. It is
 retained byte-for-byte with `"superseded_by":
