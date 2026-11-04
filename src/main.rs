@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -21,6 +21,7 @@ use weftcodec::limits::{self, Limits};
 use weftcodec::modes;
 use weftcodec::selector;
 use weftcodec::tensor;
+use weftcodec::tensor_sharded;
 use weftcodec::wcb;
 
 #[derive(Parser, Debug)]
@@ -85,7 +86,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -115,6 +116,21 @@ struct EncodeArgs {
     /// QUANTIZED_TENSOR zero point (i64, within the dtype range).
     #[arg(long = "zero-point", default_value_t = 0)]
     zero_point: i64,
+    /// TENSOR_SHARDED shard axis.
+    #[arg(long)]
+    axis: Option<u32>,
+    /// TENSOR_SHARDED shard count.
+    #[arg(long)]
+    shards: Option<u32>,
+    /// TENSOR_SHARDED quantization block size (16, 32, 64, 128, or 256).
+    #[arg(long = "block-size")]
+    block_size: Option<u64>,
+    /// TENSOR_SHARDED per-block f32 scale bits, comma-separated u32 values.
+    #[arg(long)]
+    scales: Option<String>,
+    /// TENSOR_SHARDED per-block zero points, comma-separated i64 values.
+    #[arg(long = "zero-points")]
+    zero_points: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -129,6 +145,18 @@ struct TensorMetaInput {
     scale: Option<f64>,
     #[serde(default)]
     zero_point: Option<i64>,
+}
+
+/// TENSOR_SHARDED metadata JSON.
+#[derive(serde::Deserialize)]
+struct ShardedMetaInput {
+    dtype: String,
+    shape: Vec<u64>,
+    axis: u32,
+    shards: u32,
+    block_size: u64,
+    scales: Vec<u64>,
+    zero_points: Vec<i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -362,10 +390,13 @@ struct TensorRootArgs {
     shards_dir: Option<String>,
     /// Tensor dtype (`f16|bf16|f32|f64|i8|u8|i16|i32|i64`).
     #[arg(long)]
-    dtype: String,
+    dtype: Option<String>,
     /// Comma-separated u64 extents.
     #[arg(long)]
-    shape: String,
+    shape: Option<String>,
+    /// Read a directory of TENSOR_SHARDED mode-10 frames instead.
+    #[arg(long)]
+    frames: bool,
     /// Physical layout: row-major, column-major, blocked, or sharded.
     #[arg(long, default_value = "row-major")]
     layout: String,
@@ -447,6 +478,9 @@ struct ConformanceArgs {
     /// Write only the WEFT-TENSOR vectors into `<dir>/tensor`.
     #[arg(long)]
     tensor_only: bool,
+    /// Write only the TENSOR_SHARDED (mode 10) vectors into `<dir>/sharded`.
+    #[arg(long)]
+    sharded_only: bool,
 }
 
 fn main() -> ExitCode {
@@ -504,6 +538,9 @@ fn run(cli: Cli) -> Result<()> {
             } else if args.tensor_only {
                 weftcodec::conformance::generate_tensor_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote tensor vectors to {}/tensor", args.dir);
+            } else if args.sharded_only {
+                weftcodec::conformance::generate_sharded_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote sharded vectors to {}/sharded", args.dir);
             } else {
                 weftcodec::conformance::generate_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote conformance vectors to {}", args.dir);
@@ -534,6 +571,17 @@ fn encode(args: EncodeArgs) -> Result<()> {
     } else if args.mode == "float_tensor" || args.mode == "float-tensor" {
         let (dtype, shape) = float_tensor_metadata_args(&args)?;
         modes::encode_float_tensor(&data, dtype, &shape, &limits)?
+    } else if args.mode == "tensor_sharded" || args.mode == "tensor-sharded" {
+        let input = sharded_encode_args(&args, &data, &limits)?;
+        let frames = tensor_sharded::encode_sharded_tensor(&input, &limits)?;
+        fs::create_dir_all(&args.output)
+            .map_err(|e| Error::io(format!("cannot create {}: {e}", args.output)))?;
+        for (index, frame) in frames.iter().enumerate() {
+            let path = Path::new(&args.output).join(format!("shard-{index}.wft1"));
+            fs::write(&path, frame)
+                .map_err(|e| Error::io(format!("cannot write {}: {e}", path.display())))?;
+        }
+        return Ok(());
     } else if args.mode == "tokens" {
         let input: TokensInput = serde_json::from_slice(&data).map_err(|err| {
             Error::malformed(format!(
@@ -606,6 +654,9 @@ fn encode_mode(
         )),
         Mode::FloatTensor => Err(Error::malformed(
             "FLOAT_TENSOR encoding requires the dedicated CLI path with --dtype/--shape/--metadata",
+        )),
+        Mode::TensorSharded => Err(Error::malformed(
+            "TENSOR_SHARDED encoding requires the dedicated CLI path with --dtype/--shape/--axis/--shards/--block-size/--scales/--zero-points",
         )),
     }
 }
@@ -742,6 +793,136 @@ fn float_tensor_metadata_args(args: &EncodeArgs) -> Result<(modes::FloatDtype, V
             .collect::<Result<Vec<u64>>>()?,
     };
     Ok((dtype, shape))
+}
+
+fn parse_u32_list(text: &str, what: &str) -> Result<Vec<u32>> {
+    text.split(',')
+        .map(|part| {
+            let part = part.trim();
+            let value =
+                if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+                    u32::from_str_radix(hex, 16)
+                } else {
+                    part.parse::<u32>()
+                };
+            value.map_err(|err| Error::malformed(format!("bad {what} value `{part}`: {err}")))
+        })
+        .collect()
+}
+
+fn parse_i64_list(text: &str, what: &str) -> Result<Vec<i64>> {
+    text.split(',')
+        .map(|part| {
+            let part = part.trim();
+            part.parse::<i64>()
+                .map_err(|err| Error::malformed(format!("bad {what} value `{part}`: {err}")))
+        })
+        .collect()
+}
+
+/// Parse a TENSOR_SHARDED input from `--metadata` or the dedicated flags.
+fn sharded_encode_args(
+    args: &EncodeArgs,
+    data: &[u8],
+    limits: &Limits,
+) -> Result<tensor_sharded::ShardedTensorInput> {
+    let (dtype, shape, axis, shards, block_size, scales, zero_points) = if let Some(path) =
+        &args.metadata
+    {
+        if args.dtype.is_some()
+            || args.shape.is_some()
+            || args.axis.is_some()
+            || args.shards.is_some()
+            || args.block_size.is_some()
+            || args.scales.is_some()
+            || args.zero_points.is_some()
+        {
+            return Err(Error::malformed(
+                "--metadata cannot be combined with TENSOR_SHARDED flags",
+            ));
+        }
+        let bytes = read_limited(path, limits.max_string_bytes)?;
+        let input: ShardedMetaInput = serde_json::from_slice(&bytes).map_err(|err| {
+                Error::malformed(format!(
+                    "TENSOR_SHARDED metadata must be JSON {{\"dtype\":string,\"shape\":[u64,...],\"axis\":u32,\"shards\":u32,\"block_size\":u64,\"scales\":[u32,...],\"zero_points\":[i64,...]}}: {err}"
+                ))
+            })?;
+        let dtype = tensor_sharded::ShardedDtype::from_name(&input.dtype)?;
+        let mut scales = Vec::with_capacity(input.scales.len());
+        for bits in input.scales {
+            scales.push(
+                u32::try_from(bits)
+                    .map_err(|_| Error::malformed("TENSOR_SHARDED scale bits exceed u32"))?,
+            );
+        }
+        (
+            dtype,
+            input.shape,
+            input.axis,
+            input.shards,
+            input.block_size,
+            scales,
+            input.zero_points,
+        )
+    } else {
+        let dtype = args.dtype.as_deref().ok_or_else(|| {
+            Error::malformed("TENSOR_SHARDED encoding requires --dtype or --metadata")
+        })?;
+        let dtype = tensor_sharded::ShardedDtype::from_name(dtype)?;
+        let shape = try_parse_extents(
+            args.shape
+                .as_deref()
+                .ok_or_else(|| Error::malformed("TENSOR_SHARDED encoding requires --shape"))?,
+        )?;
+        let axis = args
+            .axis
+            .ok_or_else(|| Error::malformed("TENSOR_SHARDED encoding requires --axis"))?;
+        let shards = args
+            .shards
+            .ok_or_else(|| Error::malformed("TENSOR_SHARDED encoding requires --shards"))?;
+        let block_size = args
+            .block_size
+            .ok_or_else(|| Error::malformed("TENSOR_SHARDED encoding requires --block-size"))?;
+        let scales = parse_u32_list(
+            args.scales
+                .as_deref()
+                .ok_or_else(|| Error::malformed("TENSOR_SHARDED encoding requires --scales"))?,
+            "--scales",
+        )?;
+        let zero_points = parse_i64_list(
+            args.zero_points.as_deref().ok_or_else(|| {
+                Error::malformed("TENSOR_SHARDED encoding requires --zero-points")
+            })?,
+            "--zero-points",
+        )?;
+        (dtype, shape, axis, shards, block_size, scales, zero_points)
+    };
+    if data.len() as u64 > limits.max_decoded_bytes {
+        return Err(Error::limit_exceeded(
+            "TENSOR_SHARDED word input exceeds limit",
+        ));
+    }
+    let words = data.iter().map(|byte| *byte as i8).collect();
+    Ok(tensor_sharded::ShardedTensorInput {
+        dtype,
+        shape,
+        shard_axis: axis,
+        shard_count: shards,
+        block_size,
+        scales,
+        zero_points,
+        words,
+    })
+}
+
+fn try_parse_extents(text: &str) -> Result<Vec<u64>> {
+    text.split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<u64>()
+                .map_err(|err| Error::malformed(format!("bad shape extent `{part}`: {err}")))
+        })
+        .collect()
 }
 
 fn encode_auto(
@@ -1219,8 +1400,72 @@ fn tensor_record(
 
 fn tensor_root(args: &TensorRootArgs) -> Result<()> {
     let limits = Limits::default();
-    let dtype = tensor::dtype_from_name(&args.dtype)?;
-    let shape = parse_extents(&args.shape, "shape")?;
+    if args.frames {
+        let dir = args
+            .shards_dir
+            .as_deref()
+            .ok_or_else(|| Error::parse("--frames requires --shards-dir"))?;
+        if args.dtype.is_some() || args.shape.is_some() || args.input.is_some() {
+            return Err(Error::parse(
+                "--frames cannot be combined with --dtype, --shape, or --input",
+            ));
+        }
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+            .map_err(|e| Error::io(format!("cannot read {dir}: {e}")))?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("shard-") && name.ends_with(".wft1"))
+            })
+            .collect();
+        paths.sort();
+        if paths.is_empty() {
+            return Err(Error::malformed(format!(
+                "{dir} contains no shard-<index>.wft1 frames"
+            )));
+        }
+        let mut shards = Vec::with_capacity(paths.len());
+        for path in paths {
+            let bytes = fs::read(&path)
+                .map_err(|e| Error::io(format!("cannot read {}: {e}", path.display())))?;
+            let parsed = Frame::parse(&bytes, &limits)?;
+            shards.push(tensor_sharded::decode_shard_frame(&parsed, &limits)?);
+        }
+        let root = tensor_sharded::shard_set_root(&shards, &limits)?;
+        let meta = &shards[0].meta;
+        if args.json {
+            let output = json!({
+                "schema": tensor_sharded::TENSOR_SHARDED_SCHEMA,
+                "dtype": meta.dtype.as_str(),
+                "shape": meta.shape,
+                "element_count": meta.element_count,
+                "shard_axis": meta.shard_axis,
+                "shard_count": meta.shard_count,
+                "block_size": meta.block_size,
+                "layout_root": root.to_hex(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output)
+                    .map_err(|e| Error::io(format!("cannot serialize tensor root: {e}")))?
+            );
+        } else {
+            println!("{root}");
+        }
+        return Ok(());
+    }
+    let dtype_text = args
+        .dtype
+        .as_deref()
+        .ok_or_else(|| Error::parse("tensor root requires --dtype (or --frames)"))?;
+    let shape_text = args
+        .shape
+        .as_deref()
+        .ok_or_else(|| Error::parse("tensor root requires --shape (or --frames)"))?;
+    let dtype = tensor::dtype_from_name(dtype_text)?;
+    let shape = parse_extents(shape_text, "shape")?;
 
     let (row_major, layout_name) = if let Some(dir) = &args.shards_dir {
         let axis = args

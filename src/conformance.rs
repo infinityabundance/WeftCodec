@@ -20,12 +20,14 @@ use crate::frame::{
 };
 use crate::hash::{
     hash_domain, Hash32, DOMAIN_CHUNK, DOMAIN_FLOAT_TENSOR_PAYLOAD,
-    DOMAIN_QUANTIZED_TENSOR_PAYLOAD, DOMAIN_SELECTOR, DOMAIN_TENSOR_PAYLOAD, DOMAIN_TOKENS_PAYLOAD,
+    DOMAIN_QUANTIZED_TENSOR_PAYLOAD, DOMAIN_SELECTOR, DOMAIN_TENSOR_PAYLOAD,
+    DOMAIN_TENSOR_SHARDED_PAYLOAD, DOMAIN_TOKENS_PAYLOAD,
 };
 use crate::limits::Limits;
 use crate::modes;
 use crate::selector;
 use crate::tensor::{self, LayoutDescriptor, LogicalRecord, TensorLayout};
+use crate::tensor_sharded;
 use crate::varint;
 use crate::wcb::{self, Value};
 
@@ -38,6 +40,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let context_dir = dir.join("context");
     let causal_dir = dir.join("causal");
     let tensor_dir = dir.join("tensor");
+    let sharded_dir = dir.join("sharded");
     for sub in [
         &codec_dir,
         &structured_dir,
@@ -45,6 +48,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
         &context_dir,
         &causal_dir,
         &tensor_dir,
+        &sharded_dir,
     ] {
         fs::create_dir_all(sub)
             .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
@@ -56,6 +60,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_context_vectors(&context_dir, limits)?;
     write_causal_vectors(&causal_dir, limits)?;
     write_tensor_vectors(&tensor_dir, limits)?;
+    write_sharded_vectors(&sharded_dir, limits)?;
     Ok(())
 }
 
@@ -65,6 +70,14 @@ pub fn generate_tensor_v1(dir: &Path, limits: &Limits) -> Result<()> {
     fs::create_dir_all(&tensor_dir)
         .map_err(|e| Error::io(format!("cannot create {}: {e}", tensor_dir.display())))?;
     write_tensor_vectors(&tensor_dir, limits)
+}
+
+/// Generate only the TENSOR_SHARDED (mode 10) vectors into `<dir>/sharded`.
+pub fn generate_sharded_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let sharded_dir = dir.join("sharded");
+    fs::create_dir_all(&sharded_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", sharded_dir.display())))?;
+    write_sharded_vectors(&sharded_dir, limits)
 }
 
 fn write_json(path: &Path, value: &Json) -> Result<()> {
@@ -518,11 +531,11 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     );
 
     let mut unknown_mode = good.clone();
-    unknown_mode[7] = 10;
+    unknown_mode[7] = 11;
     refix_header_and_trailer(&mut unknown_mode);
     push_error(
         &mut vectors,
-        &name("unknown_mode_reserved10"),
+        &name("unknown_mode_reserved11"),
         "raw",
         &unknown_mode,
         &[],
@@ -2729,6 +2742,303 @@ fn write_tensor_vectors(dir: &Path, limits: &Limits) -> Result<()> {
         });
         write_json(&dir.join(format!("{name}.json")), &vector)?;
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// TENSOR_SHARDED (mode 10) vectors
+// ---------------------------------------------------------------------------
+
+fn sharded_frame_with_value(
+    meta_value: Value,
+    planes: &[u8],
+    stored: &[u8],
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let meta_bytes = wcb::encode(&meta_value, limits)?;
+    let meta_len = u32::try_from(meta_bytes.len())
+        .map_err(|_| Error::limit_exceeded("TENSOR_SHARDED metadata does not fit u32"))?;
+    let mut body = Vec::with_capacity(4 + meta_bytes.len() + stored.len());
+    body.extend_from_slice(&meta_len.to_le_bytes());
+    body.extend_from_slice(&meta_bytes);
+    body.extend_from_slice(stored);
+    build_frame(
+        Mode::TensorSharded,
+        DOMAIN_PAYLOAD,
+        0,
+        planes.len() as u64,
+        hash_domain(DOMAIN_CHUNK, planes),
+        &[],
+        &body,
+        limits,
+    )
+}
+
+fn sharded_frame(
+    meta: &tensor_sharded::TensorShardedMeta,
+    planes: &[u8],
+    stored: &[u8],
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let payload_hash = hash_domain(DOMAIN_TENSOR_SHARDED_PAYLOAD, stored);
+    sharded_frame_with_value(
+        tensor_sharded::descriptor_value(meta, &payload_hash),
+        planes,
+        stored,
+        limits,
+    )
+}
+
+fn sharded_words_hex(words: &[i8]) -> String {
+    let bytes: Vec<u8> = words.iter().map(|word| *word as u8).collect();
+    hexs(&bytes)
+}
+
+fn sharded_pattern_q8(count: usize) -> Vec<i8> {
+    (0..count)
+        .map(|i| (((i * 7 + 3) % 251) as i32 - 125) as i8)
+        .collect()
+}
+
+fn sharded_pattern_q4(count: usize) -> Vec<i8> {
+    (0..count).map(|i| (i % 16) as i8 - 8).collect()
+}
+
+fn write_sharded_valid(
+    dir: &Path,
+    name: &str,
+    input: &tensor_sharded::ShardedTensorInput,
+    limits: &Limits,
+) -> Result<()> {
+    let frames = tensor_sharded::encode_sharded_tensor(input, limits)?;
+    let root = tensor_sharded::logical_root(
+        input.dtype,
+        &input.shape,
+        &input.words,
+        &input.scales,
+        &input.zero_points,
+        limits,
+    )?;
+    let mut frame_json = Vec::with_capacity(frames.len());
+    for frame in frames.iter() {
+        let parsed = Frame::parse(frame, limits)?;
+        let shard = tensor_sharded::decode_shard_frame(&parsed, limits)?;
+        frame_json.push(json!({
+            "index": shard.meta.shard_index,
+            "frame_hex": hexs(frame),
+        }));
+    }
+    // Deliberately shuffled: the descriptor index is authoritative.
+    frame_json.reverse();
+    let vector = json!({
+        "name": name,
+        "schema": tensor_sharded::TENSOR_SHARDED_SCHEMA,
+        "dtype": input.dtype.as_str(),
+        "shape": input.shape,
+        "element_count": input.words.len(),
+        "axis": input.shard_axis,
+        "shards": input.shard_count,
+        "block_size": input.block_size,
+        "scales": input.scales,
+        "zero_points": input.zero_points,
+        "words_hex": sharded_words_hex(&input.words),
+        "layout_root": root.to_hex(),
+        "frames": frame_json,
+        "expect": { "ok": true },
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_sharded_reject(
+    dir: &Path,
+    name: &str,
+    frames: &[Vec<u8>],
+    expected: ErrorClass,
+    note: &str,
+) -> Result<()> {
+    let mut frame_json = Vec::with_capacity(frames.len());
+    for frame in frames {
+        frame_json.push(json!({
+            "frame_hex": hexs(frame),
+        }));
+    }
+    let vector = json!({
+        "name": name,
+        "expect_error": expected.as_str(),
+        "note": note,
+        "frames": frame_json,
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_sharded_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    let q8 = tensor_sharded::ShardedTensorInput {
+        dtype: tensor_sharded::ShardedDtype::Q8_0,
+        shape: vec![4, 8],
+        shard_axis: 0,
+        shard_count: 2,
+        block_size: 16,
+        scales: vec![0.5f32.to_bits(), 0.25f32.to_bits()],
+        zero_points: vec![0, 3],
+        words: sharded_pattern_q8(32),
+    };
+    write_sharded_valid(dir, "001_q8_0_rank2_2shards", &q8, limits)?;
+
+    let q4 = tensor_sharded::ShardedTensorInput {
+        dtype: tensor_sharded::ShardedDtype::Q4_0,
+        shape: vec![2, 4, 8],
+        shard_axis: 1,
+        shard_count: 4,
+        block_size: 16,
+        scales: vec![
+            0.5f32.to_bits(),
+            0.25f32.to_bits(),
+            0.125f32.to_bits(),
+            0.0625f32.to_bits(),
+        ],
+        zero_points: vec![0, 1, -1, 2],
+        words: sharded_pattern_q4(64),
+    };
+    write_sharded_valid(dir, "002_q4_0_rank3_4shards", &q4, limits)?;
+
+    let single = tensor_sharded::ShardedTensorInput {
+        dtype: tensor_sharded::ShardedDtype::Q8_0,
+        shape: vec![16],
+        shard_axis: 0,
+        shard_count: 1,
+        block_size: 16,
+        scales: vec![1.0f32.to_bits()],
+        zero_points: vec![0],
+        words: sharded_pattern_q8(16),
+    };
+    write_sharded_valid(dir, "003_q8_0_rank1_1shard", &single, limits)?;
+
+    // Rejection frames are derived from the first q8_0 shard.
+    let frames = tensor_sharded::encode_sharded_tensor(&q8, limits)?;
+    let parsed = Frame::parse(&frames[0], limits)?;
+    let shard = tensor_sharded::decode_shard_frame(&parsed, limits)?;
+    let planes = shard.planes.clone();
+    let stored = crate::huffman::encode(&planes);
+    let mut base = shard.meta.clone();
+    base.payload_len = stored.len() as u64;
+
+    let unknown_dtype_frame = {
+        let payload_hash = hash_domain(DOMAIN_TENSOR_SHARDED_PAYLOAD, &stored);
+        let value = tensor_sharded::descriptor_value(&base, &payload_hash);
+        let overridden = match value {
+            Value::Map(mut map) => {
+                map.insert("dtype".to_owned(), Value::Str("q5_1".to_owned()));
+                Value::Map(map)
+            }
+            other => other,
+        };
+        sharded_frame_with_value(overridden, &planes, &stored, limits)?
+    };
+    write_sharded_reject(
+        dir,
+        "101_unknown_dtype",
+        &[unknown_dtype_frame],
+        ErrorClass::Malformed,
+        "dtype q5_1 has no v1 wire value",
+    )?;
+
+    let mut mismatched_planes = planes.clone();
+    let last = mismatched_planes.len() - 1;
+    mismatched_planes[last] ^= 0x01;
+    let mismatched_stored = crate::huffman::encode(&mismatched_planes);
+    let mut mismatched_meta = base.clone();
+    mismatched_meta.payload_len = mismatched_stored.len() as u64;
+    let scale_mismatch = sharded_frame(
+        &mismatched_meta,
+        &mismatched_planes,
+        &mismatched_stored,
+        limits,
+    )?;
+    write_sharded_reject(
+        dir,
+        "102_quant_scale_mismatch",
+        &[scale_mismatch],
+        ErrorClass::Corrupt,
+        "scale plane bit differs from the descriptor scales array",
+    )?;
+
+    let mut element_meta = base.clone();
+    element_meta.element_count = 31;
+    element_meta.payload_len = stored.len() as u64;
+    let element_frame = sharded_frame(&element_meta, &planes, &stored, limits)?;
+    write_sharded_reject(
+        dir,
+        "103_element_count_mismatch",
+        &[element_frame],
+        ErrorClass::Malformed,
+        "element_count is not the shape product",
+    )?;
+
+    let mut block_meta = base.clone();
+    block_meta.block_size = 24;
+    block_meta.payload_len = stored.len() as u64;
+    let block_frame = sharded_frame(&block_meta, &planes, &stored, limits)?;
+    write_sharded_reject(
+        dir,
+        "104_block_size_invalid",
+        &[block_frame],
+        ErrorClass::Malformed,
+        "block_size 24 is not in {16,32,64,128,256}",
+    )?;
+
+    let mut axis_meta = base.clone();
+    axis_meta.shard_axis = 1;
+    axis_meta.shard_count = 3;
+    axis_meta.payload_len = stored.len() as u64;
+    let axis_frame = sharded_frame(&axis_meta, &planes, &stored, limits)?;
+    write_sharded_reject(
+        dir,
+        "105_shape_not_divisible",
+        &[axis_frame],
+        ErrorClass::Malformed,
+        "shape[1] = 8 is not divisible by shard_count 3",
+    )?;
+
+    let mut index_meta = base.clone();
+    index_meta.shard_index = 2;
+    index_meta.payload_len = stored.len() as u64;
+    let index_frame = sharded_frame(&index_meta, &planes, &stored, limits)?;
+    write_sharded_reject(
+        dir,
+        "106_index_out_of_range",
+        &[index_frame],
+        ErrorClass::Malformed,
+        "shard_index 2 is not below shard_count 2",
+    )?;
+
+    let second_parsed = Frame::parse(&frames[1], limits)?;
+    let second = tensor_sharded::decode_shard_frame(&second_parsed, limits)?;
+    let second_stored = crate::huffman::encode(&second.planes);
+    let mut duplicate_meta = second.meta.clone();
+    duplicate_meta.shard_index = 0;
+    duplicate_meta.payload_len = second_stored.len() as u64;
+    let duplicate_frame = sharded_frame(&duplicate_meta, &second.planes, &second_stored, limits)?;
+    write_sharded_reject(
+        dir,
+        "107_duplicate_shard",
+        &[frames[0].clone(), duplicate_frame],
+        ErrorClass::NonCanonical,
+        "two shards declare index 0",
+    )?;
+
+    let mut truncated = stored.clone();
+    truncated.truncate(truncated.len() - 1);
+    let mut huffman_meta = base.clone();
+    huffman_meta.payload_len = truncated.len() as u64;
+    let huffman_frame = sharded_frame(&huffman_meta, &planes, &truncated, limits)?;
+    write_sharded_reject(
+        dir,
+        "108_malformed_huffman",
+        &[huffman_frame],
+        ErrorClass::Corrupt,
+        "truncated huffman-canonical-v1 bitstream",
+    )?;
 
     Ok(())
 }

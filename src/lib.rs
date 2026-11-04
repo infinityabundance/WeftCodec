@@ -36,6 +36,7 @@ pub mod modes;
 pub mod selector;
 pub mod stream;
 pub mod tensor;
+pub mod tensor_sharded;
 pub mod varint;
 pub mod wcb;
 
@@ -47,4 +48,8 @@ pub use modes::TensorDtype;
 pub use tensor::{
     logical_root, shard_root, LayoutDescriptor, LogicalRecord, PhysicalTensor, Region, RegionRead,
     TensorLayout,
+};
+pub use tensor_sharded::{
+    assemble_sharded_words, decode_shard_frame, encode_shard_frame, encode_sharded_tensor,
+    shard_set_root, DecodedTensorShard, ShardedDtype, ShardedTensorInput, TensorShardedMeta,
 };

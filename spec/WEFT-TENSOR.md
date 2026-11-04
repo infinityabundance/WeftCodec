@@ -35,6 +35,26 @@ f16  bf16  f32  f64  i8  u8  i16  i32  i64
 with element sizes `2, 2, 4, 8, 1, 1, 2, 4, 8` bytes respectively. Elements are
 fixed-width little-endian bytes.
 
+### 2.1 Additive quantized logical dtypes (WEFT-AI-CODEC §11)
+
+Mode 10 (`TENSOR_SHARDED`) adds two logical dtype names, `q8_0` and `q4_0`.
+They are used only with the `weft.ai.tensor_sharded.v1` descriptor; they are
+not mode-6 element types and they do not change the dtype table above or any
+committed vector. For these dtypes `element_count` is the number of quantized
+values, and `values_hash` is
+
+```
+H("weft/tensor/values/v1", W || B)
+```
+
+where `W` is the whole canonical row-major sequence of quantized values
+each sign-extended to one `u8` byte (`q4_0` values are in `-8..=7`; `q8_0`
+values are `i8`), and `B` is the concatenation, in block order, of
+`u32le(scale_f32_bits) || i64le(zero_point)`. The logical record and
+`LogicalTensorRoot` construction are otherwise identical to §3. This additive
+type set exists so a sharded quantized tensor has the same layout-independent
+identity as a full-precision tensor; it does not define dequantization.
+
 `shape` is an array of `u64` extents. It MUST satisfy:
 
 - rank `1 <= len(shape) <= max_tensor_rank`;

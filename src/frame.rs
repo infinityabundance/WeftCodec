@@ -80,6 +80,8 @@ pub enum Mode {
     /// Split float tensor: zstd exponent plane plus raw sign+mantissa plane
     /// with WCB descriptor (WEFT-AI-CODEC §5).
     FloatTensor = 9,
+    /// Sharded quantized tensor shard with WCB descriptor (WEFT-AI-CODEC §11).
+    TensorSharded = 10,
 }
 
 impl Mode {
@@ -96,7 +98,8 @@ impl Mode {
             7 => Ok(Mode::TokenSequence),
             8 => Ok(Mode::QuantizedTensor),
             9 => Ok(Mode::FloatTensor),
-            10..=127 => Err(Error::unsupported_mode(format!(
+            10 => Ok(Mode::TensorSharded),
+            11..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -123,6 +126,7 @@ impl Mode {
             Mode::TokenSequence => "tokens",
             Mode::QuantizedTensor => "quantized_tensor",
             Mode::FloatTensor => "float_tensor",
+            Mode::TensorSharded => "tensor_sharded",
         }
     }
 
@@ -139,6 +143,7 @@ impl Mode {
             "tokens" | "token_sequence" => Ok(Mode::TokenSequence),
             "quantized" | "quantized_tensor" => Ok(Mode::QuantizedTensor),
             "float_tensor" | "float-tensor" => Ok(Mode::FloatTensor),
+            "tensor_sharded" | "tensor-sharded" | "sharded" => Ok(Mode::TensorSharded),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -761,10 +766,14 @@ fn validate_mode_rules(
                 return Err(Error::malformed("DELTA must not be chunked"));
             }
         }
-        Mode::Tensor | Mode::TokenSequence | Mode::QuantizedTensor | Mode::FloatTensor => {
+        Mode::Tensor
+        | Mode::TokenSequence
+        | Mode::QuantizedTensor
+        | Mode::FloatTensor
+        | Mode::TensorSharded => {
             if header.domain != DOMAIN_PAYLOAD {
                 return Err(Error::malformed(
-                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR/FLOAT_TENSOR frames must use the payload domain",
+                    "AI-mode frames must use the payload domain",
                 ));
             }
             if dict_flag {

@@ -48,6 +48,8 @@ pub const DOMAIN_TOKENS_PAYLOAD: &str = "weft/tokens/payload/v1";
 pub const DOMAIN_QUANTIZED_TENSOR_PAYLOAD: &str = "weft/quantized-tensor/payload/v1";
 /// Float-tensor stored-payload binding (WEFT-AI-CODEC §5).
 pub const DOMAIN_FLOAT_TENSOR_PAYLOAD: &str = "weft/float-tensor/payload/v1";
+/// Sharded quantized tensor stored-payload binding (WEFT-AI-CODEC §11).
+pub const DOMAIN_TENSOR_SHARDED_PAYLOAD: &str = "weft/tensor-sharded/payload/v1";
 
 /// A 32-byte Weft digest.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -9,6 +9,7 @@ and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 | 7 | `TOKEN_SEQUENCE` (CLI `tokens`) | **implemented** | `103_tokens_delta_boundaries`, `104_tokens_empty` + rejects |
 | 8 | `QUANTIZED_TENSOR` (CLI `quantized`) | **implemented** | `105_quantized_i8_2x3`, `106_quantized_u8_zero_element`, `107_quantized_i8_scalar` + rejects |
 | 9 | `FLOAT_TENSOR` (CLI `float-tensor`) | **implemented** | `108_float_bf16_2x2`, `109_float_fp16_3d`, `110_float_fp32_4d` + rejects |
+| 10 | `TENSOR_SHARDED` (CLI `tensor-sharded`) | **implemented** | `conformance/v1/sharded/001`–`003` + eight rejects |
 
 Every other mode below is `specified, not implemented` and has **no allocated
 wire value**. Nothing in this document is a compression or performance claim.
@@ -478,7 +479,7 @@ reserved value or an existing descriptor field.
 | Tensor `column_major` layout | specified, not implemented in mode 6 | Mode 6 remains `row_major`; the additive layout layer is WEFT-TENSOR §4 |
 | Tensor `blocked` layout | specified, not implemented in mode 6 | No block extents in mode 6; WEFT-TENSOR §4 defines the additive block form |
 | Tensor `sharded` layout | specified, not implemented in mode 6 | No shard fields in mode 6; WEFT-TENSOR §4–§6 defines shards and containers |
-| Tensor `quantized` storage beyond affine per-tensor i8/u8 | specified, not implemented | i4 nibble packing, per-axis scales, and dequantization are out of codec scope |
+| Tensor `quantized` storage beyond affine per-tensor i8/u8 | implemented as additive mode 10 for per-block q8_0/q4_0 | Mode 10 (§11) implements i4 nibble packing and per-block scales; dequantization remains out of codec scope |
 | Activation/gradient streams | specified, not implemented | No stream descriptor or element-hash list wire form |
 | Embedding / KV-cache pages | specified, not implemented | No layer/head/position wire form |
 | Vocabulary artifact binding | specified, not implemented | `vocab_schema` is a declaration only; no dependency hash field |
@@ -496,9 +497,10 @@ vectors, and the same cross-language gates.
 
 | Limit | Default | Applies to |
 |---|---:|---|
-| `max_tensor_elements` | 4,294,967,296 | TENSOR/FLOAT_TENSOR shape product |
-| `max_tensor_rank` | 8 | TENSOR/FLOAT_TENSOR shape length |
+| `max_tensor_elements` | 4,294,967,296 | TENSOR/FLOAT_TENSOR/TENSOR_SHARDED shape product |
+| `max_tensor_rank` | 8 | TENSOR/FLOAT_TENSOR/TENSOR_SHARDED shape length |
 | `max_tokens` | 16,777,216 | TOKEN_SEQUENCE `token_count` |
+| `max_structured_items` | 1,000,000 | TENSOR_SHARDED `scales`/`zero_points` block arrays |
 
 Existing limits also apply: `max_decoded_bytes` (payload), `max_frame_bytes`,
 `max_structured_depth`, `max_structured_items`, `max_string_bytes` (descriptor
@@ -539,11 +541,19 @@ The committed suites and vectors cover:
    Huffman tables, non-zero padding, and truncated streams; element/rank/
    decoded-byte limits.
 10. **Cross-language**: Rust→Go and Go→Rust decode equivalence plus
-   byte-identical frames for TENSOR, TOKEN_SEQUENCE, QUANTIZED_TENSOR, and
-   FLOAT_TENSOR (`WeftCodec-Go/hack/cross.sh`). `FLOAT_TENSOR` byte identity is
-   mandatory because its exponent plane uses the deterministic
-   `huffman-canonical-v1` coder, not a library zstd frame. The frozen vectors
-   are generated once and replayed by both implementations.
+   byte-identical frames for TENSOR, TOKEN_SEQUENCE, QUANTIZED_TENSOR,
+   FLOAT_TENSOR, and TENSOR_SHARDED (`WeftCodec-Go/hack/cross.sh`).
+   `FLOAT_TENSOR` and `TENSOR_SHARDED` byte identity is mandatory because both
+   use the deterministic `huffman-canonical-v1` coder, not a library zstd
+   frame. The frozen vectors are generated once and replayed by both
+   implementations.
+11. **TENSOR_SHARDED**: q8_0 rank-2 and q4_0 rank-3 shard sets round-trip
+    exactly; single-shard q8_0; nibble order; shard sets accepted in any order;
+    duplicate/missing/out-of-range indices rejected; sharding axis/count do not
+    change `layout_root`; unknown dtype, scale-plane mismatch, wrong element
+    count, invalid block size, non-divisible axis, out-of-range index, and a
+    malformed Huffman stream rejected with the classes of §11.4; rank, element,
+    block-array, and plane-length limits fail closed.
 
 Frozen vector names live in both codec repositories under
 `conformance/v1/codec/`. The Rust generator is
@@ -586,3 +596,234 @@ does not alter any mode-6 encoding or frozen vector. Mode-6 `TENSOR` frames
 continue to require `layout: "row_major"` and remain the frame format for
 single-region canonical payloads. See WEFT-TENSOR §1 and §10 for the exact
 boundary.
+
+---
+
+## 11. Mode 10 — `TENSOR_SHARDED` (implemented)
+
+Mode 10 carries one shard of a quantized tensor. The descriptor names the whole
+logical shape, the shard position, the global quantization blocks, and the
+WeftTensor `LogicalTensorRoot` of the unsharded tensor. Decoding reconstructs
+the exact quantized words and scale bits; dequantization is out of band.
+
+### 11.1 Frame shape
+
+Identical to §2.1, with `mode = 10`. The body is
+
+```
+u32le(meta_len) || WCB(weft.ai.tensor_sharded.v1) || huffman_stream
+```
+
+`decoded_len` is the length of the reconstructed planes `P` (§11.4), not the
+stored Huffman stream length. `content_hash` is `H("weft/chunk/v1", P)`.
+Frame `domain` is `0`; no dependencies and no chunks are permitted; `level` is
+`0`. The descriptor additionally binds the stored stream under
+
+```
+H("weft/tensor-sharded/payload/v1", huffman_stream)
+```
+
+so swapping the encoded stream without changing the descriptor is `Corrupt`.
+
+### 11.2 Descriptor
+
+The WCB descriptor is a map with exactly these keys:
+
+| Key | WCB type | Value |
+|---|---|---|
+| `schema` | text | exactly `weft.ai.tensor_sharded.v1` |
+| `dtype` | text | exactly `q8_0` or `q4_0` in v1 |
+| `shape` | array of u64 | whole-tensor extents, rank 1..=`max_tensor_rank`; every dimension > 0 |
+| `element_count` | u64 | product of `shape` |
+| `shard_axis` | u64 | axis being split, `0 <= shard_axis < rank` (u32 range) |
+| `shard_count` | u64 | `1..=u32::MAX`; MUST divide `shape[shard_axis]` |
+| `shard_index` | u64 | `0 <= shard_index < shard_count` (u32 range) |
+| `block_size` | u64 | exactly 16, 32, 64, 128, or 256 |
+| `scales` | array of u64 | one per global block; low 32 bits are the exact f32 bit pattern, high 32 bits MUST be zero |
+| `zero_points` | array of i64 | one per global block, in block order |
+| `layout_root` | bytes(32) | the WeftTensor `LogicalTensorRoot` of the whole tensor (§11.5) |
+| `payload_len` | u64 | length of the stored `huffman-canonical-v1` stream |
+| `payload_hash` | bytes(32) | `H("weft/tensor-sharded/payload/v1", stored stream)` |
+
+`WCB` has no `u32` tag, so `shard_axis`, `shard_count`, and `shard_index` are
+carried as `u64` restricted to the `u32` range.
+
+Derived quantities (never on the wire):
+
+```
+shard_elements = element_count / shard_count
+block_count    = element_count / block_size
+```
+
+Requirements: `element_count % block_size == 0`; `shard_count` divides
+`shape[shard_axis]`, so `element_count % shard_count == 0`; `block_count >=
+scales.len() == zero_points.len()`; and every scale is a **finite positive
+f32**. The scale/zero-point arrays are global: every shard of the same tensor
+MUST carry identical arrays. A block `b` covers the global canonical row-major
+element indices `[b * block_size, (b + 1) * block_size)`.
+
+### 11.3 Quantized values and planes
+
+Quantized values are exact integers. The codec never converts, rounds, or
+deinterprets them.
+
+- `q8_0`: one signed 8-bit value per element, two's complement, range
+  `-128..=127`.
+- `q4_0`: one signed 4-bit value per element, two's complement, range
+  `-8..=7`. Two values are packed per byte; the even element is the **low**
+  nibble and the odd element is the **high** nibble. A `q4_0` shard therefore
+  requires an even `shard_elements`; otherwise the descriptor is `Malformed`.
+
+For shard `j`, the quantized plane is the shard's `shard_elements` values in
+**shard-local canonical row-major order** (WEFT-TENSOR §4.2), packed as above.
+The scale plane is the `block_count` exact f32 scale bits, each as 4 bytes
+little-endian, in global block order. Thus the reconstructed plane is
+
+```
+P = quantized plane || scale plane
+```
+
+and its length is
+
+```
+q8_0: shard_elements + 4 * block_count
+q4_0: shard_elements / 2 + 4 * block_count
+```
+
+The stored stream is `huffman-canonical-v1(P)` (§5.3.1), including its 256-byte
+code-length table. `payload_len` is the stored length and `decoded_len` is
+`len(P)`. The decoder MUST verify that the scale plane is byte-identical to the
+`scales` array (`Corrupt` otherwise). It reconstructs the quantized words and
+scale bits exactly; no dequantization is part of the codec or of identity.
+
+### 11.4 Validation order (normative for error classes)
+
+1. Body split / `meta_len` bounds → `Malformed`.
+2. WCB canonical decode → `NonCanonical`, `Malformed`, or `LimitExceeded`.
+3. Descriptor key set, `schema` → `Malformed`.
+4. Unknown `dtype` → `Malformed`.
+5. `shape` rank 0 or zero dimension → `Malformed`; rank > `max_tensor_rank`,
+   product overflow, or product > `max_tensor_elements` → `LimitExceeded`.
+6. `element_count` ≠ shape product → `Malformed`.
+7. `shard_axis` ≥ rank, `shard_count` = 0, `shard_index` ≥ `shard_count`, or
+   `shape[shard_axis] % shard_count ≠ 0` → `Malformed`.
+8. `block_size` not in `{16,32,64,128,256}` → `Malformed`; `element_count %
+   block_size ≠ 0` → `Malformed`; `block_count` > `max_structured_items` →
+   `LimitExceeded`.
+9. `scales` or `zero_points` length ≠ `block_count` → `Malformed`; a scale
+   value above `u32::MAX`, a non-finite f32, or a non-positive scale →
+   `Malformed`.
+10. `q4_0` with odd `shard_elements` → `Malformed`.
+11. `payload_len` ≠ actual stored length → `Malformed`; computed plane length
+    overflow or above `max_decoded_bytes` → `LimitExceeded`.
+12. `decoded_len` ≠ computed plane length → `Corrupt`.
+13. Huffman stream rejects → the classes of §5.3.1.
+14. Scale plane ≠ descriptor `scales` → `Corrupt`.
+15. `content_hash` ≠ `H("weft/chunk/v1", P)` → `Corrupt`.
+16. `payload_hash` length ≠ 32 → `Malformed`; value mismatch → `Corrupt`.
+17. `layout_root` length ≠ 32 → `Malformed`. A single shard cannot verify the
+    root; `shard_set_root` does (§11.6).
+
+### 11.5 Logical root
+
+The root is the WeftTensor `LogicalTensorRoot` (WEFT-TENSOR §3) applied to the
+quantized tensor, with the additive quantized dtypes `q8_0` and `q4_0`. Let
+
+- `W` be the whole-tensor canonical row-major sequence of quantized values,
+  each **sign-extended to one `u8` byte**: for `q8_0`, the `i8` two's-complement
+  byte; for `q4_0`, the `i4` value sign-extended (for example `-8` → `0xF8`).
+- `B` be the block records in block order:
+  `u32le(scales[b]) || i64le(zero_points[b])`.
+
+Then
+
+```
+values_hash = H("weft/tensor/values/v1", W || B)
+record      = { "schema": "weft.tensor.logical.v1",
+                "dtype":  "q8_0" | "q4_0",
+                "shape":  shape,
+                "element_count": element_count,
+                "values_hash": values_hash }
+layout_root = H("weft/tensor/logical/v1", WCB(record))
+```
+
+The record uses the canonical WCB map encoding and key ordering of
+WEFT-TENSOR §3. Because `W` and `B` are defined over the whole canonical
+tensor, `layout_root` does **not** depend on `shard_axis`, `shard_count`, or
+`shard_index`. Two artifacts that describe the same quantized tensor with
+different sharding produce the same root. Resharding therefore need not change
+logical identity.
+
+Zero points are carried exactly and are part of the root, but this document
+defines no dequantization rule. A consumer that needs floats applies its own
+out-of-band formula; that formula is not part of WeftCodec identity.
+
+### 11.6 Shard-set verification
+
+`shard_set_root(shards)` accepts decoded mode-10 shards in any order and:
+
+1. requires at least one shard (`Malformed` for an empty set);
+2. requires every descriptor to agree on `dtype`, `shape`, `element_count`,
+   `shard_axis`, `shard_count`, `block_size`, `scales`, `zero_points`, and
+   `layout_root` (`NonCanonical` otherwise);
+3. requires exactly `shard_count` entries whose indices form a permutation of
+   `0..shard_count` (`Malformed` for a wrong count; `NonCanonical` for a
+   duplicate, missing, or out-of-range index);
+4. reassembles `W` by placing each shard's slab into its logical position
+   (WEFT-TENSOR §4.2–§4.3), computes the root above, and requires every
+   shard's declared `layout_root` to equal it (`Corrupt` otherwise).
+
+The shard order in the input is not significant: `shard_index` is
+authoritative. Both implementations reorder deterministically by index.
+
+### 11.7 Limits
+
+`max_tensor_rank` and `max_tensor_elements` bound the whole shape.
+`block_count` is additionally bounded by the WCB `max_structured_items`
+(default 1,000,000), because `scales` and `zero_points` are descriptor arrays;
+this is the effective mode-10 bound and is deliberately stricter than
+`max_tensor_elements` for large tensors. Reconstructed planes, stored streams,
+bodies, and frames are bounded by `max_decoded_bytes` and `max_frame_bytes`.
+All products and sums are checked; overflow is `LimitExceeded` before
+allocation.
+
+### 11.8 API and CLI (maintainer tools, not wire formats)
+
+Rust (`weftcodec::tensor_sharded`):
+
+- `encode_sharded_tensor(input, limits) -> Vec<frame bytes>`
+- `decode_shard_frame(frame, limits) -> DecodedTensorShard`
+- `assemble_sharded_words(shards, limits) -> Vec<i8>`
+- `shard_set_root(shards, limits) -> Hash32`
+- `logical_root(dtype, shape, words, scales, zero_points, limits) -> Hash32`
+
+Go (`modes` package) exposes the equivalent `EncodeShardedTensor`,
+`DecodeShardFrame`, `AssembleShardedWords`, `ShardedSetRoot`, and
+`LogicalRootSharded`.
+
+```
+weftcodec encode --mode tensor-sharded --input WORDS --output DIR \
+    --dtype q8_0 --shape 4,8 --axis 0 --shards 2 --block-size 16 \
+    --scales 1056964608,1048576000 --zero-points 0,3
+weftcodec tensor root --shards-dir DIR --frames [--json]
+```
+
+`WORDS` contains one byte per whole-tensor quantized value; `q4_0` values are
+sign-extended (`0xF8` for `-8`). Encoding writes `shard-<index>.wft1` frames
+into `DIR`. `--metadata JSON` accepts the same fields as an object.
+
+### 11.9 Conformance vectors
+
+`conformance/v1/sharded/` is byte-identical in both codec repositories:
+
+- `001_q8_0_rank2_2shards`, `002_q4_0_rank3_4shards`, and
+  `003_q8_0_rank1_1shard`: valid sets with `words_hex`, global scales and zero
+  points, the expected `layout_root`, and every shard frame (deliberately
+  shuffled);
+- `101`–`108`: unknown dtype, scale-plane mismatch, wrong element count,
+  invalid block size, non-divisible shard axis, out-of-range index, duplicate
+  shard, and malformed Huffman stream.
+
+`WeftCodec-Go/hack/cross.sh compare` additionally encodes all three sets with
+both CLIs and reports byte-identical frames, decode equivalence, and identical
+logical roots.

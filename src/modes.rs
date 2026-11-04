@@ -220,6 +220,7 @@ pub fn decode_bytes(
         Mode::TokenSequence => decode_token_sequence(&frame, limits)?,
         Mode::QuantizedTensor => decode_quantized_tensor(&frame, limits)?,
         Mode::FloatTensor => decode_float_tensor(&frame, limits)?,
+        Mode::TensorSharded => crate::tensor_sharded::decode_planes(&frame, limits)?,
     };
 
     if plaintext.len() as u64 != frame.header.decoded_len {
