@@ -14,5 +14,5 @@ jobs:
           curl -sS -o /tmp/out -w "%{http_code}\n" -X DELETE \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/infinityabundance/WeftCodec/packages/container/weftcodec-rust
+            https://api.github.com/user/packages/container/weftcodec-rust
           cat /tmp/out
