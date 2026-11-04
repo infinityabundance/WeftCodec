@@ -12,6 +12,7 @@ use std::path::Path;
 
 use serde_json::{json, Value as Json};
 
+use crate::activation_stream;
 use crate::context::{self, Budget, CausalClosure, ContextRoot, DEFAULT_RESOLVER};
 use crate::error::{Error, ErrorClass, Result};
 use crate::frame::{
@@ -23,6 +24,7 @@ use crate::hash::{
     DOMAIN_QUANTIZED_TENSOR_PAYLOAD, DOMAIN_SELECTOR, DOMAIN_TENSOR_PAYLOAD,
     DOMAIN_TENSOR_SHARDED_PAYLOAD, DOMAIN_TOKENS_PAYLOAD,
 };
+use crate::kv_cache;
 use crate::limits::Limits;
 use crate::modes;
 use crate::selector;
@@ -43,6 +45,8 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let tensor_dir = dir.join("tensor");
     let sharded_dir = dir.join("sharded");
     let weight_delta_dir = dir.join("weight-delta");
+    let kv_cache_dir = dir.join("kv-cache");
+    let activation_stream_dir = dir.join("activation-stream");
     for sub in [
         &codec_dir,
         &structured_dir,
@@ -52,6 +56,8 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
         &tensor_dir,
         &sharded_dir,
         &weight_delta_dir,
+        &kv_cache_dir,
+        &activation_stream_dir,
     ] {
         fs::create_dir_all(sub)
             .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
@@ -65,6 +71,8 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_tensor_vectors(&tensor_dir, limits)?;
     write_sharded_vectors(&sharded_dir, limits)?;
     write_weight_delta_vectors(&weight_delta_dir, limits)?;
+    write_kv_cache_vectors(&kv_cache_dir, limits)?;
+    write_activation_stream_vectors(&activation_stream_dir, limits)?;
     Ok(())
 }
 
@@ -91,6 +99,23 @@ pub fn generate_weight_delta_v1(dir: &Path, limits: &Limits) -> Result<()> {
     fs::create_dir_all(&weight_delta_dir)
         .map_err(|e| Error::io(format!("cannot create {}: {e}", weight_delta_dir.display())))?;
     write_weight_delta_vectors(&weight_delta_dir, limits)
+}
+
+/// Generate only the KV_CACHE (mode 12) vectors into `<dir>/kv-cache`.
+pub fn generate_kv_cache_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let kv_cache_dir = dir.join("kv-cache");
+    fs::create_dir_all(&kv_cache_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", kv_cache_dir.display())))?;
+    write_kv_cache_vectors(&kv_cache_dir, limits)
+}
+
+/// Generate only the ACTIVATION_STREAM (mode 13) vectors into
+/// `<dir>/activation-stream`.
+pub fn generate_activation_stream_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let activation_dir = dir.join("activation-stream");
+    fs::create_dir_all(&activation_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", activation_dir.display())))?;
+    write_activation_stream_vectors(&activation_dir, limits)
 }
 
 fn write_json(path: &Path, value: &Json) -> Result<()> {
@@ -544,11 +569,11 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     );
 
     let mut unknown_mode = good.clone();
-    unknown_mode[7] = 12;
+    unknown_mode[7] = 14;
     refix_header_and_trailer(&mut unknown_mode);
     push_error(
         &mut vectors,
-        &name("unknown_mode_reserved12"),
+        &name("unknown_mode_reserved14"),
         "raw",
         &unknown_mode,
         &[],
@@ -3411,4 +3436,685 @@ fn write_weight_delta_vectors(dir: &Path, limits: &Limits) -> Result<()> {
 
 fn blake3_hex(bytes: &[u8]) -> String {
     hash_domain(DOMAIN_CHUNK, bytes).to_hex()
+}
+
+// ---------------------------------------------------------------------------
+// Mode 12 KV_CACHE
+// ---------------------------------------------------------------------------
+
+fn kv_words_bf16(offset: usize, count: usize) -> Vec<u8> {
+    const PATTERN: [u16; 12] = [
+        0x3F80, 0xC000, 0x0000, 0x8000, 0x7FC0, 0x7F81, 0x0001, 0x7F80, 0xBC00, 0xFF80, 0x0002,
+        0x4000,
+    ];
+    let mut out = Vec::with_capacity(count * 2);
+    for index in 0..count {
+        let word = PATTERN[(offset + index) % PATTERN.len()];
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+fn kv_words_fp16(offset: usize, count: usize) -> Vec<u8> {
+    const PATTERN: [u16; 8] = [
+        0x3C00, 0xBC00, 0x0000, 0x8000, 0x7E00, 0x7C00, 0xFC00, 0x0001,
+    ];
+    let mut out = Vec::with_capacity(count * 2);
+    for index in 0..count {
+        let word = PATTERN[(offset + index) % PATTERN.len()];
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+fn kv_words_fp32(offset: usize, count: usize) -> Vec<u8> {
+    const PATTERN: [u32; 10] = [
+        0x7FC0_0001,
+        0x8000_0000,
+        0x0000_0001,
+        0x7F80_0000,
+        0xFF80_0000,
+        0x3F80_0000,
+        0xBF80_0000,
+        0x007F_FFFF,
+        0x0000_0002,
+        0x7F7F_FFFF,
+    ];
+    let mut out = Vec::with_capacity(count * 4);
+    for index in 0..count {
+        let word = PATTERN[(offset + index) % PATTERN.len()];
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+fn write_kv_valid(
+    dir: &Path,
+    name: &str,
+    pages: &[(kv_cache::KvCacheInput, Vec<u8>)],
+    limits: &Limits,
+) -> Result<()> {
+    let mut page_json = Vec::with_capacity(pages.len());
+    for (input, elements) in pages {
+        let frame = kv_cache::encode_kv_page(input, elements, limits)?;
+        let parsed = Frame::parse(&frame, limits)?;
+        let decoded = kv_cache::decode_kv_page(&parsed, limits)?;
+        if decoded.bytes != *elements {
+            return Err(Error::corrupt("KV_CACHE vector does not reconstruct"));
+        }
+        page_json.push(json!({
+            "page_index": decoded.meta.page_index,
+            "seq_start": decoded.meta.seq_start,
+            "seq_end": decoded.meta.seq_end,
+            "page_rows": decoded.meta.shape[0],
+            "page_bytes": decoded.meta.page_bytes,
+            "payload_len": decoded.meta.payload_len,
+            "elements_hex": hexs(elements),
+            "frame_hex": hexs(&frame),
+        }));
+    }
+    let first = &pages[0].0;
+    let vector = json!({
+        "name": name,
+        "schema": kv_cache::KV_CACHE_SCHEMA,
+        "model": first.model,
+        "layer": first.layer,
+        "session": first.session,
+        "dtype": first.dtype.as_str(),
+        "head_count": first.head_count,
+        "head_dim": first.head_dim,
+        "page_count": first.page_count,
+        "pages": page_json,
+        "expect": { "ok": true },
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn kv_frame_value(
+    value: Value,
+    payload: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let meta_bytes = wcb::encode(&value, limits)?;
+    let meta_len = u32::try_from(meta_bytes.len())
+        .map_err(|_| Error::limit_exceeded("KV_CACHE metadata does not fit u32"))?;
+    let mut body = Vec::with_capacity(4 + meta_bytes.len() + payload.len());
+    body.extend_from_slice(&meta_len.to_le_bytes());
+    body.extend_from_slice(&meta_bytes);
+    body.extend_from_slice(payload);
+    build_frame(
+        Mode::KvCache,
+        DOMAIN_PAYLOAD,
+        0,
+        decoded_len,
+        content_hash,
+        &[],
+        &body,
+        limits,
+    )
+}
+
+fn write_kv_reject(
+    dir: &Path,
+    name: &str,
+    frame: &[u8],
+    expected: ErrorClass,
+    note: &str,
+) -> Result<()> {
+    let vector = json!({
+        "name": name,
+        "expect_error": expected.as_str(),
+        "note": note,
+        "frame_hex": hexs(frame),
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_kv_cache_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    // 001: bf16, two pages of one layer.
+    let bf16_input = |page_index: u64, seq_start: u64, seq_end: u64| kv_cache::KvCacheInput {
+        model: "llama-4-8b".to_owned(),
+        layer: 3,
+        session: "sess-7".to_owned(),
+        page_index,
+        page_count: 2,
+        seq_start,
+        seq_end,
+        dtype: kv_cache::KvDtype::Bf16,
+        head_count: 2,
+        head_dim: 4,
+    };
+    let bf16_pages = vec![
+        (bf16_input(0, 0, 4), kv_words_bf16(0, 32)),
+        (bf16_input(1, 4, 8), kv_words_bf16(32, 32)),
+    ];
+    write_kv_valid(dir, "001_bf16_two_pages", &bf16_pages, limits)?;
+
+    // 002: fp32, two pages.
+    let fp32_input = |page_index: u64, seq_start: u64, seq_end: u64| kv_cache::KvCacheInput {
+        model: "llama-4-70b".to_owned(),
+        layer: 17,
+        session: "sess-fp32".to_owned(),
+        page_index,
+        page_count: 2,
+        seq_start,
+        seq_end,
+        dtype: kv_cache::KvDtype::Fp32,
+        head_count: 2,
+        head_dim: 3,
+    };
+    let fp32_pages = vec![
+        (fp32_input(0, 0, 2), kv_words_fp32(0, 12)),
+        (fp32_input(1, 2, 4), kv_words_fp32(12, 12)),
+    ];
+    write_kv_valid(dir, "002_fp32_two_pages", &fp32_pages, limits)?;
+
+    // 003: bf16 sequence boundary (nonzero seq_start, late page).
+    let boundary_pages = vec![(
+        kv_cache::KvCacheInput {
+            model: "llama-4-8b".to_owned(),
+            layer: 0,
+            session: "sess-boundary".to_owned(),
+            page_index: 3,
+            page_count: 4,
+            seq_start: 4096,
+            seq_end: 4098,
+            dtype: kv_cache::KvDtype::Bf16,
+            head_count: 1,
+            head_dim: 2,
+        },
+        kv_words_bf16(7, 4),
+    )];
+    write_kv_valid(dir, "003_bf16_seq_boundary", &boundary_pages, limits)?;
+
+    // Rejects derived from the first bf16 page.
+    let base_frame = kv_cache::encode_kv_page(&bf16_pages[0].0, &bf16_pages[0].1, limits)?;
+    let parsed = Frame::parse(&base_frame, limits)?;
+    let meta = kv_cache::kv_cache_metadata(&parsed, limits)?;
+    let body = &parsed.body;
+    let meta_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let payload = body[4 + meta_len..].to_vec();
+    let decoded_len = parsed.header.decoded_len;
+    let content_hash = parsed.header.content_hash;
+
+    let mut zero_dims = meta.clone();
+    zero_dims.head_count = 0;
+    zero_dims.shape = vec![zero_dims.shape[0], 0, zero_dims.shape[2]];
+    write_kv_reject(
+        dir,
+        "102_zero_dimension",
+        &kv_cache::encode_descriptor_frame(
+            &zero_dims,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "head_count is zero",
+    )?;
+
+    let unknown_dtype_value = match kv_cache::descriptor_value(&meta) {
+        Value::Map(mut map) => {
+            map.insert("dtype".to_owned(), Value::Str("q8_0".to_owned()));
+            Value::Map(map)
+        }
+        other => other,
+    };
+    write_kv_reject(
+        dir,
+        "101_unknown_dtype",
+        &kv_frame_value(
+            unknown_dtype_value,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "dtype q8_0 has no KV_CACHE wire value",
+    )?;
+
+    let mut index_out = meta.clone();
+    index_out.page_index = index_out.page_count;
+    write_kv_reject(
+        dir,
+        "103_page_index_out_of_range",
+        &kv_cache::encode_descriptor_frame(
+            &index_out,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "page_index equals page_count",
+    )?;
+
+    let mut bad_seq = meta.clone();
+    bad_seq.seq_start = 10;
+    bad_seq.seq_end = 10;
+    bad_seq.shape = vec![0, bad_seq.shape[1], bad_seq.shape[2]];
+    write_kv_reject(
+        dir,
+        "104_seq_range_invalid",
+        &kv_cache::encode_descriptor_frame(&bad_seq, &payload, decoded_len, content_hash, limits)?,
+        ErrorClass::Malformed,
+        "seq_start is not less than seq_end",
+    )?;
+
+    let mut bad_shape = meta.clone();
+    bad_shape.shape = vec![
+        bad_shape.shape[0] + 1,
+        bad_shape.shape[1],
+        bad_shape.shape[2],
+    ];
+    write_kv_reject(
+        dir,
+        "105_shape_mismatch",
+        &kv_cache::encode_descriptor_frame(
+            &bad_shape,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "shape[0] differs from page_rows",
+    )?;
+
+    let mut bad_bytes = meta.clone();
+    bad_bytes.page_bytes += 2;
+    write_kv_reject(
+        dir,
+        "106_page_bytes_mismatch",
+        &kv_cache::encode_descriptor_frame(
+            &bad_bytes,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "page_bytes is not the shape product times word_bytes",
+    )?;
+
+    let mut overflow = meta.clone();
+    overflow.seq_start = 0;
+    overflow.seq_end = u64::MAX;
+    overflow.shape = vec![
+        u64::MAX,
+        u64::from(overflow.head_count),
+        u64::from(overflow.head_dim),
+    ];
+    overflow.page_bytes = 64;
+    write_kv_reject(
+        dir,
+        "107_seq_overflow",
+        &kv_cache::encode_descriptor_frame(&overflow, &payload, decoded_len, content_hash, limits)?,
+        ErrorClass::LimitExceeded,
+        "page_rows * head_count * head_dim overflows u64",
+    )?;
+
+    let mut bad_payload_len = meta.clone();
+    bad_payload_len.payload_len = payload.len() as u64 + 1;
+    write_kv_reject(
+        dir,
+        "108_payload_len_mismatch",
+        &kv_cache::encode_descriptor_frame(
+            &bad_payload_len,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "declared payload_len is one byte larger than the stored payload",
+    )?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mode 13 ACTIVATION_STREAM
+// ---------------------------------------------------------------------------
+
+fn stream_words(dtype: activation_stream::StreamDtype, offset: usize, count: usize) -> Vec<u8> {
+    match dtype.as_str() {
+        "bf16" => kv_words_bf16(offset, count),
+        "fp16" => kv_words_fp16(offset, count),
+        _ => kv_words_fp32(offset, count),
+    }
+}
+
+fn stream_head(
+    stream: activation_stream::StreamKind,
+    step: u64,
+    rank: u32,
+    world: u32,
+    chunk_count: u64,
+    dtype: activation_stream::StreamDtype,
+    shape: &[u64],
+) -> activation_stream::ActivationStreamHead {
+    activation_stream::ActivationStreamHead {
+        stream,
+        step,
+        rank,
+        world,
+        chunk_count,
+        dtype,
+        shape: shape.to_vec(),
+    }
+}
+
+fn write_stream_valid(
+    dir: &Path,
+    name: &str,
+    head: &activation_stream::ActivationStreamHead,
+    chunks: &[Vec<u8>],
+    limits: &Limits,
+) -> Result<()> {
+    let mut frames = Vec::with_capacity(chunks.len());
+    let mut chunk_json = Vec::with_capacity(chunks.len());
+    for (index, elements) in chunks.iter().enumerate() {
+        let frame =
+            activation_stream::encode_activation_chunk(head, index as u64, elements, limits)?;
+        let parsed = Frame::parse(&frame, limits)?;
+        let decoded = activation_stream::decode_activation_chunk(&parsed, limits)?;
+        if decoded.bytes != *elements {
+            return Err(Error::corrupt(
+                "ACTIVATION_STREAM vector does not reconstruct",
+            ));
+        }
+        chunk_json.push(json!({
+            "chunk_index": decoded.meta.chunk_index,
+            "digest_root": decoded.meta.digest_root.to_hex(),
+            "payload_len": decoded.meta.payload_len,
+            "elements_hex": hexs(elements),
+            "frame_hex": hexs(&frame),
+        }));
+        frames.push(frame);
+    }
+    let refs: Vec<&[u8]> = frames.iter().map(|frame| frame.as_slice()).collect();
+    let assembly = activation_stream::assemble_stream(&refs, limits)?;
+    let element_count: u64 = head.shape.iter().product();
+    let vector = json!({
+        "name": name,
+        "schema": activation_stream::ACTIVATION_STREAM_SCHEMA,
+        "stream": head.stream.as_str(),
+        "step": head.step,
+        "rank": head.rank,
+        "world": head.world,
+        "chunk_count": head.chunk_count,
+        "dtype": head.dtype.as_str(),
+        "shape": head.shape,
+        "element_count": element_count,
+        "chunks": chunk_json,
+        "stream_root": assembly.stream_root.to_hex(),
+        "chunk_digests": assembly
+            .chunk_digests
+            .iter()
+            .map(|digest| digest.to_hex())
+            .collect::<Vec<_>>(),
+        "expect": { "ok": true },
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn stream_frame_value(
+    value: Value,
+    payload: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let meta_bytes = wcb::encode(&value, limits)?;
+    let meta_len = u32::try_from(meta_bytes.len())
+        .map_err(|_| Error::limit_exceeded("ACTIVATION_STREAM metadata does not fit u32"))?;
+    let mut body = Vec::with_capacity(4 + meta_bytes.len() + payload.len());
+    body.extend_from_slice(&meta_len.to_le_bytes());
+    body.extend_from_slice(&meta_bytes);
+    body.extend_from_slice(payload);
+    build_frame(
+        Mode::ActivationStream,
+        DOMAIN_PAYLOAD,
+        0,
+        decoded_len,
+        content_hash,
+        &[],
+        &body,
+        limits,
+    )
+}
+
+fn write_stream_reject(
+    dir: &Path,
+    name: &str,
+    frame: &[u8],
+    expected: ErrorClass,
+    note: &str,
+) -> Result<()> {
+    let vector = json!({
+        "name": name,
+        "expect_error": expected.as_str(),
+        "note": note,
+        "frame_hex": hexs(frame),
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_activation_stream_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    use activation_stream::{StreamDtype, StreamKind};
+
+    // 001: activation, bf16, two chunks of one step.
+    let activation_head = stream_head(
+        StreamKind::Activation,
+        7,
+        0,
+        1,
+        2,
+        StreamDtype::Bf16,
+        &[2, 4],
+    );
+    let activation_chunks = vec![
+        stream_words(StreamDtype::Bf16, 0, 8),
+        stream_words(StreamDtype::Bf16, 8, 8),
+    ];
+    write_stream_valid(
+        dir,
+        "001_activation_bf16_two_chunks",
+        &activation_head,
+        &activation_chunks,
+        limits,
+    )?;
+
+    // 002: gradient, fp32, two chunks.
+    let gradient_head = stream_head(StreamKind::Gradient, 9, 1, 4, 2, StreamDtype::Fp32, &[1, 3]);
+    let gradient_chunks = vec![
+        stream_words(StreamDtype::Fp32, 0, 3),
+        stream_words(StreamDtype::Fp32, 3, 3),
+    ];
+    write_stream_valid(
+        dir,
+        "002_gradient_fp32_two_chunks",
+        &gradient_head,
+        &gradient_chunks,
+        limits,
+    )?;
+
+    // 003: activation, fp16, one chunk (sequence boundary configuration).
+    let single_head = stream_head(
+        StreamKind::Activation,
+        0,
+        0,
+        2,
+        1,
+        StreamDtype::Fp16,
+        &[2, 2],
+    );
+    let single_chunks = vec![stream_words(StreamDtype::Fp16, 5, 4)];
+    write_stream_valid(
+        dir,
+        "003_activation_fp16_single_chunk",
+        &single_head,
+        &single_chunks,
+        limits,
+    )?;
+
+    // Rejects derived from the first activation chunk.
+    let base_frame = activation_stream::encode_activation_chunk(
+        &activation_head,
+        0,
+        &activation_chunks[0],
+        limits,
+    )?;
+    let parsed = Frame::parse(&base_frame, limits)?;
+    let meta = activation_stream::activation_chunk_metadata(&parsed, limits)?;
+    let body = &parsed.body;
+    let meta_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let payload = body[4 + meta_len..].to_vec();
+    let decoded_len = parsed.header.decoded_len;
+    let content_hash = parsed.header.content_hash;
+
+    let unknown_dtype_value = match activation_stream::descriptor_value(&meta) {
+        Value::Map(mut map) => {
+            map.insert("dtype".to_owned(), Value::Str("q8_0".to_owned()));
+            Value::Map(map)
+        }
+        other => other,
+    };
+    write_stream_reject(
+        dir,
+        "101_unknown_dtype",
+        &stream_frame_value(
+            unknown_dtype_value,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "dtype q8_0 has no ACTIVATION_STREAM wire value",
+    )?;
+
+    let unknown_stream_value = match activation_stream::descriptor_value(&meta) {
+        Value::Map(mut map) => {
+            map.insert("stream".to_owned(), Value::Str("optimizer".to_owned()));
+            Value::Map(map)
+        }
+        other => other,
+    };
+    write_stream_reject(
+        dir,
+        "102_unknown_stream",
+        &stream_frame_value(
+            unknown_stream_value,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "stream optimizer has no v1 wire value",
+    )?;
+
+    let mut rank_world = meta.clone();
+    rank_world.rank = rank_world.world;
+    write_stream_reject(
+        dir,
+        "103_rank_not_below_world",
+        &activation_stream::encode_descriptor_frame(
+            &rank_world,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "rank equals world",
+    )?;
+
+    let mut chunk_out = meta.clone();
+    chunk_out.chunk_index = chunk_out.chunk_count;
+    write_stream_reject(
+        dir,
+        "104_chunk_index_out_of_range",
+        &activation_stream::encode_descriptor_frame(
+            &chunk_out,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "chunk_index equals chunk_count",
+    )?;
+
+    let mut count_mismatch = meta.clone();
+    count_mismatch.element_count += 1;
+    write_stream_reject(
+        dir,
+        "105_element_count_mismatch",
+        &activation_stream::encode_descriptor_frame(
+            &count_mismatch,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "element_count is not the shape product",
+    )?;
+
+    let mut digest_mismatch = meta.clone();
+    let mut flipped = digest_mismatch.digest_root.into_bytes();
+    flipped[0] ^= 0x01;
+    digest_mismatch.digest_root = Hash32::from_bytes(flipped);
+    write_stream_reject(
+        dir,
+        "106_digest_root_mismatch",
+        &activation_stream::encode_descriptor_frame(
+            &digest_mismatch,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Corrupt,
+        "declared digest_root does not match the reconstructed elements",
+    )?;
+
+    let mut payload_mismatch = meta.clone();
+    payload_mismatch.payload_len = payload.len() as u64 + 1;
+    write_stream_reject(
+        dir,
+        "107_payload_len_mismatch",
+        &activation_stream::encode_descriptor_frame(
+            &payload_mismatch,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "declared payload_len is one byte larger than the stored payload",
+    )?;
+
+    write_stream_reject(
+        dir,
+        "108_decoded_len_mismatch",
+        &activation_stream::encode_descriptor_frame(
+            &meta,
+            &payload,
+            decoded_len + 1,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Corrupt,
+        "decoded_len differs from element_count * word_bytes",
+    )?;
+
+    Ok(())
 }

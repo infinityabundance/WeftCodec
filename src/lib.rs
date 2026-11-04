@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod activation_stream;
 pub mod adversarial;
 pub mod archive;
 pub mod conformance;
@@ -31,6 +32,7 @@ pub mod frame;
 pub mod generated;
 pub mod hash;
 pub mod huffman;
+pub mod kv_cache;
 pub mod limits;
 pub mod modes;
 pub mod selector;
@@ -41,9 +43,19 @@ pub mod varint;
 pub mod wcb;
 pub mod weight_delta;
 
+pub use activation_stream::{
+    activation_chunk_metadata, assemble_stream, decode_activation_chunk,
+    decode_activation_chunk_range, encode_activation_chunk, stream_root, ActivationChunkSet,
+    ActivationStreamAssembly, ActivationStreamHead, ActivationStreamMeta, ActivationStreamWriter,
+    DecodedActivationChunk, StreamDtype, StreamKind, ACTIVATION_STREAM_SCHEMA,
+};
 pub use error::{Error, ErrorClass, Result};
 pub use frame::{Dependency, Frame, FrameHeader, Mode};
 pub use hash::Hash32;
+pub use kv_cache::{
+    decode_kv_page, decode_kv_page_range, encode_kv_page, kv_cache_metadata, DecodedKvPage,
+    KvCacheInput, KvCacheMeta, KvDtype, KvPageSet, KV_CACHE_SCHEMA,
+};
 pub use limits::Limits;
 pub use modes::TensorDtype;
 pub use tensor::{

@@ -222,6 +222,10 @@ pub fn decode_bytes(
         Mode::FloatTensor => decode_float_tensor(&frame, limits)?,
         Mode::TensorSharded => crate::tensor_sharded::decode_planes(&frame, limits)?,
         Mode::WeightDelta => crate::weight_delta::decode_frame(&frame, resolver, limits)?,
+        Mode::KvCache => crate::kv_cache::decode_kv_page(&frame, limits)?.bytes,
+        Mode::ActivationStream => {
+            crate::activation_stream::decode_activation_chunk(&frame, limits)?.bytes
+        }
     };
 
     if plaintext.len() as u64 != frame.header.decoded_len {

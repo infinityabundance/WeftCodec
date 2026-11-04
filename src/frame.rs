@@ -84,6 +84,12 @@ pub enum Mode {
     TensorSharded = 10,
     /// Exact word-wise tensor delta against a base frame (WEFT-AI-CODEC §12).
     WeightDelta = 11,
+    /// One paged attention KV cache page with WCB descriptor
+    /// (WEFT-AI-CODEC §13).
+    KvCache = 12,
+    /// One activation/gradient stream chunk with WCB descriptor
+    /// (WEFT-AI-CODEC §14).
+    ActivationStream = 13,
 }
 
 impl Mode {
@@ -102,7 +108,9 @@ impl Mode {
             9 => Ok(Mode::FloatTensor),
             10 => Ok(Mode::TensorSharded),
             11 => Ok(Mode::WeightDelta),
-            12..=127 => Err(Error::unsupported_mode(format!(
+            12 => Ok(Mode::KvCache),
+            13 => Ok(Mode::ActivationStream),
+            14..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -131,6 +139,8 @@ impl Mode {
             Mode::FloatTensor => "float_tensor",
             Mode::TensorSharded => "tensor_sharded",
             Mode::WeightDelta => "weight_delta",
+            Mode::KvCache => "kv_cache",
+            Mode::ActivationStream => "activation_stream",
         }
     }
 
@@ -149,6 +159,8 @@ impl Mode {
             "float_tensor" | "float-tensor" => Ok(Mode::FloatTensor),
             "tensor_sharded" | "tensor-sharded" | "sharded" => Ok(Mode::TensorSharded),
             "weight_delta" | "weight-delta" | "weightdelta" => Ok(Mode::WeightDelta),
+            "kv_cache" | "kv-cache" | "kvcache" => Ok(Mode::KvCache),
+            "activation_stream" | "activation-stream" | "activation" => Ok(Mode::ActivationStream),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -775,7 +787,9 @@ fn validate_mode_rules(
         | Mode::TokenSequence
         | Mode::QuantizedTensor
         | Mode::FloatTensor
-        | Mode::TensorSharded => {
+        | Mode::TensorSharded
+        | Mode::KvCache
+        | Mode::ActivationStream => {
             if header.domain != DOMAIN_PAYLOAD {
                 return Err(Error::malformed(
                     "AI-mode frames must use the payload domain",
@@ -786,13 +800,11 @@ fn validate_mode_rules(
             }
             if header.dep_count != 0 {
                 return Err(Error::malformed(
-                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR/FLOAT_TENSOR frames must not have dependencies in v1",
+                    "AI-mode frames must not have dependencies in v1",
                 ));
             }
             if header.chunk_count != 0 {
-                return Err(Error::malformed(
-                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR/FLOAT_TENSOR frames must not be chunked",
-                ));
+                return Err(Error::malformed("AI-mode frames must not be chunked"));
             }
             if header.body_len < 4 {
                 return Err(Error::malformed(

@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
+use weftcodec::activation_stream;
 use weftcodec::archive;
 use weftcodec::context::{self, Budget, ContextRoot, ContextUri, DEFAULT_RESOLVER};
 use weftcodec::dependency::{
@@ -17,6 +18,7 @@ use weftcodec::dependency::{
 use weftcodec::error::{Error, ErrorClass, Result};
 use weftcodec::frame::{Frame, Mode};
 use weftcodec::hash::hash_domain;
+use weftcodec::kv_cache;
 use weftcodec::limits::{self, Limits};
 use weftcodec::modes;
 use weftcodec::selector;
@@ -87,7 +89,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "weight_delta", "weight-delta", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "weight_delta", "weight-delta", "kv_cache", "kv-cache", "activation_stream", "activation-stream", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -158,6 +160,34 @@ struct ShardedMetaInput {
     block_size: u64,
     scales: Vec<u64>,
     zero_points: Vec<i64>,
+}
+
+/// KV_CACHE (mode 12) metadata JSON.
+#[derive(serde::Deserialize)]
+struct KvCacheMetaInput {
+    model: String,
+    layer: u32,
+    session: String,
+    page_index: u64,
+    page_count: u64,
+    seq_start: u64,
+    seq_end: u64,
+    dtype: String,
+    head_count: u32,
+    head_dim: u32,
+}
+
+/// ACTIVATION_STREAM (mode 13) metadata JSON.
+#[derive(serde::Deserialize)]
+struct ActivationStreamMetaInput {
+    stream: String,
+    step: u64,
+    rank: u32,
+    world: u32,
+    chunk_index: u64,
+    chunk_count: u64,
+    dtype: String,
+    shape: Vec<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -492,6 +522,13 @@ struct ConformanceArgs {
     /// Write only the WEIGHT_DELTA (mode 11) vectors into `<dir>/weight-delta`.
     #[arg(long)]
     weight_delta_only: bool,
+    /// Write only the KV_CACHE (mode 12) vectors into `<dir>/kv-cache`.
+    #[arg(long)]
+    kv_cache_only: bool,
+    /// Write only the ACTIVATION_STREAM (mode 13) vectors into
+    /// `<dir>/activation-stream`.
+    #[arg(long)]
+    activation_stream_only: bool,
 }
 
 fn main() -> ExitCode {
@@ -555,6 +592,18 @@ fn run(cli: Cli) -> Result<()> {
             } else if args.weight_delta_only {
                 weftcodec::conformance::generate_weight_delta_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote weight-delta vectors to {}/weight-delta", args.dir);
+            } else if args.kv_cache_only {
+                weftcodec::conformance::generate_kv_cache_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote kv-cache vectors to {}/kv-cache", args.dir);
+            } else if args.activation_stream_only {
+                weftcodec::conformance::generate_activation_stream_v1(
+                    Path::new(&args.dir),
+                    &limits,
+                )?;
+                eprintln!(
+                    "wrote activation-stream vectors to {}/activation-stream",
+                    args.dir
+                );
             } else {
                 weftcodec::conformance::generate_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote conformance vectors to {}", args.dir);
@@ -602,6 +651,12 @@ fn encode(args: EncodeArgs) -> Result<()> {
             .as_deref()
             .ok_or_else(|| Error::malformed("WEIGHT_DELTA encoding requires --base FRAME"))?;
         weight_delta::encode_weight_delta(&data, dtype, &shape, base_frame, &limits)?
+    } else if args.mode == "kv_cache" || args.mode == "kv-cache" {
+        let input = kv_cache_input_args(&args)?;
+        kv_cache::encode_kv_page(&input, &data, &limits)?
+    } else if args.mode == "activation_stream" || args.mode == "activation-stream" {
+        let (head, chunk_index) = activation_stream_input_args(&args, &limits)?;
+        activation_stream::encode_activation_chunk(&head, chunk_index, &data, &limits)?
     } else if args.mode == "tokens" {
         let input: TokensInput = serde_json::from_slice(&data).map_err(|err| {
             Error::malformed(format!(
@@ -680,6 +735,12 @@ fn encode_mode(
         )),
         Mode::WeightDelta => Err(Error::malformed(
             "WEIGHT_DELTA encoding requires the dedicated CLI path with --base/--dtype/--shape",
+        )),
+        Mode::KvCache => Err(Error::malformed(
+            "KV_CACHE encoding requires the dedicated CLI path with --metadata",
+        )),
+        Mode::ActivationStream => Err(Error::malformed(
+            "ACTIVATION_STREAM encoding requires the dedicated CLI path with --metadata",
         )),
     }
 }
@@ -845,6 +906,75 @@ fn weight_delta_metadata_args(args: &EncodeArgs) -> Result<(weight_delta::Weight
             .collect::<Result<Vec<u64>>>()?,
     };
     Ok((dtype, shape))
+}
+
+fn read_metadata_json<T: serde::de::DeserializeOwned>(args: &EncodeArgs, what: &str) -> Result<T> {
+    let path = args
+        .metadata
+        .as_deref()
+        .ok_or_else(|| Error::malformed(format!("{what} encoding requires --metadata FILE")))?;
+    let bytes = read_limited(path, Limits::default().max_string_bytes)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| Error::malformed(format!("{what} metadata is not valid JSON: {err}")))
+}
+
+/// Parse a KV_CACHE page descriptor from `--metadata`.
+fn kv_cache_input_args(args: &EncodeArgs) -> Result<kv_cache::KvCacheInput> {
+    let input: KvCacheMetaInput = read_metadata_json(args, "KV_CACHE")?;
+    Ok(kv_cache::KvCacheInput {
+        model: input.model,
+        layer: input.layer,
+        session: input.session,
+        page_index: input.page_index,
+        page_count: input.page_count,
+        seq_start: input.seq_start,
+        seq_end: input.seq_end,
+        dtype: kv_cache::KvDtype::from_name(&input.dtype)?,
+        head_count: input.head_count,
+        head_dim: input.head_dim,
+    })
+}
+
+/// Parse an ACTIVATION_STREAM chunk descriptor from `--metadata`.
+fn activation_stream_input_args(
+    args: &EncodeArgs,
+    limits: &Limits,
+) -> Result<(activation_stream::ActivationStreamHead, u64)> {
+    let input: ActivationStreamMetaInput = read_metadata_json(args, "ACTIVATION_STREAM")?;
+    let head = activation_stream::ActivationStreamHead {
+        stream: activation_stream::StreamKind::from_name(&input.stream)?,
+        step: input.step,
+        rank: input.rank,
+        world: input.world,
+        chunk_count: input.chunk_count,
+        dtype: activation_stream::StreamDtype::from_name(&input.dtype)?,
+        shape: input.shape,
+    };
+    // Validate the head early so CLI errors are descriptor errors.
+    let probe = activation_stream::ActivationStreamMeta {
+        stream: head.stream,
+        step: head.step,
+        rank: head.rank,
+        world: head.world,
+        chunk_index: input.chunk_index,
+        chunk_count: head.chunk_count,
+        dtype: head.dtype,
+        shape: head.shape.clone(),
+        element_count: {
+            let mut product: u64 = 1;
+            for dim in &head.shape {
+                product = product
+                    .checked_mul(*dim)
+                    .ok_or_else(|| Error::limit_exceeded("shape product overflows u64"))?;
+            }
+            product
+        },
+        digest_root: weftcodec::Hash32::ZERO,
+        plane_codec: activation_stream::ACTIVATION_STREAM_PLANE_CODEC.to_owned(),
+        payload_len: 0,
+    };
+    activation_stream::validate_meta(&probe, limits)?;
+    Ok((head, input.chunk_index))
 }
 
 fn parse_u32_list(text: &str, what: &str) -> Result<Vec<u32>> {
@@ -1157,6 +1287,38 @@ fn inspect(args: InspectArgs) -> Result<()> {
             output["delta_root"] = json!(meta.delta_root.to_hex());
             output["payload_len"] = json!(meta.payload_len);
         }
+        if header.mode == Mode::KvCache {
+            let meta = kv_cache::kv_cache_metadata(&frame, &limits)?;
+            output["model"] = json!(meta.model);
+            output["layer"] = json!(meta.layer);
+            output["session"] = json!(meta.session);
+            output["page_index"] = json!(meta.page_index);
+            output["page_count"] = json!(meta.page_count);
+            output["seq_start"] = json!(meta.seq_start);
+            output["seq_end"] = json!(meta.seq_end);
+            output["dtype"] = json!(meta.dtype.as_str());
+            output["head_count"] = json!(meta.head_count);
+            output["head_dim"] = json!(meta.head_dim);
+            output["shape"] = json!(meta.shape);
+            output["page_bytes"] = json!(meta.page_bytes);
+            output["plane_codec"] = json!(meta.plane_codec);
+            output["payload_len"] = json!(meta.payload_len);
+        }
+        if header.mode == Mode::ActivationStream {
+            let meta = activation_stream::activation_chunk_metadata(&frame, &limits)?;
+            output["stream"] = json!(meta.stream.as_str());
+            output["step"] = json!(meta.step);
+            output["rank"] = json!(meta.rank);
+            output["world"] = json!(meta.world);
+            output["chunk_index"] = json!(meta.chunk_index);
+            output["chunk_count"] = json!(meta.chunk_count);
+            output["dtype"] = json!(meta.dtype.as_str());
+            output["shape"] = json!(meta.shape);
+            output["element_count"] = json!(meta.element_count);
+            output["digest_root"] = json!(meta.digest_root.to_hex());
+            output["plane_codec"] = json!(meta.plane_codec);
+            output["payload_len"] = json!(meta.payload_len);
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&output)
@@ -1193,6 +1355,38 @@ fn inspect(args: InspectArgs) -> Result<()> {
             println!("planes: {}", meta.planes);
             println!("plane_codec: {}", meta.plane_codec);
             println!("delta_root: {}", meta.delta_root);
+            println!("payload_len: {}", meta.payload_len);
+        }
+        if header.mode == Mode::KvCache {
+            let meta = kv_cache::kv_cache_metadata(&frame, &limits)?;
+            println!("model: {}", meta.model);
+            println!("layer: {}", meta.layer);
+            println!("session: {}", meta.session);
+            println!("page_index: {}", meta.page_index);
+            println!("page_count: {}", meta.page_count);
+            println!("seq_start: {}", meta.seq_start);
+            println!("seq_end: {}", meta.seq_end);
+            println!("dtype: {}", meta.dtype.as_str());
+            println!("head_count: {}", meta.head_count);
+            println!("head_dim: {}", meta.head_dim);
+            println!("shape: {:?}", meta.shape);
+            println!("page_bytes: {}", meta.page_bytes);
+            println!("plane_codec: {}", meta.plane_codec);
+            println!("payload_len: {}", meta.payload_len);
+        }
+        if header.mode == Mode::ActivationStream {
+            let meta = activation_stream::activation_chunk_metadata(&frame, &limits)?;
+            println!("stream: {}", meta.stream.as_str());
+            println!("step: {}", meta.step);
+            println!("rank: {}", meta.rank);
+            println!("world: {}", meta.world);
+            println!("chunk_index: {}", meta.chunk_index);
+            println!("chunk_count: {}", meta.chunk_count);
+            println!("dtype: {}", meta.dtype.as_str());
+            println!("shape: {:?}", meta.shape);
+            println!("element_count: {}", meta.element_count);
+            println!("digest_root: {}", meta.digest_root);
+            println!("plane_codec: {}", meta.plane_codec);
             println!("payload_len: {}", meta.payload_len);
         }
         println!("flags: 0x{:04x} {:?}", header.flags, header.flag_names());

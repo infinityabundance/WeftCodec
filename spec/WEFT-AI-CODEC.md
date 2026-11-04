@@ -1,6 +1,6 @@
 # WEFT-AI-CODEC v1.2.0 — AI-native codec modes
 
-**Status: PARTIALLY IMPLEMENTED.** Exactly six AI-native modes are normative
+**Status: PARTIALLY IMPLEMENTED.** Exactly eight AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 
 | Value | Name | Status | Frozen vectors |
@@ -11,6 +11,8 @@ and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 | 9 | `FLOAT_TENSOR` (CLI `float-tensor`) | **implemented** | `108_float_bf16_2x2`, `109_float_fp16_3d`, `110_float_fp32_4d` + rejects |
 | 10 | `TENSOR_SHARDED` (CLI `tensor-sharded`) | **implemented** | `conformance/v1/sharded/001`–`003` + eight rejects |
 | 11 | `WEIGHT_DELTA` (CLI `weight-delta`) | **implemented** | `conformance/v1/weight-delta/001`–`003` + eight rejects |
+| 12 | `KV_CACHE` (CLI `kv-cache`) | **implemented** | `conformance/v1/kv-cache/001`–`003` + eight rejects |
+| 13 | `ACTIVATION_STREAM` (CLI `activation-stream`) | **implemented** | `conformance/v1/activation-stream/001`–`003` + eight rejects |
 
 Every other mode below is `specified, not implemented` and has **no allocated
 wire value**. Nothing in this document is a compression or performance claim.
@@ -1065,3 +1067,229 @@ The vector files carry the base frame, the target bytes, the committed delta
 frame, the descriptor fields, and the expected error class. Both
 implementations replay them, decode the valid cases, re-encode them to the
 same bytes, and reject every invalid case with the stated class.
+
+## 13. Mode 12 — `KV_CACHE` (implemented)
+
+### 13.1 Frame shape
+
+```text
+domain        = 0 (payload)
+mode          = 12
+flags         = 0
+dep_count     = 0
+chunk_count   = 0
+decoded_len   = page_bytes
+content_hash  = H("weft/chunk/v1", page element bytes)
+body          = u32le(meta_len) || WCB(meta) || payload
+```
+
+One frame is exactly one page. Pages have no dependencies, no chunk table, and
+no decoder state outside the frame. A page is fetched and decoded without
+reading, parsing, or decoding its siblings.
+
+### 13.2 Descriptor
+
+Schema: `weft.ai.kv_cache.v1`. Exactly these keys, no others:
+
+| Key | Type | Rule |
+|---|---|---|
+| `schema` | text | exactly `weft.ai.kv_cache.v1` |
+| `model` | text | model identity |
+| `layer` | u64 | fits u32 |
+| `session` | text | session identity |
+| `page_index` | u64 | `< page_count` |
+| `page_count` | u64 | `>= 1` |
+| `seq_start` | u64 | `< seq_end` |
+| `seq_end` | u64 | `> seq_start` |
+| `dtype` | text | `bf16`, `fp16`, or `fp32` |
+| `head_count` | u64 | fits u32 and `> 0` |
+| `head_dim` | u64 | fits u32 and `> 0` |
+| `shape` | array(u64) | exactly `[page_rows, head_count, head_dim]` |
+| `page_bytes` | u64 | `page_rows * head_count * head_dim * word_bytes` |
+| `plane_codec` | text | exactly `huffman-canonical-v1` |
+| `payload_len` | u64 | exact stored payload byte length |
+
+`page_rows = seq_end - seq_start`. `word_bytes` is 2 for `bf16`/`fp16` and 4
+for `fp32`. Every product and sum is checked; overflow is `LimitExceeded`.
+`page_bytes` is bounded by `max_decoded_bytes`, the rank by `max_tensor_rank`,
+and the element count by `max_tensor_elements`.
+
+### 13.3 Payload
+
+The payload is the canonical row-major little-endian element bytes split into
+byte planes: plane 0 is the least significant byte of each element word.
+`bf16` and `fp16` have two planes; `fp32` has four. Each plane is an
+independent `huffman-canonical-v1` stream (§5.3.1) with its own 256-byte code
+length table, and the streams are concatenated in plane order. Decoding MUST
+reconstruct exactly `page_bytes` bytes. No dtype conversion, dequantization, or
+numeric interpretation occurs. NaNs, denormals, signed zeros, and infinities
+are preserved bit-for-bit.
+
+### 13.4 Validation order (normative for error classes)
+
+1. Unknown key, missing key, wrong WCB type, schema mismatch, unknown dtype →
+   `Malformed`.
+2. `plane_codec` not `huffman-canonical-v1` → `Malformed`.
+3. `page_count == 0`, `page_index >= page_count` → `Malformed`.
+4. `seq_start >= seq_end` → `Malformed`; `head_count == 0` or
+   `head_dim == 0` → `Malformed`.
+5. `shape` not exactly `[page_rows, head_count, head_dim]` → `Malformed`.
+6. A checked product overflows u64 → `LimitExceeded`; a rank/element/page
+   limit is exceeded → `LimitExceeded`.
+7. `page_bytes` differs from the computed byte length → `Malformed`.
+8. `payload_len` differs from the stored payload length → `Malformed`;
+   frame `decoded_len` differs from `page_bytes` → `Corrupt`.
+9. Huffman stream rejects use §5.3.1 classes; trailing payload bytes →
+   `Corrupt`.
+10. Reconstructed `content_hash` mismatch → `Corrupt`.
+
+### 13.5 API and CLI
+
+Rust (`weftcodec::kv_cache`): `encode_kv_page`, `decode_kv_page`,
+`decode_kv_page_range`, `kv_cache_metadata`, `KvPageSet` (which counts
+page-level decodes). Go (`modes`): `EncodeKvPage`, `DecodeKvPage`,
+`DecodeKvPageRange`, `KvCacheMetadata`, `KvPageSet`.
+
+```sh
+weftcodec encode --mode kv-cache --input PAGE --output FRAME --metadata PAGE.json
+weftcodec decode --input FRAME --output PAGE
+```
+
+`decode_kv_page_range` decodes one page and slices the requested byte range.
+Huffman planes are not independently seekable; the bounded guarantee is that
+only one page is touched, never that only the requested bytes are entropy
+decoded.
+
+### 13.6 Conformance vectors
+
+`conformance/v1/kv-cache/` is byte-identical in both repositories:
+
+- `001_bf16_two_pages`: two bf16 pages of one layer with NaN, denormal, signed
+  zero, and infinity patterns;
+- `002_fp32_two_pages`: two fp32 pages;
+- `003_bf16_seq_boundary`: a late page with `seq_start = 4096`;
+- `101`–`108`: unknown dtype, zero dimension, page index out of range, invalid
+  sequence range, shape mismatch, page-byte mismatch, sequence product
+  overflow, and payload-length mismatch.
+
+Both implementations decode each valid page, re-encode it to the identical
+bytes, and reject every invalid frame with the stated class.
+
+## 14. Mode 13 — `ACTIVATION_STREAM` (implemented)
+
+### 14.1 Frame shape
+
+```text
+domain        = 0 (payload)
+mode          = 13
+flags         = 0
+dep_count     = 0
+chunk_count   = 0
+decoded_len   = chunk element byte length
+content_hash  = H("weft/chunk/v1", chunk element bytes)
+body          = u32le(meta_len) || WCB(meta) || payload
+```
+
+One frame is exactly one chunk of one `(stream, step, rank)` stream. Chunks
+do not depend on one another: encoding chunk `k+1` does not decode chunk `k`,
+and a decoder may materialize one chunk without its siblings.
+
+### 14.2 Descriptor
+
+Schema: `weft.ai.activation_stream.v1`. Exactly these keys:
+
+| Key | Type | Rule |
+|---|---|---|
+| `schema` | text | exactly `weft.ai.activation_stream.v1` |
+| `stream` | text | `activation` or `gradient` |
+| `step` | u64 | training/inference step |
+| `rank` | u64 | fits u32 and `< world` |
+| `world` | u64 | fits u32 and `>= 1` |
+| `chunk_index` | u64 | `< chunk_count` |
+| `chunk_count` | u64 | `>= 1` |
+| `dtype` | text | `bf16`, `fp16`, or `fp32` |
+| `shape` | array(u64) | rank `>= 1`, every dimension `> 0` |
+| `element_count` | u64 | exactly the shape product |
+| `digest_root` | bytes(32) | `H("weft/tensor/values/v1", chunk element bytes)` |
+| `plane_codec` | text | exactly `huffman-canonical-v1` |
+| `payload_len` | u64 | exact stored payload byte length |
+
+### 14.3 Payload
+
+The byte-plane layout is exactly §13.3. Decoding reconstructs the chunk's
+canonical row-major element bytes, verifies `digest_root`, and verifies the
+frame `content_hash`. No numeric interpretation occurs.
+
+### 14.4 Validation order (normative for error classes)
+
+1. Unknown key, missing key, wrong WCB type, schema mismatch, unknown stream,
+   unknown dtype → `Malformed`.
+2. `plane_codec` not `huffman-canonical-v1` → `Malformed`.
+3. `world == 0` or `rank >= world` → `Malformed`.
+4. `chunk_count == 0` or `chunk_index >= chunk_count` → `Malformed`.
+5. Empty shape, zero dimension, rank/element limit, or shape-product overflow
+   → `Malformed`/`LimitExceeded` as in §13.4.
+6. `element_count` not the shape product → `Malformed`; `digest_root` not 32
+   bytes → `Malformed`.
+7. `payload_len` differs from the stored payload → `Malformed`;
+   `decoded_len` differs from `element_count * word_bytes` → `Corrupt`.
+8. Huffman rejects use §5.3.1; trailing payload bytes → `Corrupt`.
+9. Reconstructed `digest_root` mismatch → `Corrupt`; reconstructed
+   `content_hash` mismatch → `Corrupt`.
+
+### 14.5 Assembly and append
+
+`assemble_stream(chunks)` accepts chunk frames in any order and:
+
+1. decodes every chunk and re-verifies its `digest_root`;
+2. requires the same `stream`, `step`, `rank`, `world`, `chunk_count`,
+   `dtype`, `shape`, and `element_count` on every chunk;
+3. sorts by `chunk_index`, rejects duplicate indices (`NonCanonical`) and
+   missing indices (`Malformed`);
+4. concatenates the element bytes in index order and returns them with
+
+```text
+stream_root = H("weft/ai/stream/v1", WCB({
+  stream, step, rank, world, chunk_count, digest_roots
+}))
+```
+
+where `digest_roots` is the array of per-chunk `digest_root` values in
+`chunk_index` order. Duplicate, missing, or inconsistent chunks never produce
+a stream root.
+
+`append_chunk` encodes the next `chunk_index` from the elements alone. It does
+not accept, read, or decode earlier chunk frames; both implementations expose
+an encoded/decoded counter so this property is testable.
+
+### 14.6 API and CLI
+
+Rust (`weftcodec::activation_stream`): `encode_activation_chunk`,
+`decode_activation_chunk`, `decode_activation_chunk_range`,
+`activation_chunk_metadata`, `assemble_stream`, `stream_root`,
+`ActivationStreamWriter`, `ActivationChunkSet`. Go (`modes`): the equivalent
+`EncodeActivationChunk`, `DecodeActivationChunk`, `DecodeActivationChunkRange`,
+`ActivationChunkMetadata`, `AssembleStream`, `StreamRoot`,
+`ActivationStreamWriter`, `ActivationChunkSet`.
+
+```sh
+weftcodec encode --mode activation-stream --input CHUNK --output FRAME --metadata CHUNK.json
+weftcodec decode --input FRAME --output CHUNK
+```
+
+### 14.7 Conformance vectors
+
+`conformance/v1/activation-stream/` is byte-identical in both repositories:
+
+- `001_activation_bf16_two_chunks`: two bf16 activation chunks of one step;
+- `002_gradient_fp32_two_chunks`: the gradient variant with fp32;
+- `003_activation_fp16_single_chunk`: a single fp16 chunk at a world
+  boundary;
+- `101`–`108`: unknown dtype, unknown stream, rank not below world, chunk index
+  out of range, element-count mismatch, digest-root mismatch, payload-length
+  mismatch, and decoded-length mismatch.
+
+Valid vectors carry every chunk frame, the element bytes, per-chunk digest
+roots, and the assembled `stream_root`. Both implementations decode, re-encode
+to identical bytes, assemble, and recompute the root; every invalid frame is
+rejected with the stated class.
