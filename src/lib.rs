@@ -36,6 +36,8 @@ pub mod kv_cache;
 pub mod limits;
 pub mod modes;
 pub mod selector;
+pub mod semantic;
+pub mod semantic_delta;
 pub mod stream;
 pub mod tensor;
 pub mod tensor_sharded;
@@ -58,6 +60,16 @@ pub use kv_cache::{
 };
 pub use limits::Limits;
 pub use modes::TensorDtype;
+pub use semantic::{
+    select_semantic_base, semantic_matches, semantic_record, semantic_root,
+    semantic_root_with_limits, SemanticPolicy, SemanticRootRecord, DOMAIN_TENSOR_SEMANTIC,
+    DOMAIN_TENSOR_SEMANTIC_VALUES, SEMANTIC_SCHEMA,
+};
+pub use semantic_delta::{
+    base_semantic_root, decode_frame as decode_semantic_delta,
+    decode_with_base_frame as decode_semantic_delta_with_base, encode_semantic_delta,
+    semantic_delta_metadata, SemanticDeltaMeta, SEMANTIC_DELTA_SCHEMA,
+};
 pub use tensor::{
     logical_root, shard_root, LayoutDescriptor, LogicalRecord, PhysicalTensor, Region, RegionRead,
     TensorLayout,

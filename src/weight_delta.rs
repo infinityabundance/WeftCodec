@@ -108,7 +108,7 @@ impl WeightDtype {
         }
     }
 
-    fn is_quantized(self) -> bool {
+    pub(crate) fn is_quantized(self) -> bool {
         matches!(self, WeightDtype::Q8_0 | WeightDtype::Q4_0)
     }
 }
@@ -134,7 +134,7 @@ pub struct WeightDeltaMeta {
 // Shape and metadata helpers
 // ---------------------------------------------------------------------------
 
-fn validate_shape(shape: &[u64], limits: &Limits) -> Result<u64> {
+pub(crate) fn validate_shape(shape: &[u64], limits: &Limits) -> Result<u64> {
     if shape.is_empty() {
         return Err(Error::malformed(
             "WEIGHT_DELTA shape rank must be at least 1",
@@ -167,7 +167,7 @@ fn validate_shape(shape: &[u64], limits: &Limits) -> Result<u64> {
     Ok(product)
 }
 
-fn payload_len(element_count: u64, dtype: WeightDtype) -> Result<u64> {
+pub(crate) fn payload_len(element_count: u64, dtype: WeightDtype) -> Result<u64> {
     element_count
         .checked_mul(dtype.storage_bytes())
         .ok_or_else(|| Error::limit_exceeded("WEIGHT_DELTA element byte length overflows u64"))
@@ -315,7 +315,7 @@ pub fn descriptor_value(meta: &WeightDeltaMeta) -> Value {
     ])
 }
 
-fn split_ai_body(body: &[u8]) -> Result<(&[u8], &[u8])> {
+pub(crate) fn split_ai_body(body: &[u8]) -> Result<(&[u8], &[u8])> {
     if body.len() < 4 {
         return Err(Error::malformed(
             "WEIGHT_DELTA body is shorter than its 4-byte metadata length",
@@ -422,7 +422,7 @@ pub fn weight_delta_metadata(frame: &Frame<'_>, limits: &Limits) -> Result<Weigh
 // Delta words and planes
 // ---------------------------------------------------------------------------
 
-fn word_at(dtype: WeightDtype, bytes: &[u8], index: usize) -> u32 {
+pub(crate) fn word_at(dtype: WeightDtype, bytes: &[u8], index: usize) -> u32 {
     match dtype {
         WeightDtype::Bf16 | WeightDtype::Fp16 => {
             let offset = index * 2;
@@ -441,7 +441,7 @@ fn word_at(dtype: WeightDtype, bytes: &[u8], index: usize) -> u32 {
     }
 }
 
-fn push_word(dtype: WeightDtype, word: u32, out: &mut Vec<u8>) {
+pub(crate) fn push_word(dtype: WeightDtype, word: u32, out: &mut Vec<u8>) {
     match dtype {
         WeightDtype::Bf16 | WeightDtype::Fp16 => {
             out.extend_from_slice(&(word as u16).to_le_bytes());
@@ -471,7 +471,7 @@ fn target_word(dtype: WeightDtype, delta: u32, base: u32) -> u32 {
 
 /// Split `target`/`base` element bytes into the canonical delta word stream and
 /// the encoded byte planes.
-fn build_planes(
+pub(crate) fn build_planes(
     dtype: WeightDtype,
     target: &[u8],
     base: &[u8],
@@ -555,9 +555,18 @@ pub fn base_frame_descriptor(
             let meta = modes::float_tensor_metadata(frame, limits)?;
             Ok((float_dtype_to_weight(meta.dtype)?, meta.shape))
         }
-        Mode::WeightDelta => {
-            let meta = weight_delta_metadata(frame, limits)?;
-            Ok((meta.dtype, meta.shape))
+        Mode::WeightDelta | Mode::SemanticDelta => {
+            let (dtype, shape) = match frame.header.mode {
+                Mode::WeightDelta => {
+                    let meta = weight_delta_metadata(frame, limits)?;
+                    (meta.dtype, meta.shape)
+                }
+                _ => {
+                    let meta = crate::semantic_delta::semantic_delta_metadata(frame, limits)?;
+                    (meta.dtype, meta.shape)
+                }
+            };
+            Ok((dtype, shape))
         }
         other => Err(Error::malformed(format!(
             "base frame mode `{}` does not carry tensor dtype/shape metadata",
@@ -570,7 +579,7 @@ fn dependency_mismatch_base(message: impl Into<String>) -> Error {
     Error::dependency_mismatch(message)
 }
 
-fn check_quantized_words(dtype: WeightDtype, bytes: &[u8], what: &str) -> Result<()> {
+pub(crate) fn check_quantized_words(dtype: WeightDtype, bytes: &[u8], what: &str) -> Result<()> {
     if dtype == WeightDtype::Q4_0 {
         for (index, byte) in bytes.iter().enumerate() {
             if *byte > 15 {
@@ -742,7 +751,11 @@ pub fn encode_weight_delta_with_resolver(
 // Decoding
 // ---------------------------------------------------------------------------
 
-fn decode_planes(dtype: WeightDtype, payload: &[u8], element_count: usize) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn decode_planes(
+    dtype: WeightDtype,
+    payload: &[u8],
+    element_count: usize,
+) -> Result<Vec<Vec<u8>>> {
     let plane_count = usize::try_from(dtype.planes())
         .map_err(|_| Error::limit_exceeded("WEIGHT_DELTA plane count does not fit usize"))?;
     let mut planes = Vec::with_capacity(plane_count);
@@ -767,7 +780,11 @@ fn decode_planes(dtype: WeightDtype, payload: &[u8], element_count: usize) -> Re
     Ok(planes)
 }
 
-fn delta_word_from_planes(dtype: WeightDtype, planes: &[Vec<u8>], index: usize) -> Result<u32> {
+pub(crate) fn delta_word_from_planes(
+    dtype: WeightDtype,
+    planes: &[Vec<u8>],
+    index: usize,
+) -> Result<u32> {
     let word = match dtype {
         WeightDtype::Bf16 | WeightDtype::Fp16 => {
             u32::from(planes[0][index]) | (u32::from(planes[1][index]) << 8)

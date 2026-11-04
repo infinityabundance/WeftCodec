@@ -90,6 +90,9 @@ pub enum Mode {
     /// One activation/gradient stream chunk with WCB descriptor
     /// (WEFT-AI-CODEC §14).
     ActivationStream = 13,
+    /// Exact word-wise delta against a semantically matched base frame
+    /// (WEFT-AI-CODEC §15).
+    SemanticDelta = 14,
 }
 
 impl Mode {
@@ -110,7 +113,8 @@ impl Mode {
             11 => Ok(Mode::WeightDelta),
             12 => Ok(Mode::KvCache),
             13 => Ok(Mode::ActivationStream),
-            14..=127 => Err(Error::unsupported_mode(format!(
+            14 => Ok(Mode::SemanticDelta),
+            15..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -141,6 +145,7 @@ impl Mode {
             Mode::WeightDelta => "weight_delta",
             Mode::KvCache => "kv_cache",
             Mode::ActivationStream => "activation_stream",
+            Mode::SemanticDelta => "semantic_delta",
         }
     }
 
@@ -161,6 +166,7 @@ impl Mode {
             "weight_delta" | "weight-delta" | "weightdelta" => Ok(Mode::WeightDelta),
             "kv_cache" | "kv-cache" | "kvcache" => Ok(Mode::KvCache),
             "activation_stream" | "activation-stream" | "activation" => Ok(Mode::ActivationStream),
+            "semantic_delta" | "semantic-delta" | "semanticdelta" => Ok(Mode::SemanticDelta),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -812,37 +818,41 @@ fn validate_mode_rules(
                 ));
             }
         }
-        Mode::WeightDelta => {
+        Mode::WeightDelta | Mode::SemanticDelta => {
+            let mode_name = match header.mode {
+                Mode::WeightDelta => "WEIGHT_DELTA",
+                _ => "SEMANTIC_DELTA",
+            };
             if header.domain != DOMAIN_PAYLOAD {
-                return Err(Error::malformed(
-                    "WEIGHT_DELTA frame must use the payload domain",
-                ));
+                return Err(Error::malformed(format!(
+                    "{mode_name} frame must use the payload domain"
+                )));
             }
             if dict_flag {
                 return Err(Error::malformed("DICT_RAW is only valid for DICTIONARY"));
             }
             if header.dep_count != 1 {
-                return Err(Error::malformed(
-                    "WEIGHT_DELTA requires exactly one dependency",
-                ));
+                return Err(Error::malformed(format!(
+                    "{mode_name} requires exactly one dependency"
+                )));
             }
             if header.chunk_count != 0 {
-                return Err(Error::malformed("WEIGHT_DELTA must not be chunked"));
+                return Err(Error::malformed(format!("{mode_name} must not be chunked")));
             }
             if header.body_len < 4 {
-                return Err(Error::malformed(
-                    "WEIGHT_DELTA body is shorter than its 4-byte metadata length",
-                ));
+                return Err(Error::malformed(format!(
+                    "{mode_name} body is shorter than its 4-byte metadata length"
+                )));
             }
             if dependencies[0].dep_domain != DEP_DOMAIN_PAYLOAD {
-                return Err(Error::malformed(
-                    "WEIGHT_DELTA dependency must use dep_domain 0 (payload)",
-                ));
+                return Err(Error::malformed(format!(
+                    "{mode_name} dependency must use dep_domain 0 (payload)"
+                )));
             }
             if header.decoded_len != dependencies[0].decoded_len {
-                return Err(Error::malformed(
-                    "WEIGHT_DELTA decoded_len must equal the base decoded_len",
-                ));
+                return Err(Error::malformed(format!(
+                    "{mode_name} decoded_len must equal the base decoded_len"
+                )));
             }
         }
         Mode::Dictionary => {

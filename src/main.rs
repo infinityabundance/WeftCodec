@@ -22,6 +22,8 @@ use weftcodec::kv_cache;
 use weftcodec::limits::{self, Limits};
 use weftcodec::modes;
 use weftcodec::selector;
+use weftcodec::semantic::SemanticPolicy;
+use weftcodec::semantic_delta;
 use weftcodec::tensor;
 use weftcodec::tensor_sharded;
 use weftcodec::wcb;
@@ -89,7 +91,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "weight_delta", "weight-delta", "kv_cache", "kv-cache", "activation_stream", "activation-stream", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "kv_cache", "kv-cache", "activation_stream", "activation-stream", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -134,6 +136,10 @@ struct EncodeArgs {
     /// TENSOR_SHARDED per-block zero points, comma-separated i64 values.
     #[arg(long = "zero-points")]
     zero_points: Option<String>,
+    /// SEMANTIC_DELTA policy: `none`, `mantissa_truncate:N`, or
+    /// `block_quantize:B:L`.
+    #[arg(long = "semantic-policy")]
+    semantic_policy: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -522,6 +528,10 @@ struct ConformanceArgs {
     /// Write only the WEIGHT_DELTA (mode 11) vectors into `<dir>/weight-delta`.
     #[arg(long)]
     weight_delta_only: bool,
+    /// Write only the SEMANTIC_DELTA (mode 14) and semantic-root vectors into
+    /// `<dir>/semantic-delta` and `<dir>/semantic-root`.
+    #[arg(long)]
+    semantic_delta_only: bool,
     /// Write only the KV_CACHE (mode 12) vectors into `<dir>/kv-cache`.
     #[arg(long)]
     kv_cache_only: bool,
@@ -592,6 +602,12 @@ fn run(cli: Cli) -> Result<()> {
             } else if args.weight_delta_only {
                 weftcodec::conformance::generate_weight_delta_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote weight-delta vectors to {}/weight-delta", args.dir);
+            } else if args.semantic_delta_only {
+                weftcodec::conformance::generate_semantic_delta_v1(Path::new(&args.dir), &limits)?;
+                eprintln!(
+                    "wrote semantic-root and semantic-delta vectors to {}/semantic-root and {}/semantic-delta",
+                    args.dir, args.dir
+                );
             } else if args.kv_cache_only {
                 weftcodec::conformance::generate_kv_cache_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote kv-cache vectors to {}/kv-cache", args.dir);
@@ -651,6 +667,13 @@ fn encode(args: EncodeArgs) -> Result<()> {
             .as_deref()
             .ok_or_else(|| Error::malformed("WEIGHT_DELTA encoding requires --base FRAME"))?;
         weight_delta::encode_weight_delta(&data, dtype, &shape, base_frame, &limits)?
+    } else if args.mode == "semantic_delta" || args.mode == "semantic-delta" {
+        let (dtype, shape) = weight_delta_metadata_args(&args)?;
+        let policy = semantic_policy_arg(&args)?;
+        let base_frame = base
+            .as_deref()
+            .ok_or_else(|| Error::malformed("SEMANTIC_DELTA encoding requires --base FRAME"))?;
+        semantic_delta::encode_semantic_delta(&data, dtype, &shape, base_frame, policy, &limits)?
     } else if args.mode == "kv_cache" || args.mode == "kv-cache" {
         let input = kv_cache_input_args(&args)?;
         kv_cache::encode_kv_page(&input, &data, &limits)?
@@ -735,6 +758,9 @@ fn encode_mode(
         )),
         Mode::WeightDelta => Err(Error::malformed(
             "WEIGHT_DELTA encoding requires the dedicated CLI path with --base/--dtype/--shape",
+        )),
+        Mode::SemanticDelta => Err(Error::malformed(
+            "SEMANTIC_DELTA encoding requires the dedicated CLI path with --base/--dtype/--shape/--semantic-policy",
         )),
         Mode::KvCache => Err(Error::malformed(
             "KV_CACHE encoding requires the dedicated CLI path with --metadata",
@@ -906,6 +932,68 @@ fn weight_delta_metadata_args(args: &EncodeArgs) -> Result<(weight_delta::Weight
             .collect::<Result<Vec<u64>>>()?,
     };
     Ok((dtype, shape))
+}
+
+/// Parse `--semantic-policy` for SEMANTIC_DELTA.
+fn semantic_policy_arg(args: &EncodeArgs) -> Result<SemanticPolicy> {
+    let text = args.semantic_policy.as_deref().ok_or_else(|| {
+        Error::malformed(
+            "SEMANTIC_DELTA encoding requires --semantic-policy (none|mantissa_truncate:N|block_quantize:B:L)",
+        )
+    })?;
+    let text = text.trim();
+    if text == "none" {
+        return Ok(SemanticPolicy::None);
+    }
+    if let Some(rest) = text
+        .strip_prefix("mantissa_truncate:")
+        .or_else(|| text.strip_prefix("mantissa-truncate:"))
+    {
+        let bits = rest.parse::<u32>().map_err(|err| {
+            Error::malformed(format!("bad --semantic-policy bits `{rest}`: {err}"))
+        })?;
+        return Ok(SemanticPolicy::MantissaTruncate { bits });
+    }
+    if let Some(rest) = text
+        .strip_prefix("block_quantize:")
+        .or_else(|| text.strip_prefix("block-quantize:"))
+    {
+        let mut parts = rest.split(':');
+        let block_size = parts
+            .next()
+            .ok_or_else(|| Error::malformed("block_quantize policy requires block_size"))?
+            .parse::<u64>()
+            .map_err(|err| Error::malformed(format!("bad block_quantize block_size: {err}")))?;
+        let levels = parts
+            .next()
+            .ok_or_else(|| Error::malformed("block_quantize policy requires levels"))?
+            .parse::<u64>()
+            .map_err(|err| Error::malformed(format!("bad block_quantize levels: {err}")))?;
+        if parts.next().is_some() {
+            return Err(Error::malformed(
+                "block_quantize policy has trailing fields",
+            ));
+        }
+        return Ok(SemanticPolicy::BlockQuantize { block_size, levels });
+    }
+    Err(Error::malformed(format!(
+        "unknown --semantic-policy `{text}` (none|mantissa_truncate:N|block_quantize:B:L)"
+    )))
+}
+
+/// JSON form of a semantic policy (for `inspect`).
+fn semantic_policy_json(policy: &SemanticPolicy) -> serde_json::Value {
+    match policy {
+        SemanticPolicy::None => json!({ "scheme": "none" }),
+        SemanticPolicy::MantissaTruncate { bits } => {
+            json!({ "scheme": "mantissa_truncate", "bits": bits })
+        }
+        SemanticPolicy::BlockQuantize { block_size, levels } => json!({
+            "scheme": "block_quantize",
+            "block_size": block_size,
+            "levels": levels
+        }),
+    }
 }
 
 fn read_metadata_json<T: serde::de::DeserializeOwned>(args: &EncodeArgs, what: &str) -> Result<T> {
@@ -1162,26 +1250,35 @@ fn decode(args: DecodeArgs) -> Result<()> {
     // `--base` supplies the base frame explicitly. `--resolve` is an explicit
     // opt-in to the DAG resolver, which also verifies the base frame's own
     // dtype/shape descriptor.
-    if root.header.mode == Mode::WeightDelta {
+    if root.header.mode == Mode::WeightDelta || root.header.mode == Mode::SemanticDelta {
         if args.resolve && args.frame_source.is_none() {
             return Err(Error::malformed(
-                "WEIGHT_DELTA --resolve requires --frame-source",
+                "delta modes require --frame-source with --resolve",
             ));
         }
         if let Some(base_path) = args.base.as_deref() {
             let base_bytes = read_limited(base_path, limits.max_frame_bytes)?;
             let resolver = resolver_for(args.deps.as_deref());
-            let plaintext = weight_delta::decode_with_base_frame(
-                &root,
-                &base_bytes,
-                resolver.as_ref(),
-                &limits,
-            )?;
+            let plaintext = if root.header.mode == Mode::SemanticDelta {
+                semantic_delta::decode_with_base_frame(
+                    &root,
+                    &base_bytes,
+                    resolver.as_ref(),
+                    &limits,
+                )?
+            } else {
+                weight_delta::decode_with_base_frame(
+                    &root,
+                    &base_bytes,
+                    resolver.as_ref(),
+                    &limits,
+                )?
+            };
             return write_output(&args.output, &plaintext);
         }
     } else if args.resolve {
         return Err(Error::malformed(
-            "--resolve applies only to WEIGHT_DELTA frames",
+            "--resolve applies only to WEIGHT_DELTA and SEMANTIC_DELTA frames",
         ));
     }
 
@@ -1287,6 +1384,22 @@ fn inspect(args: InspectArgs) -> Result<()> {
             output["delta_root"] = json!(meta.delta_root.to_hex());
             output["payload_len"] = json!(meta.payload_len);
         }
+        if header.mode == Mode::SemanticDelta {
+            let meta = semantic_delta::semantic_delta_metadata(&frame, &limits)?;
+            output["dtype"] = json!(meta.dtype.as_str());
+            output["shape"] = json!(meta.shape);
+            output["element_count"] = json!(meta.element_count);
+            output["word_bits"] = json!(meta.word_bits);
+            output["base"] = json!(meta.base.to_hex());
+            output["base_dtype"] = json!(meta.base_dtype.as_str());
+            output["base_shape"] = json!(meta.base_shape);
+            output["base_semantic_root"] = json!(meta.base_semantic_root.to_hex());
+            output["policy"] = semantic_policy_json(&meta.policy);
+            output["planes"] = json!(meta.dtype.planes());
+            output["plane_codec"] = json!(meta.plane_codec);
+            output["delta_root"] = json!(meta.delta_root.to_hex());
+            output["payload_len"] = json!(meta.payload_len);
+        }
         if header.mode == Mode::KvCache {
             let meta = kv_cache::kv_cache_metadata(&frame, &limits)?;
             output["model"] = json!(meta.model);
@@ -1353,6 +1466,22 @@ fn inspect(args: InspectArgs) -> Result<()> {
             println!("base_shape: {:?}", meta.base_shape);
             println!("op: {}", meta.op);
             println!("planes: {}", meta.planes);
+            println!("plane_codec: {}", meta.plane_codec);
+            println!("delta_root: {}", meta.delta_root);
+            println!("payload_len: {}", meta.payload_len);
+        }
+        if header.mode == Mode::SemanticDelta {
+            let meta = semantic_delta::semantic_delta_metadata(&frame, &limits)?;
+            println!("dtype: {}", meta.dtype.as_str());
+            println!("shape: {:?}", meta.shape);
+            println!("element_count: {}", meta.element_count);
+            println!("word_bits: {}", meta.word_bits);
+            println!("base: {}", meta.base);
+            println!("base_dtype: {}", meta.base_dtype.as_str());
+            println!("base_shape: {:?}", meta.base_shape);
+            println!("base_semantic_root: {}", meta.base_semantic_root);
+            println!("policy: {}", meta.policy.as_str());
+            println!("planes: {}", meta.dtype.planes());
             println!("plane_codec: {}", meta.plane_codec);
             println!("delta_root: {}", meta.delta_root);
             println!("payload_len: {}", meta.payload_len);

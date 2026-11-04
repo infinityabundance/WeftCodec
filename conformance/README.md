@@ -91,8 +91,10 @@ retained byte-for-byte with `"superseded_by":
 `"superseded_by": "017_unknown_mode_reserved9"` because mode 8 is now
 `QUANTIZED_TENSOR`; `017_unknown_mode_reserved9` is retained and marked
 `"superseded_by": "017_unknown_mode_reserved10"` because mode 9 is now
-`FLOAT_TENSOR`. The current reserved-value vector is
-`017_unknown_mode_reserved14` (mode 14); `017_unknown_mode_reserved12` is
+`FLOAT_TENSOR`. `017_unknown_mode_reserved14` is retained and marked
+`"superseded_by": "017_unknown_mode_reserved15"` because mode 14 is now
+`SEMANTIC_DELTA`. The current reserved-value vector is
+`017_unknown_mode_reserved15` (mode 15); `017_unknown_mode_reserved12` is
 retained and marked superseded because mode 12 is now `KV_CACHE` (mode 13 is
 `ACTIVATION_STREAM`).
 

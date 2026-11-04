@@ -28,6 +28,8 @@ use crate::kv_cache;
 use crate::limits::Limits;
 use crate::modes;
 use crate::selector;
+use crate::semantic::{SemanticPolicy, SemanticRootRecord, SEMANTIC_SCHEMA};
+use crate::semantic_delta::{self, SemanticDeltaMeta, SEMANTIC_DELTA_SCHEMA};
 use crate::tensor::{self, LayoutDescriptor, LogicalRecord, TensorLayout};
 use crate::tensor_sharded;
 use crate::varint;
@@ -45,6 +47,8 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let tensor_dir = dir.join("tensor");
     let sharded_dir = dir.join("sharded");
     let weight_delta_dir = dir.join("weight-delta");
+    let semantic_root_dir = dir.join("semantic-root");
+    let semantic_delta_dir = dir.join("semantic-delta");
     let kv_cache_dir = dir.join("kv-cache");
     let activation_stream_dir = dir.join("activation-stream");
     for sub in [
@@ -56,6 +60,8 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
         &tensor_dir,
         &sharded_dir,
         &weight_delta_dir,
+        &semantic_root_dir,
+        &semantic_delta_dir,
         &kv_cache_dir,
         &activation_stream_dir,
     ] {
@@ -71,6 +77,8 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_tensor_vectors(&tensor_dir, limits)?;
     write_sharded_vectors(&sharded_dir, limits)?;
     write_weight_delta_vectors(&weight_delta_dir, limits)?;
+    write_semantic_root_vectors(&semantic_root_dir, limits)?;
+    write_semantic_delta_vectors(&semantic_delta_dir, limits)?;
     write_kv_cache_vectors(&kv_cache_dir, limits)?;
     write_activation_stream_vectors(&activation_stream_dir, limits)?;
     Ok(())
@@ -99,6 +107,19 @@ pub fn generate_weight_delta_v1(dir: &Path, limits: &Limits) -> Result<()> {
     fs::create_dir_all(&weight_delta_dir)
         .map_err(|e| Error::io(format!("cannot create {}: {e}", weight_delta_dir.display())))?;
     write_weight_delta_vectors(&weight_delta_dir, limits)
+}
+
+/// Generate only the SEMANTIC_DELTA (mode 14) and semantic-root vectors into
+/// `<dir>/semantic-delta` and `<dir>/semantic-root`.
+pub fn generate_semantic_delta_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let root_dir = dir.join("semantic-root");
+    let delta_dir = dir.join("semantic-delta");
+    for sub in [&root_dir, &delta_dir] {
+        fs::create_dir_all(sub)
+            .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
+    }
+    write_semantic_root_vectors(&root_dir, limits)?;
+    write_semantic_delta_vectors(&delta_dir, limits)
 }
 
 /// Generate only the KV_CACHE (mode 12) vectors into `<dir>/kv-cache`.
@@ -205,6 +226,32 @@ fn push_error(
         "frame_hex": hexs(frame),
         "dependencies": deps_json(deps),
         "expect": { "error": class.as_str() },
+    });
+    if let Some(limits) = limits_override {
+        value["limits"] = limits;
+    }
+    vectors.push(value);
+}
+
+fn push_error_superseded(
+    vectors: &mut Vec<Json>,
+    name: &str,
+    mode: &str,
+    frame: &[u8],
+    deps: &[(Hash32, Vec<u8>, u8)],
+    class: ErrorClass,
+    limits_override: Option<Json>,
+    superseded_by: &str,
+    note: &str,
+) {
+    let mut value = json!({
+        "name": name,
+        "mode": mode,
+        "frame_hex": hexs(frame),
+        "dependencies": deps_json(deps),
+        "expect": { "error": class.as_str() },
+        "superseded_by": superseded_by,
+        "note": note,
     });
     if let Some(limits) = limits_override {
         value["limits"] = limits;
@@ -571,9 +618,26 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     let mut unknown_mode = good.clone();
     unknown_mode[7] = 14;
     refix_header_and_trailer(&mut unknown_mode);
-    push_error(
+    push_error_superseded(
         &mut vectors,
         &name("unknown_mode_reserved14"),
+        "raw",
+        &unknown_mode,
+        &[],
+        ErrorClass::UnsupportedMode,
+        None,
+        "unknown_mode_reserved15",
+        "Historical: this vector asserted that mode value 14 was reserved. WEFT-AI-CODEC allocates 14 to SEMANTIC_DELTA, so the authoritative unknown-mode vector is 017_unknown_mode_reserved15. The frozen bytes and original expectation are retained unchanged.",
+    );
+
+    let mut unknown_mode = good.clone();
+    unknown_mode[7] = 15;
+    refix_header_and_trailer(&mut unknown_mode);
+    // Keep the historical 017 numbering; reserved14 above already consumed
+    // the shared sequence step, so this fixed name does not disturb 018.
+    push_error(
+        &mut vectors,
+        "017_unknown_mode_reserved15",
         "raw",
         &unknown_mode,
         &[],
@@ -4114,6 +4178,526 @@ fn write_activation_stream_vectors(dir: &Path, limits: &Limits) -> Result<()> {
         )?,
         ErrorClass::Corrupt,
         "decoded_len differs from element_count * word_bytes",
+    )?;
+
+    Ok(())
+}
+// ---------------------------------------------------------------------------
+// Semantic roots (§15) and mode 14 SEMANTIC_DELTA
+// ---------------------------------------------------------------------------
+
+fn semantic_policy_json(policy: &SemanticPolicy) -> Json {
+    match policy {
+        SemanticPolicy::None => json!({ "scheme": "none" }),
+        SemanticPolicy::MantissaTruncate { bits } => {
+            json!({ "scheme": "mantissa_truncate", "bits": bits })
+        }
+        SemanticPolicy::BlockQuantize { block_size, levels } => json!({
+            "scheme": "block_quantize",
+            "block_size": block_size,
+            "levels": levels
+        }),
+    }
+}
+
+fn words_bf16(words: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(words.len() * 2);
+    for word in words {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+fn words_fp32(words: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(words.len() * 4);
+    for word in words {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+fn write_semantic_root_valid(
+    dir: &Path,
+    name: &str,
+    dtype: WeightDtype,
+    shape: &[u64],
+    bytes: &[u8],
+    policy: SemanticPolicy,
+    limits: &Limits,
+) -> Result<()> {
+    let record = SemanticRootRecord::from_row_major(dtype, shape, bytes, policy, limits)?;
+    let canonical = record.canonical_bytes(limits)?;
+    let vector = json!({
+        "name": name,
+        "kind": "semantic_root",
+        "schema": SEMANTIC_SCHEMA,
+        "dtype": record.dtype.as_str(),
+        "shape": record.shape,
+        "element_count": record.element_count,
+        "policy": semantic_policy_json(&record.policy),
+        "values_hex": hexs(bytes),
+        "quantized_values_hash": record.quantized_values_hash.to_hex(),
+        "canonical_hex": hexs(&canonical),
+        "semantic_root": record.root(limits)?.to_hex(),
+        "expect": { "ok": true },
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn semantic_root_record_bytes(
+    dtype: WeightDtype,
+    shape: &[u64],
+    element_count: u64,
+    policy: Value,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    wcb::encode(
+        &Value::map([
+            ("schema", Value::Str(SEMANTIC_SCHEMA.to_owned())),
+            ("dtype", Value::Str(dtype.as_str().to_owned())),
+            (
+                "shape",
+                Value::Array(shape.iter().map(|dim| Value::U64(*dim)).collect()),
+            ),
+            ("element_count", Value::U64(element_count)),
+            ("policy", policy),
+            ("quantized_values_hash", Value::Bytes(vec![0u8; 32])),
+        ]),
+        limits,
+    )
+}
+
+fn write_semantic_root_reject(dir: &Path, name: &str, record: &[u8], note: &str) -> Result<()> {
+    let vector = json!({
+        "name": name,
+        "kind": "semantic_root",
+        "expect_error": "Malformed",
+        "note": note,
+        "record_hex": hexs(record),
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_semantic_root_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    let bf16_bytes = words_bf16(&[0x3F80, 0xC000, 0x0000, 0x7FC0, 0x8000, 0x0001]);
+    write_semantic_root_valid(
+        dir,
+        "001_root_none_bf16",
+        WeightDtype::Bf16,
+        &[2, 3],
+        &bf16_bytes,
+        SemanticPolicy::None,
+        limits,
+    )?;
+    write_semantic_root_valid(
+        dir,
+        "002_root_mantissa_bf16_bits3",
+        WeightDtype::Bf16,
+        &[2, 3],
+        &bf16_bytes,
+        SemanticPolicy::MantissaTruncate { bits: 3 },
+        limits,
+    )?;
+
+    let fp32_bytes: Vec<u8> = (0..128u32)
+        .flat_map(|index| (0x3F80_0000u32.wrapping_add(index * 7919)).to_le_bytes())
+        .collect();
+    write_semantic_root_valid(
+        dir,
+        "003_root_block_quantize_fp32_b128_l256",
+        WeightDtype::Fp32,
+        &[2, 64],
+        &fp32_bytes,
+        SemanticPolicy::BlockQuantize {
+            block_size: 128,
+            levels: 256,
+        },
+        limits,
+    )?;
+
+    // Rejects -------------------------------------------------------------
+    write_semantic_root_reject(
+        dir,
+        "101_unknown_scheme",
+        &semantic_root_record_bytes(
+            WeightDtype::Bf16,
+            &[2, 3],
+            6,
+            Value::map([("scheme", Value::Str("approximate".to_owned()))]),
+            limits,
+        )?,
+        "the scheme string is not one of none, mantissa_truncate, block_quantize",
+    )?;
+    write_semantic_root_reject(
+        dir,
+        "102_bits_out_of_range",
+        &semantic_root_record_bytes(
+            WeightDtype::Bf16,
+            &[2, 3],
+            6,
+            Value::map([
+                ("bits", Value::U64(8)),
+                ("scheme", Value::Str("mantissa_truncate".to_owned())),
+            ]),
+            limits,
+        )?,
+        "bf16 has 7 mantissa bits; bits 8 is outside 1..=7",
+    )?;
+    write_semantic_root_reject(
+        dir,
+        "103_block_size_not_divisor",
+        &semantic_root_record_bytes(
+            WeightDtype::Bf16,
+            &[2, 3],
+            6,
+            Value::map([
+                ("block_size", Value::U64(4)),
+                ("levels", Value::U64(16)),
+                ("scheme", Value::Str("block_quantize".to_owned())),
+            ]),
+            limits,
+        )?,
+        "block_size 4 does not divide element_count 6",
+    )?;
+    write_semantic_root_reject(
+        dir,
+        "104_shape_mismatch",
+        &semantic_root_record_bytes(
+            WeightDtype::Bf16,
+            &[2, 3],
+            7,
+            Value::map([("scheme", Value::Str("none".to_owned()))]),
+            limits,
+        )?,
+        "element_count 7 does not match the shape product 6",
+    )?;
+    write_semantic_root_reject(
+        dir,
+        "105_levels_zero",
+        &semantic_root_record_bytes(
+            WeightDtype::Bf16,
+            &[2, 3],
+            6,
+            Value::map([
+                ("block_size", Value::U64(3)),
+                ("levels", Value::U64(0)),
+                ("scheme", Value::Str("block_quantize".to_owned())),
+            ]),
+            limits,
+        )?,
+        "levels 0 cannot describe a quantizer",
+    )?;
+    write_semantic_root_reject(
+        dir,
+        "106_non_finite_policy",
+        &semantic_root_record_bytes(
+            WeightDtype::Bf16,
+            &[2, 3],
+            6,
+            Value::map([
+                ("block_size", Value::U64(3)),
+                ("levels", Value::Null),
+                ("scheme", Value::Str("block_quantize".to_owned())),
+            ]),
+            limits,
+        )?,
+        "levels is null (not a finite u64); WCB has no float/NaN type",
+    )?;
+    Ok(())
+}
+
+fn semantic_delta_bf16_case(limits: &Limits) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let base_words: [u16; 6] = [0x3F80, 0xC000, 0x0000, 0x7FC0, 0x8000, 0x0001];
+    let mut target_words = base_words;
+    target_words[1] ^= 0x0003;
+    let base_bytes = words_bf16(&base_words);
+    let target_bytes = words_bf16(&target_words);
+    let base_frame = modes::encode_tensor(&base_bytes, modes::TensorDtype::Bf16, &[2, 3], limits)?;
+    Ok((target_bytes, base_bytes, base_frame))
+}
+
+fn semantic_delta_fp32_case(limits: &Limits) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let base_words: [u32; 4] = [0x3F80_0000, 0xC000_0000, 0x0000_0001, 0x7FC0_0001];
+    let mut target_words = base_words;
+    target_words[2] = 0x0000_00FE;
+    let base_bytes = words_fp32(&base_words);
+    let target_bytes = words_fp32(&target_words);
+    let base_frame = modes::encode_tensor(&base_bytes, modes::TensorDtype::F32, &[2, 2], limits)?;
+    Ok((target_bytes, base_bytes, base_frame))
+}
+
+fn semantic_delta_q8_case(limits: &Limits) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let base: [u8; 8] = [0x80, 0xFF, 0x00, 0x01, 0x7F, 0x2A, 0xF9, 0x64];
+    let mut target = base;
+    target[0] = base[0].wrapping_add(1);
+    target[1] = base[1].wrapping_sub(1);
+    target[3] = base[3].wrapping_add(2);
+    target[4] = base[4].wrapping_sub(1);
+    target[6] = base[6].wrapping_add(1);
+    target[7] = base[7].wrapping_sub(2);
+    let base_frame = modes::encode_tensor(&base, modes::TensorDtype::I8, &[2, 4], limits)?;
+    Ok((target.to_vec(), base.to_vec(), base_frame))
+}
+
+fn write_semantic_delta_valid(
+    dir: &Path,
+    name: &str,
+    dtype: WeightDtype,
+    shape: &[u64],
+    base_frame: &[u8],
+    target: &[u8],
+    policy: SemanticPolicy,
+    limits: &Limits,
+) -> Result<()> {
+    let delta_frame =
+        semantic_delta::encode_semantic_delta(target, dtype, shape, base_frame, policy, limits)?;
+    let parsed = Frame::parse(&delta_frame, limits)?;
+    let meta = semantic_delta::semantic_delta_metadata(&parsed, limits)?;
+    let decoded = semantic_delta::decode_with_base_frame(
+        &parsed,
+        base_frame,
+        &crate::dependency::MapResolver::new(),
+        limits,
+    )?;
+    if decoded != target {
+        return Err(Error::corrupt("SEMANTIC_DELTA vector does not reconstruct"));
+    }
+    let vector = json!({
+        "name": name,
+        "schema": SEMANTIC_DELTA_SCHEMA,
+        "dtype": meta.dtype.as_str(),
+        "shape": meta.shape,
+        "element_count": meta.element_count,
+        "word_bits": meta.word_bits,
+        "base": meta.base.to_hex(),
+        "base_dtype": meta.base_dtype.as_str(),
+        "base_shape": meta.base_shape,
+        "base_semantic_root": meta.base_semantic_root.to_hex(),
+        "policy": semantic_policy_json(&meta.policy),
+        "planes": meta.dtype.planes(),
+        "plane_codec": meta.plane_codec,
+        "delta_root": meta.delta_root.to_hex(),
+        "payload_len": meta.payload_len,
+        "target_hash": blake3_hex(target),
+        "target_hex": hexs(target),
+        "base_frame_hex": hexs(base_frame),
+        "delta_frame_hex": hexs(&delta_frame),
+        "expect": { "ok": true },
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_semantic_delta_reject(
+    dir: &Path,
+    name: &str,
+    delta_frame: &[u8],
+    base_frame: Option<&[u8]>,
+    expected: ErrorClass,
+    note: &str,
+    use_frame_source: bool,
+) -> Result<()> {
+    let vector = json!({
+        "name": name,
+        "expect_error": expected.as_str(),
+        "note": note,
+        "base_frame_hex": base_frame.map(hexs),
+        "delta_frame_hex": hexs(delta_frame),
+        "use_frame_source": use_frame_source,
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn semantic_delta_frame(
+    meta: &SemanticDeltaMeta,
+    payload: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    base_mode: u32,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    semantic_delta::encode_descriptor_frame(
+        meta,
+        payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )
+}
+
+fn write_semantic_delta_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    // --- valid ------------------------------------------------------------
+    let (bf16_target, _bf16_base, bf16_base_frame) = semantic_delta_bf16_case(limits)?;
+    write_semantic_delta_valid(
+        dir,
+        "001_bf16_near_duplicate",
+        WeightDtype::Bf16,
+        &[2, 3],
+        &bf16_base_frame,
+        &bf16_target,
+        SemanticPolicy::MantissaTruncate { bits: 3 },
+        limits,
+    )?;
+
+    let (fp32_target, _fp32_base, fp32_base_frame) = semantic_delta_fp32_case(limits)?;
+    write_semantic_delta_valid(
+        dir,
+        "002_fp32_small_change",
+        WeightDtype::Fp32,
+        &[2, 2],
+        &fp32_base_frame,
+        &fp32_target,
+        SemanticPolicy::MantissaTruncate { bits: 8 },
+        limits,
+    )?;
+
+    let (q8_target, _q8_base, q8_base_frame) = semantic_delta_q8_case(limits)?;
+    write_semantic_delta_valid(
+        dir,
+        "003_q8_0_mixed_changes",
+        WeightDtype::Q8_0,
+        &[2, 4],
+        &q8_base_frame,
+        &q8_target,
+        SemanticPolicy::None,
+        limits,
+    )?;
+
+    // --- rejects derived from the bf16 case -------------------------------
+    let delta_frame = semantic_delta::encode_semantic_delta(
+        &bf16_target,
+        WeightDtype::Bf16,
+        &[2, 3],
+        &bf16_base_frame,
+        SemanticPolicy::MantissaTruncate { bits: 3 },
+        limits,
+    )?;
+    let parsed = Frame::parse(&delta_frame, limits)?;
+    let meta = semantic_delta::semantic_delta_metadata(&parsed, limits)?;
+    let payload = {
+        let body = &parsed.body;
+        let meta_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+        body[4 + meta_len..].to_vec()
+    };
+    let content_hash = parsed.header.content_hash;
+    let decoded_len = parsed.header.decoded_len;
+    let base_mode = 6u32;
+
+    let mut base_root = meta.clone();
+    let mut flipped = base_root.base_semantic_root.into_bytes();
+    flipped[0] ^= 0x01;
+    base_root.base_semantic_root = Hash32::from_bytes(flipped);
+    let frame = semantic_delta_frame(
+        &base_root,
+        &payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )?;
+    write_semantic_delta_reject(
+        dir,
+        "101_base_semantic_mismatch",
+        &frame,
+        Some(&bf16_base_frame),
+        ErrorClass::DependencyMismatch,
+        "declared base_semantic_root does not equal the root recomputed from the base",
+        false,
+    )?;
+
+    let mut policy_mismatch = meta.clone();
+    policy_mismatch.policy = SemanticPolicy::MantissaTruncate { bits: 1 };
+    let frame = semantic_delta_frame(
+        &policy_mismatch,
+        &payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )?;
+    write_semantic_delta_reject(
+        dir,
+        "102_policy_mismatch",
+        &frame,
+        Some(&bf16_base_frame),
+        ErrorClass::DependencyMismatch,
+        "policy bits=1 recomputes a different base semantic root than the descriptor",
+        false,
+    )?;
+
+    let mut delta_root = meta.clone();
+    let mut flipped = delta_root.delta_root.into_bytes();
+    flipped[0] ^= 0x01;
+    delta_root.delta_root = Hash32::from_bytes(flipped);
+    let frame = semantic_delta_frame(
+        &delta_root,
+        &payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )?;
+    write_semantic_delta_reject(
+        dir,
+        "103_delta_root_mismatch",
+        &frame,
+        Some(&bf16_base_frame),
+        ErrorClass::Corrupt,
+        "declared delta_root does not match the reconstructed delta words",
+        false,
+    )?;
+
+    write_semantic_delta_reject(
+        dir,
+        "104_missing_base",
+        &delta_frame,
+        None,
+        ErrorClass::DependencyMissing,
+        "no resolver entry and no --base frame was supplied",
+        false,
+    )?;
+
+    let other_base =
+        modes::encode_tensor(&vec![0u8; 12], modes::TensorDtype::Bf16, &[3, 2], limits)?;
+    let other_parsed = Frame::parse(&other_base, limits)?;
+    let mut shape_mismatch = meta.clone();
+    shape_mismatch.base = other_parsed.header.content_hash;
+    let frame = semantic_delta_frame(
+        &shape_mismatch,
+        &payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )?;
+    write_semantic_delta_reject(
+        dir,
+        "105_base_shape_mismatch",
+        &frame,
+        Some(&other_base),
+        ErrorClass::DependencyMismatch,
+        "supplied base frame shape [3,2] does not match the declared shape [2,3]",
+        false,
+    )?;
+
+    let mut payload_mismatch = meta.clone();
+    payload_mismatch.payload_len = payload.len() as u64 + 1;
+    let frame = semantic_delta_frame(
+        &payload_mismatch,
+        &payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )?;
+    write_semantic_delta_reject(
+        dir,
+        "106_payload_length_mismatch",
+        &frame,
+        Some(&bf16_base_frame),
+        ErrorClass::Malformed,
+        "declared payload_len is one byte larger than the stored payload",
+        false,
     )?;
 
     Ok(())

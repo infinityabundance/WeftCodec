@@ -1293,3 +1293,174 @@ Valid vectors carry every chunk frame, the element bytes, per-chunk digest
 roots, and the assembled `stream_root`. Both implementations decode, re-encode
 to identical bytes, assemble, and recompute the root; every invalid frame is
 rejected with the stated class.
+
+## 15. Semantic roots and mode 14 — `SEMANTIC_DELTA` (implemented)
+
+Near-duplicate tensors need a way to be grouped and proposed as delta bases
+without weakening exactness. A **semantic root** is metadata for that grouping.
+It is **not** a content identity, it never replaces `LogicalTensorRoot`, and it
+never replaces a frame `content_hash`. Two objects with the same semantic root
+are *candidates*; they are not interchangeable bytes.
+
+### 15.1 Semantic root
+
+```
+SemanticRoot = H("weft/tensor/semantic/v1",
+                 WCB({schema: "weft.tensor.semantic.v1",
+                      dtype, shape, element_count, policy,
+                      quantized_values_hash}))
+```
+
+`dtype` is one of `bf16`, `fp16`, `fp32`, `q8_0`, `q4_0`; `shape` and
+`element_count` follow §12.2. `quantized_values_hash` is:
+
+- for `{"scheme":"none"}`, exactly the logical values hash
+  `H("weft/tensor/values/v1", row_major_bytes)`;
+- otherwise `H("weft/tensor/semantic-values/v1", transformed_bytes)` where
+  `transformed_bytes` is the policy output below.
+
+Policies are canonical WCB maps and are required:
+
+| Policy | Value |
+|---|---|
+| identity | `{"scheme":"none"}` |
+| mantissa truncation | `{"scheme":"mantissa_truncate","bits":N}` |
+| block quantization | `{"scheme":"block_quantize","block_size":B,"levels":L}` |
+
+`mantissa_truncate` is defined only for `bf16` (7 mantissa bits), `fp16` (10),
+and `fp32` (23). For each element word, clear the `N` least-significant mantissa
+bits (`word & ~((1<<N)-1)`). A word whose exponent field is all ones (NaN or
+infinity) is stored unchanged, so sign, exponent, NaN payloads, and infinities
+are preserved verbatim. `1 <= N <= mantissa_bits(dtype)`; `N = 0` is rejected
+because `none` is the identity.
+
+`block_quantize` interprets each raw word as a signed two's-complement integer
+`s` of the dtype's word width and splits the element sequence into blocks of
+`B` consecutive row-major elements, where `B` MUST divide `element_count` and
+`1 <= L <= 2^24`. For a block with `amax = max |s_i|`:
+
+- if `amax == 0` or `L == 1`, every reconstructed word is signed zero;
+- otherwise the reconstruction grid is
+
+  ```
+  level_k = -amax + floor((2*amax*k + (L-1)/2) / (L-1)),   k = 0..L-1
+  ```
+
+  and element `s` maps to
+
+  ```
+  k = clamp(floor(((s + amax)*(L-1) + amax) / (2*amax)), 0, L-1)
+  ```
+
+  storing `level_k` in two's complement. Every intermediate fits `u64` because
+  `amax <= 2^31` and `L <= 2^24`. The grid spans `[-amax, amax]`, so the
+  quantizer is symmetric about zero within each block.
+
+Unknown schemes, wrong WCB types (including null in place of a numeric field),
+out-of-range `bits`, non-dividing `block_size`, `levels == 0`, and
+`element_count != product(shape)` are `Malformed`.
+
+### 15.2 Mode 14 — `SEMANTIC_DELTA`
+
+Mode 14 is the exact WEIGHT_DELTA reconstruction scheme plus a verified
+semantic-root binding. The payload is identical to §12.3: modular element-wise
+subtraction on raw words, one `huffman-canonical-v1` stream per byte plane, and
+the same `delta_root`. Frame shape, dependency shape, and content hash follow
+§12.1 with `mode = 14`.
+
+The WCB descriptor is `weft.ai.semantic_delta.v1` with exactly these keys:
+
+| Key | WCB type | Value |
+|---|---|---|
+| `schema` | text | exactly `weft.ai.semantic_delta.v1` |
+| `dtype` | text | `bf16`, `fp16`, `fp32`, `q8_0`, or `q4_0` |
+| `shape` | array of u64 | logical extents |
+| `element_count` | u64 | product of `shape` |
+| `word_bits` | u64 | fixed per dtype (§12.3) |
+| `base` | bytes(32) | base frame content hash |
+| `base_dtype` | text | MUST equal `dtype` |
+| `base_shape` | array of u64 | MUST equal `shape` |
+| `base_semantic_root` | bytes(32) | semantic root of the base bytes under `policy` |
+| `policy` | map | one canonical policy from §15.1 |
+| `delta_root` | bytes(32) | `H("weft/tensor/values/v1", delta words)` |
+| `plane_codec` | text | exactly `huffman-canonical-v1` |
+| `payload_len` | u64 | stored payload length |
+
+Decoding verifies, in order: descriptor structure and policy validity; frame
+`decoded_len`, `payload_len`, dependency count/domain, and dependency hash;
+`delta_root` against the reconstructed delta words; the base content hash,
+dtype, and shape; and finally the semantic root recomputed from the actual base
+bytes under the declared policy. Any mismatch is `DependencyMismatch` (base
+metadata or semantic root) or `Corrupt` (`delta_root`, reconstructed content
+hash). A missing base is `DependencyMissing`.
+
+`base_semantic_root` is an **input to base selection**, never a substitute for
+verification. The semantic root is not recomputed from the target for
+verification: mode 14 proves the base, and the frame content hash proves the
+target.
+
+### 15.3 No lossy mode
+
+Approximate decoding is **not implemented**. No mode, flag, or decoder path
+silently reconstructs approximate bytes. `SEMANTIC_DELTA` reconstruction is
+bit-exact; its descriptor policy only selects and verifies a base, and an
+approximate base is a hard error, not a fallback. The policy transformations
+exist solely to compute a grouping hash; they are never emitted as
+reconstructed element bytes.
+
+### 15.4 Candidate selection
+
+The candidate helper takes a target, its dtype/shape, one policy, and a set of
+candidate base **frames whose bytes are present**. It computes the target's
+semantic root, skips candidates whose dtype/shape differ, decodes each remaining
+candidate, recomputes its semantic root under the same policy, and skips
+candidates whose root differs. Among matches it computes the exact modular
+difference and its exact `huffman-canonical-v1` per-plane size and chooses the
+smallest. Ties are broken by the candidate frame content hash. The result is
+deterministic for a fixed candidate order, and a pair with different semantic
+roots is never offered as a candidate. Because both tensors must be present,
+this is a local selection helper, not a remote index query.
+
+### 15.5 API and CLI (maintainer tools, not wire formats)
+
+Rust (`weftcodec::semantic`, `weftcodec::semantic_delta`):
+
+- `semantic_root(dtype, shape, bytes, policy)` and `semantic_root_with_limits`
+- `semantic_record(...)`, `SemanticRootRecord::from_canonical_bytes`
+- `semantic_matches(a, b)`
+- `select_semantic_base(target, dtype, shape, policy, candidates, limits)`
+- `encode_semantic_delta(target, dtype, shape, base_frame, policy, limits)`
+- `decode_frame(frame, resolver, limits)` and `decode_with_base_frame(...)`
+- `semantic_delta_metadata(frame, limits)`
+
+Go (`modes` package) exposes `SemanticRoot`, `SemanticRootWithLimits`,
+`NewSemanticRecord`, `ParseSemanticRecord`, `SemanticMatches`,
+`SelectSemanticBase`, `EncodeSemanticDelta`, `DecodeSemanticDeltaFrame`,
+`DecodeSemanticDeltaFrameWithBase`, and `SemanticDeltaMetadata`.
+
+```
+weftcodec encode --mode semantic-delta --base BASE_FRAME --input TARGET \
+    --output FRAME --dtype bf16|fp16|fp32|q8_0|q4_0 --shape 2,3 \
+    --semantic-policy none|mantissa_truncate:3|block_quantize:128:256
+weftcodec decode --input FRAME --output TARGET [--base BASE_FRAME | --resolve --frame-source DIR]
+```
+
+`inspect` reports `base_semantic_root` and the canonical `policy` in addition
+to the mode-11 fields.
+
+### 15.6 Conformance vectors
+
+`conformance/v1/semantic-root/` and `conformance/v1/semantic-delta/` are
+byte-identical in both codec repositories:
+
+- roots: `001` none, `002` bf16 `mantissa_truncate:3`, `003` fp32
+  `block_quantize` `B=128 L=256`; rejects `101`–`106` unknown scheme, bits out
+  of range, block size not dividing, shape mismatch, levels zero, and a
+  non-numeric (null) policy field;
+- deltas: `001` bf16 near-duplicate, `002` fp32 small change, `003` q8_0;
+  rejects `101`–`106` base semantic mismatch, policy mismatch, delta-root
+  mismatch, missing base, base shape mismatch, and payload-length mismatch.
+
+Both implementations replay every valid vector, decode, and re-encode to the
+same bytes; invalid vectors are rejected with the stated class. The
+cross-language gate reports byte-identical mode-14 frames in both directions.
