@@ -16,7 +16,8 @@ WeftCodec v1: a deterministic, lossless, context-conditioned codec.
 - Payload modes: RAW, ZSTD, REFERENCE, DELTA (bounded COPY/INSERT matcher),
   DICTIONARY, STRUCTURED (canonical WCB), TENSOR (mode 6, exact
   row-major little-endian payload + WCB descriptor), and TOKEN_SEQUENCE
-  (mode 7, u64 zigzag-delta minimal LEB128 + WCB descriptor).
+  (mode 7, u64 zigzag-delta minimal LEB128 + WCB descriptor) and QUANTIZED_TENSOR
+  (mode 8, packed i8/u8 with exact f64 scale bits and i64 zero point).
 - WCB canonical bytes with encoded-key map ordering.
 - Self-contained WFA1 archives with enforced topological order.
 - WeftQL selector parser, normalization, canonical bytes, and `SelectorId`.
