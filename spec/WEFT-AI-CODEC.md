@@ -475,9 +475,9 @@ reserved value or an existing descriptor field.
 
 | Family | Status | Notes |
 |---|---|---|
-| Tensor `column_major` layout | specified, not implemented | Do not infer from shape; reject the descriptor value |
-| Tensor `blocked` layout | specified, not implemented | No block extents/padding wire form |
-| Tensor `sharded` layout | specified, not implemented | No shard index/count/axis wire form; no assembly semantics |
+| Tensor `column_major` layout | specified, not implemented in mode 6 | Mode 6 remains `row_major`; the additive layout layer is WEFT-TENSOR §4 |
+| Tensor `blocked` layout | specified, not implemented in mode 6 | No block extents in mode 6; WEFT-TENSOR §4 defines the additive block form |
+| Tensor `sharded` layout | specified, not implemented in mode 6 | No shard fields in mode 6; WEFT-TENSOR §4–§6 defines shards and containers |
 | Tensor `quantized` storage beyond affine per-tensor i8/u8 | specified, not implemented | i4 nibble packing, per-axis scales, and dequantization are out of codec scope |
 | Activation/gradient streams | specified, not implemented | No stream descriptor or element-hash list wire form |
 | Embedding / KV-cache pages | specified, not implemented | No layer/head/position wire form |
@@ -563,3 +563,26 @@ files without modification.
   F7 measures them and reports losses.
 - No claim of production data or Meta data. The F7 corpus is synthetic and its
   manifest records that.
+
+---
+
+## 10. Logical tensor identity and region addressing
+
+WEFT-TENSOR v1 (`spec/WEFT-TENSOR.md`) defines the additive layer that makes
+mode-6 tensor identity independent of physical layout:
+
+```
+values_hash       = H("weft/tensor/values/v1",  row-major element bytes)
+LogicalTensorRoot = H("weft/tensor/logical/v1", WCB(weft.tensor.logical.v1))
+```
+
+It additionally defines canonical `weft.tensor.layout.v1` descriptors for
+`row-major`, `column-major`, `blocked`, and `sharded` arrangements, a half-open
+region reader that touches only intersecting physical units, and the
+`weft.tensor.shard.v1` container with `shard_root` verification.
+
+The layer is **additive**: it introduces new schema strings outside mode 6 and
+does not alter any mode-6 encoding or frozen vector. Mode-6 `TENSOR` frames
+continue to require `layout: "row_major"` and remain the frame format for
+single-region canonical payloads. See WEFT-TENSOR §1 and §10 for the exact
+boundary.

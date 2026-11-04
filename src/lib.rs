@@ -14,6 +14,7 @@
 //! * [`selector`] — WeftQL parser, normalization, canonical selector identity.
 //! * [`context`] — Context Root, causal closure, capability scope, `weft://`.
 //! * [`stream`] — chunked encoding and random-range reads.
+//! * [`tensor`] — logical tensor identity, layouts, and region addressing.
 //!
 //! All parsing of untrusted input returns `Result`; the crate forbids unsafe
 //! code and has no panic paths on malformed input.
@@ -34,6 +35,7 @@ pub mod limits;
 pub mod modes;
 pub mod selector;
 pub mod stream;
+pub mod tensor;
 pub mod varint;
 pub mod wcb;
 
@@ -41,3 +43,8 @@ pub use error::{Error, ErrorClass, Result};
 pub use frame::{Dependency, Frame, FrameHeader, Mode};
 pub use hash::Hash32;
 pub use limits::Limits;
+pub use modes::TensorDtype;
+pub use tensor::{
+    logical_root, shard_root, LayoutDescriptor, LogicalRecord, PhysicalTensor, Region, RegionRead,
+    TensorLayout,
+};

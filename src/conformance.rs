@@ -25,23 +25,26 @@ use crate::hash::{
 use crate::limits::Limits;
 use crate::modes;
 use crate::selector;
+use crate::tensor::{self, LayoutDescriptor, LogicalRecord, TensorLayout};
 use crate::varint;
 use crate::wcb::{self, Value};
 
-/// Generate every v1 vector into `dir` (creating `codec/`, `structured/`, and
-/// `selectors/`).
+/// Generate every v1 vector into `dir` (creating `codec/`, `structured/`,
+/// `selectors/`, `context/`, `causal/`, and `tensor/`).
 pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let codec_dir = dir.join("codec");
     let structured_dir = dir.join("structured");
     let selectors_dir = dir.join("selectors");
     let context_dir = dir.join("context");
     let causal_dir = dir.join("causal");
+    let tensor_dir = dir.join("tensor");
     for sub in [
         &codec_dir,
         &structured_dir,
         &selectors_dir,
         &context_dir,
         &causal_dir,
+        &tensor_dir,
     ] {
         fs::create_dir_all(sub)
             .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
@@ -52,7 +55,16 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_selector_vectors(&selectors_dir, limits)?;
     write_context_vectors(&context_dir, limits)?;
     write_causal_vectors(&causal_dir, limits)?;
+    write_tensor_vectors(&tensor_dir, limits)?;
     Ok(())
+}
+
+/// Generate only the additive WEFT-TENSOR vectors into `<dir>/tensor`.
+pub fn generate_tensor_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let tensor_dir = dir.join("tensor");
+    fs::create_dir_all(&tensor_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", tensor_dir.display())))?;
+    write_tensor_vectors(&tensor_dir, limits)
 }
 
 fn write_json(path: &Path, value: &Json) -> Result<()> {
@@ -2239,6 +2251,484 @@ fn write_causal_vectors(dir: &Path, limits: &Limits) -> Result<()> {
         ("extra", Value::Bool(true)),
     ]);
     write_causal_error(dir, "106_unknown_key", extra, "NonCanonical", limits)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// WEFT-TENSOR vectors
+// ---------------------------------------------------------------------------
+
+fn write_tensor_logical_error(
+    dir: &Path,
+    name: &str,
+    description: &str,
+    record: Value,
+    expected: &str,
+    limits: &Limits,
+) -> Result<()> {
+    let bytes = wcb::encode(&record, limits)?;
+    let error = LogicalRecord::from_canonical_bytes(&bytes, limits)
+        .expect_err("rejection vector unexpectedly decoded");
+    if error.class().as_str() != expected {
+        return Err(Error::io(format!(
+            "{name}: expected class {expected}, generated {} ({error})",
+            error.class()
+        )));
+    }
+    write_json(
+        &dir.join(format!("{name}.json")),
+        &json!({
+            "name": name,
+            "kind": "logical",
+            "description": description,
+            "record_hex": hexs(&bytes),
+            "expect_error": expected,
+        }),
+    )
+}
+
+fn write_tensor_layout_error(
+    dir: &Path,
+    name: &str,
+    description: &str,
+    record: Value,
+    expected: &str,
+    limits: &Limits,
+) -> Result<()> {
+    let bytes = wcb::encode(&record, limits)?;
+    let error = LayoutDescriptor::from_canonical_bytes(&bytes, limits)
+        .expect_err("rejection vector unexpectedly decoded");
+    if error.class().as_str() != expected {
+        return Err(Error::io(format!(
+            "{name}: expected class {expected}, generated {} ({error})",
+            error.class()
+        )));
+    }
+    write_json(
+        &dir.join(format!("{name}.json")),
+        &json!({
+            "name": name,
+            "kind": "layout",
+            "description": description,
+            "record_hex": hexs(&bytes),
+            "expect_error": expected,
+        }),
+    )
+}
+
+fn shape_value(shape: &[u64]) -> Value {
+    Value::Array(shape.iter().map(|dim| Value::U64(*dim)).collect())
+}
+
+fn logical_map(dtype: &str, shape: &[u64], element_count: u64, values_hash: &[u8]) -> Value {
+    Value::map([
+        ("schema", Value::Str(tensor::LOGICAL_SCHEMA.to_owned())),
+        ("dtype", Value::Str(dtype.to_owned())),
+        ("shape", shape_value(shape)),
+        ("element_count", Value::U64(element_count)),
+        ("values_hash", Value::Bytes(values_hash.to_vec())),
+    ])
+}
+
+fn layout_map_value(dtype: &str, shape: &[u64], layout: &str, extras: &[(&str, Value)]) -> Value {
+    let mut pairs: Vec<(String, Value)> = vec![
+        (
+            "schema".to_owned(),
+            Value::Str(tensor::LAYOUT_SCHEMA.to_owned()),
+        ),
+        ("dtype".to_owned(), Value::Str(dtype.to_owned())),
+        ("shape".to_owned(), shape_value(shape)),
+        ("layout".to_owned(), Value::Str(layout.to_owned())),
+    ];
+    for (key, value) in extras {
+        pairs.push(((*key).to_owned(), value.clone()));
+    }
+    Value::map(pairs)
+}
+
+fn write_tensor_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    // Valid logical records and their layout-independent roots.
+    let valid: [(&str, modes::TensorDtype, &[u64], u64); 3] = [
+        (
+            "001_logical_bf16_2x3x4",
+            modes::TensorDtype::Bf16,
+            &[2, 3, 4],
+            0x1001,
+        ),
+        ("002_logical_f32_3", modes::TensorDtype::F32, &[3], 0x1002),
+        (
+            "003_logical_i8_2x2",
+            modes::TensorDtype::I8,
+            &[2, 2],
+            0x1003,
+        ),
+    ];
+    for (name, dtype, shape, seed) in valid {
+        let count = tensor::validate_shape(shape, limits)?;
+        let len = usize::try_from(tensor::payload_len(count, dtype)?)
+            .map_err(|_| Error::limit_exceeded("vector payload does not fit usize"))?;
+        let values = pattern(len, seed);
+        let record = LogicalRecord::from_row_major(dtype, shape, &values, limits)?;
+        let canonical = record.canonical_bytes_with_limits(limits)?;
+        let root = record.root_with_limits(limits)?;
+        let vector = json!({
+            "name": name,
+            "kind": "logical",
+            "dtype": dtype.as_str(),
+            "shape": shape,
+            "element_count": count,
+            "values_hex": hexs(&values),
+            "values_hash": record.values_hash.to_hex(),
+            "canonical_hex": hexs(&canonical),
+            "logical_root": root.to_hex(),
+        });
+        write_json(&dir.join(format!("{name}.json")), &vector)?;
+    }
+
+    // Logical rejects.
+    let good_hash = tensor::values_hash(b"weft-tensor-logical-vector");
+    write_tensor_logical_error(
+        dir,
+        "101_logical_rank_zero",
+        "rank 0 is not a v1 logical tensor",
+        logical_map("bf16", &[], 1, good_hash.as_bytes()),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_logical_error(
+        dir,
+        "102_logical_zero_dimension",
+        "a zero dimension is rejected",
+        logical_map("bf16", &[2, 0, 3], 0, good_hash.as_bytes()),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_logical_error(
+        dir,
+        "103_logical_product_overflow",
+        "the shape product overflows u64",
+        logical_map(
+            "bf16",
+            &[4_294_967_296, 4_294_967_296, 4_294_967_296],
+            1,
+            good_hash.as_bytes(),
+        ),
+        "LimitExceeded",
+        limits,
+    )?;
+    write_tensor_logical_error(
+        dir,
+        "104_logical_element_count_mismatch",
+        "element_count must equal the shape product",
+        logical_map("bf16", &[2, 3, 4], 23, good_hash.as_bytes()),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_logical_error(
+        dir,
+        "105_logical_unknown_schema",
+        "schema must be weft.tensor.logical.v1",
+        Value::map([
+            ("schema", Value::Str("weft.tensor.logical.v2".to_owned())),
+            ("dtype", Value::Str("bf16".to_owned())),
+            ("shape", shape_value(&[2, 3, 4])),
+            ("element_count", Value::U64(24)),
+            ("values_hash", Value::Bytes(good_hash.as_bytes().to_vec())),
+        ]),
+        "UnknownSchema",
+        limits,
+    )?;
+    write_tensor_logical_error(
+        dir,
+        "106_logical_unknown_dtype",
+        "unknown dtype is UnsupportedFeature in the identity layer",
+        logical_map("f8", &[2, 3, 4], 24, good_hash.as_bytes()),
+        "UnsupportedFeature",
+        limits,
+    )?;
+    write_tensor_logical_error(
+        dir,
+        "107_logical_short_values_hash",
+        "values_hash must be 32 bytes",
+        logical_map("bf16", &[2, 3, 4], 24, &good_hash.as_bytes()[..31]),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_logical_error(
+        dir,
+        "108_logical_unknown_key",
+        "unknown keys are rejected",
+        Value::map([
+            ("schema", Value::Str(tensor::LOGICAL_SCHEMA.to_owned())),
+            ("dtype", Value::Str("bf16".to_owned())),
+            ("shape", shape_value(&[2, 3, 4])),
+            ("element_count", Value::U64(24)),
+            ("values_hash", Value::Bytes(good_hash.as_bytes().to_vec())),
+            ("layout", Value::Str("row-major".to_owned())),
+        ]),
+        "NonCanonical",
+        limits,
+    )?;
+    let nine = [1u64; 9];
+    write_tensor_logical_error(
+        dir,
+        "109_logical_rank_exceeds_limit",
+        "rank 9 exceeds max_tensor_rank 8",
+        logical_map("i8", &nine, 1, good_hash.as_bytes()),
+        "LimitExceeded",
+        limits,
+    )?;
+    write_tensor_logical_error(
+        dir,
+        "110_logical_count_exceeds_limit",
+        "100000 x 100000 exceeds max_tensor_elements",
+        logical_map("i8", &[100_000, 100_000], 1, good_hash.as_bytes()),
+        "LimitExceeded",
+        limits,
+    )?;
+
+    // Valid layout descriptors.
+    let layouts = [
+        (
+            "201_layout_row_major",
+            LayoutDescriptor::row_major(modes::TensorDtype::Bf16, &[2, 3, 4]),
+        ),
+        (
+            "202_layout_column_major",
+            LayoutDescriptor::column_major(modes::TensorDtype::Bf16, &[2, 3, 4]),
+        ),
+        (
+            "203_layout_blocked",
+            LayoutDescriptor::blocked(modes::TensorDtype::Bf16, &[4, 3, 2], &[2, 2, 2]),
+        ),
+        (
+            "204_layout_sharded",
+            LayoutDescriptor::sharded(modes::TensorDtype::Bf16, &[4, 3, 2], 0, 4, 2),
+        ),
+    ];
+    for (name, descriptor) in layouts {
+        let canonical = descriptor.canonical_bytes_with_limits(limits)?;
+        let mut vector = json!({
+            "name": name,
+            "kind": "layout",
+            "dtype": descriptor.dtype.as_str(),
+            "shape": descriptor.shape,
+            "layout": descriptor.layout.name(),
+            "canonical_hex": hexs(&canonical),
+        });
+        if let TensorLayout::Blocked { block_shape } = &descriptor.layout {
+            vector["block_shape"] = json!(block_shape);
+        }
+        if let TensorLayout::Sharded {
+            axis,
+            shards,
+            index,
+        } = &descriptor.layout
+        {
+            vector["axis"] = json!(axis);
+            vector["shards"] = json!(shards);
+            vector["index"] = json!(index);
+        }
+        write_json(&dir.join(format!("{name}.json")), &vector)?;
+    }
+
+    // Layout rejects.
+    write_tensor_layout_error(
+        dir,
+        "301_layout_unknown_layout",
+        "unknown layout names are UnsupportedFeature",
+        layout_map_value("bf16", &[4, 3, 2], "tiled", &[]),
+        "UnsupportedFeature",
+        limits,
+    )?;
+    write_tensor_layout_error(
+        dir,
+        "302_sharded_not_divisible",
+        "shape[axis] must be divisible by shards",
+        layout_map_value(
+            "bf16",
+            &[2, 3, 4],
+            "sharded",
+            &[
+                ("axis", Value::U64(0)),
+                ("shards", Value::U64(3)),
+                ("index", Value::U64(0)),
+            ],
+        ),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_layout_error(
+        dir,
+        "303_shard_index_out_of_range",
+        "index must be below shards",
+        layout_map_value(
+            "bf16",
+            &[4, 3, 2],
+            "sharded",
+            &[
+                ("axis", Value::U64(0)),
+                ("shards", Value::U64(4)),
+                ("index", Value::U64(4)),
+            ],
+        ),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_layout_error(
+        dir,
+        "304_sharded_zero_shards",
+        "shards must be at least 1",
+        layout_map_value(
+            "bf16",
+            &[4, 3, 2],
+            "sharded",
+            &[
+                ("axis", Value::U64(0)),
+                ("shards", Value::U64(0)),
+                ("index", Value::U64(0)),
+            ],
+        ),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_layout_error(
+        dir,
+        "305_blocked_rank_mismatch",
+        "block_shape rank must equal shape rank",
+        layout_map_value(
+            "bf16",
+            &[4, 3, 2],
+            "blocked",
+            &[("block_shape", shape_value(&[2, 2]))],
+        ),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_layout_error(
+        dir,
+        "306_blocked_zero_block",
+        "block_shape dimensions must be >= 1",
+        layout_map_value(
+            "bf16",
+            &[4, 3, 2],
+            "blocked",
+            &[("block_shape", shape_value(&[2, 2, 0]))],
+        ),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_layout_error(
+        dir,
+        "307_column_major_rank_zero",
+        "column-major cannot express a rank-0 shape",
+        layout_map_value("bf16", &[], "column-major", &[]),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_layout_error(
+        dir,
+        "308_layout_extra_field",
+        "row-major must not carry a shard field",
+        layout_map_value("bf16", &[4, 3, 2], "row-major", &[("axis", Value::U64(0))]),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_layout_error(
+        dir,
+        "309_shard_axis_out_of_range",
+        "axis must be below rank",
+        layout_map_value(
+            "bf16",
+            &[4, 3, 2],
+            "sharded",
+            &[
+                ("axis", Value::U64(3)),
+                ("shards", Value::U64(1)),
+                ("index", Value::U64(0)),
+            ],
+        ),
+        "NonCanonical",
+        limits,
+    )?;
+    write_tensor_layout_error(
+        dir,
+        "310_layout_shape_overflow",
+        "layout shape product overflows u64",
+        layout_map_value(
+            "bf16",
+            &[4_294_967_296, 4_294_967_296, 4_294_967_296],
+            "row-major",
+            &[],
+        ),
+        "LimitExceeded",
+        limits,
+    )?;
+
+    // Shard reassembly vectors, including byte-identical containers.
+    let shard_cases: [(&str, modes::TensorDtype, &[u64], u32, u32, u64); 2] = [
+        (
+            "401_shards_bf16_4x3x2_axis0",
+            modes::TensorDtype::Bf16,
+            &[4, 3, 2],
+            0,
+            4,
+            0x2001,
+        ),
+        (
+            "402_shards_f32_4x3x2_axis1",
+            modes::TensorDtype::F32,
+            &[4, 3, 2],
+            1,
+            3,
+            0x2002,
+        ),
+    ];
+    for (name, dtype, shape, axis, shard_count, seed) in shard_cases {
+        let count = tensor::validate_shape(shape, limits)?;
+        let len = usize::try_from(tensor::payload_len(count, dtype)?)
+            .map_err(|_| Error::limit_exceeded("vector payload does not fit usize"))?;
+        let values = pattern(len, seed);
+        let shards = tensor::split_shards(dtype, shape, axis, shard_count, &values, limits)?;
+        let mut shard_hex = Vec::with_capacity(shards.len());
+        let mut descriptor_hex = Vec::with_capacity(shards.len());
+        let mut container_hex = Vec::with_capacity(shards.len());
+        let mut decoded = Vec::with_capacity(shards.len());
+        for (index, payload) in shards.iter().enumerate() {
+            let descriptor =
+                LayoutDescriptor::sharded(dtype, shape, axis, shard_count, index as u32);
+            let container = tensor::encode_shard(&descriptor, payload, limits)?;
+            let parsed = tensor::decode_shard(&container, limits)?;
+            shard_hex.push(hexs(payload));
+            descriptor_hex.push(hexs(&descriptor.canonical_bytes_with_limits(limits)?));
+            container_hex.push(hexs(&container));
+            decoded.push(parsed);
+        }
+        let root = tensor::shard_root(&decoded, limits)?;
+        let expected = tensor::logical_root(dtype, shape, &values, limits)?;
+        if root != expected {
+            return Err(Error::io(format!(
+                "{name}: shard root differs from logical root"
+            )));
+        }
+        let vector = json!({
+            "name": name,
+            "kind": "shards",
+            "dtype": dtype.as_str(),
+            "shape": shape,
+            "axis": axis,
+            "shards": shard_count,
+            "element_count": count,
+            "values_hex": hexs(&values),
+            "values_hash": tensor::values_hash(&values).to_hex(),
+            "logical_root": root.to_hex(),
+            "shard_hex": shard_hex,
+            "shard_descriptor_hex": descriptor_hex,
+            "shard_container_hex": container_hex,
+        });
+        write_json(&dir.join(format!("{name}.json")), &vector)?;
+    }
 
     Ok(())
 }

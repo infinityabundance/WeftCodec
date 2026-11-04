@@ -20,6 +20,7 @@ use weftcodec::hash::hash_domain;
 use weftcodec::limits::{self, Limits};
 use weftcodec::modes;
 use weftcodec::selector;
+use weftcodec::tensor;
 use weftcodec::wcb;
 
 #[derive(Parser, Debug)]
@@ -62,6 +63,11 @@ enum Command {
     Causal {
         #[command(subcommand)]
         command: CausalCommand,
+    },
+    /// Logical tensor identity, sharding, and region addressing.
+    Tensor {
+        #[command(subcommand)]
+        command: TensorCommand,
     },
     /// Conformance vector generation (maintainer tool).
     Conformance(ConformanceArgs),
@@ -336,6 +342,100 @@ enum CausalCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum TensorCommand {
+    /// Print the layout-independent logical root of a tensor.
+    Root(TensorRootArgs),
+    /// Split canonical row-major bytes into N shard containers.
+    Split(TensorSplitArgs),
+    /// Reassemble shard containers and verify the logical root.
+    Reassemble(TensorReassembleArgs),
+}
+
+#[derive(Args, Debug)]
+struct TensorRootArgs {
+    /// Physical tensor file (canonical row-major unless --layout says otherwise).
+    #[arg(long)]
+    input: Option<String>,
+    /// Directory of self-describing shard containers named `shard-<index>.bin`.
+    #[arg(long)]
+    shards_dir: Option<String>,
+    /// Tensor dtype (`f16|bf16|f32|f64|i8|u8|i16|i32|i64`).
+    #[arg(long)]
+    dtype: String,
+    /// Comma-separated u64 extents.
+    #[arg(long)]
+    shape: String,
+    /// Physical layout: row-major, column-major, blocked, or sharded.
+    #[arg(long, default_value = "row-major")]
+    layout: String,
+    /// Comma-separated block extents (required for blocked).
+    #[arg(long)]
+    block_shape: Option<String>,
+    /// Shard axis (required with --shards-dir).
+    #[arg(long)]
+    axis: Option<u32>,
+    /// Shard count (required with --shards-dir).
+    #[arg(long)]
+    shards: Option<u32>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct TensorSplitArgs {
+    /// Canonical row-major tensor file.
+    #[arg(long)]
+    input: String,
+    /// Tensor dtype.
+    #[arg(long)]
+    dtype: String,
+    /// Comma-separated u64 extents.
+    #[arg(long)]
+    shape: String,
+    /// Axis to shard along.
+    #[arg(long)]
+    axis: u32,
+    /// Number of shards.
+    #[arg(long)]
+    shards: u32,
+    /// Output directory for `shard-<index>.bin` containers.
+    #[arg(long)]
+    out_dir: String,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct TensorReassembleArgs {
+    /// Directory of `shard-<index>.bin` containers.
+    #[arg(long)]
+    shards_dir: String,
+    /// Tensor dtype.
+    #[arg(long)]
+    dtype: String,
+    /// Comma-separated u64 extents.
+    #[arg(long)]
+    shape: String,
+    /// Axis the tensor was sharded along.
+    #[arg(long)]
+    axis: u32,
+    /// Number of shards.
+    #[arg(long)]
+    shards: u32,
+    /// Write the reassembled canonical row-major bytes here.
+    #[arg(long)]
+    output: Option<String>,
+    /// Fail unless the logical root equals this hex digest.
+    #[arg(long)]
+    expect_root: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Args, Debug)]
 struct ConformanceArgs {
     /// Directory to write vectors into (e.g. conformance/v1).
@@ -344,6 +444,9 @@ struct ConformanceArgs {
     /// Write only the adversarial decoder-bomb vectors into `<dir>/adversarial`.
     #[arg(long)]
     adversarial: bool,
+    /// Write only the WEFT-TENSOR vectors into `<dir>/tensor`.
+    #[arg(long)]
+    tensor_only: bool,
 }
 
 fn main() -> ExitCode {
@@ -388,11 +491,19 @@ fn run(cli: Cli) -> Result<()> {
         Command::Causal { command } => match command {
             CausalCommand::Id { parents, json } => causal_id(&parents, json),
         },
+        Command::Tensor { command } => match command {
+            TensorCommand::Root(args) => tensor_root(&args),
+            TensorCommand::Split(args) => tensor_split(&args),
+            TensorCommand::Reassemble(args) => tensor_reassemble(&args),
+        },
         Command::Conformance(args) => {
             let limits = Limits::default();
             if args.adversarial {
                 weftcodec::adversarial::generate(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote adversarial vectors to {}/adversarial", args.dir);
+            } else if args.tensor_only {
+                weftcodec::conformance::generate_tensor_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote tensor vectors to {}/tensor", args.dir);
             } else {
                 weftcodec::conformance::generate_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote conformance vectors to {}", args.dir);
@@ -1078,6 +1189,244 @@ fn resolver_for(deps: Option<&str>) -> Box<dyn Resolver> {
         Some(dir) => Box::new(DirectoryResolver::new(dir)),
         None => Box::new(MapResolver::new()),
     }
+}
+
+fn parse_extents(text: &str, what: &str) -> Result<Vec<u64>> {
+    let mut out = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(Error::parse(format!("{what} contains an empty extent")));
+        }
+        out.push(
+            part.parse::<u64>()
+                .map_err(|err| Error::parse(format!("bad {what} extent `{part}`: {err}")))?,
+        );
+    }
+    Ok(out)
+}
+
+fn tensor_record(
+    dtype: tensor::TensorDtype,
+    shape: &[u64],
+    row_major: &[u8],
+    limits: &Limits,
+) -> Result<(tensor::LogicalRecord, weftcodec::Hash32)> {
+    let record = tensor::LogicalRecord::from_row_major(dtype, shape, row_major, limits)?;
+    let root = record.root_with_limits(limits)?;
+    Ok((record, root))
+}
+
+fn tensor_root(args: &TensorRootArgs) -> Result<()> {
+    let limits = Limits::default();
+    let dtype = tensor::dtype_from_name(&args.dtype)?;
+    let shape = parse_extents(&args.shape, "shape")?;
+
+    let (row_major, layout_name) = if let Some(dir) = &args.shards_dir {
+        let axis = args
+            .axis
+            .ok_or_else(|| Error::parse("--shards-dir requires --axis"))?;
+        let shards = args
+            .shards
+            .ok_or_else(|| Error::parse("--shards-dir requires --shards"))?;
+        let mut decoded = Vec::new();
+        for index in 0..shards {
+            let path = Path::new(dir).join(format!("shard-{index}.bin"));
+            let path = path
+                .to_str()
+                .ok_or_else(|| Error::parse("shard path is not valid UTF-8"))?;
+            let bytes = read_limited(path, limits.max_decoded_bytes)?;
+            let shard = tensor::decode_shard(&bytes, &limits)?;
+            let expected = tensor::LayoutDescriptor::sharded(dtype, &shape, axis, shards, index);
+            if shard.descriptor != expected {
+                return Err(Error::malformed(format!(
+                    "shard {index} descriptor does not match --dtype/--shape/--axis/--shards"
+                )));
+            }
+            decoded.push(shard);
+        }
+        let assembled = tensor::assemble_shards(&decoded, &limits)?;
+        (assembled, "sharded".to_owned())
+    } else {
+        let input = args
+            .input
+            .as_deref()
+            .ok_or_else(|| Error::parse("tensor root requires --input or --shards-dir"))?;
+        let data = read_limited(input, limits.max_decoded_bytes)?;
+        match args.layout.as_str() {
+            "row-major" => (data, "row-major".to_owned()),
+            "column-major" => {
+                let physical = tensor::PhysicalTensor::column_major(dtype, &shape, data, &limits)?;
+                (
+                    physical.assemble_with_limits(&limits)?,
+                    "column-major".to_owned(),
+                )
+            }
+            "blocked" => {
+                let block_shape = parse_extents(
+                    args.block_shape
+                        .as_deref()
+                        .ok_or_else(|| Error::parse("blocked layout requires --block-shape"))?,
+                    "block shape",
+                )?;
+                let blocks =
+                    tensor::split_blocked_payload(dtype, &shape, &block_shape, &data, &limits)?;
+                let physical =
+                    tensor::PhysicalTensor::blocked(dtype, &shape, &block_shape, blocks, &limits)?;
+                (
+                    physical.assemble_with_limits(&limits)?,
+                    "blocked".to_owned(),
+                )
+            }
+            "sharded" => {
+                return Err(Error::parse(
+                    "sharded layouts must be read with --shards-dir",
+                ))
+            }
+            other => {
+                return Err(Error::unsupported_feature(format!(
+                    "unknown tensor layout `{other}`"
+                )))
+            }
+        }
+    };
+
+    let (record, root) = tensor_record(dtype, &shape, &row_major, &limits)?;
+    if args.json {
+        let output = json!({
+            "schema": tensor::LOGICAL_SCHEMA,
+            "dtype": dtype.as_str(),
+            "shape": shape,
+            "layout": layout_name,
+            "element_count": record.element_count,
+            "values_hash": record.values_hash.to_hex(),
+            "logical_root": root.to_hex(),
+            "canonical_hex": hex::encode(record.canonical_bytes_with_limits(&limits)?),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output)
+                .map_err(|e| Error::io(format!("cannot serialize tensor root: {e}")))?
+        );
+    } else {
+        println!("{root}");
+    }
+    Ok(())
+}
+
+fn tensor_split(args: &TensorSplitArgs) -> Result<()> {
+    let limits = Limits::default();
+    let dtype = tensor::dtype_from_name(&args.dtype)?;
+    let shape = parse_extents(&args.shape, "shape")?;
+    let data = read_limited(&args.input, limits.max_decoded_bytes)?;
+    let shards = tensor::split_shards(dtype, &shape, args.axis, args.shards, &data, &limits)?;
+    fs::create_dir_all(&args.out_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", args.out_dir)))?;
+    let mut entries = Vec::with_capacity(shards.len());
+    for (index, payload) in shards.iter().enumerate() {
+        let descriptor =
+            tensor::LayoutDescriptor::sharded(dtype, &shape, args.axis, args.shards, index as u32);
+        let container = tensor::encode_shard(&descriptor, payload, &limits)?;
+        let path = Path::new(&args.out_dir).join(format!("shard-{index}.bin"));
+        fs::write(&path, &container)
+            .map_err(|e| Error::io(format!("cannot write {}: {e}", path.display())))?;
+        entries.push(json!({
+            "index": index,
+            "payload_bytes": payload.len(),
+            "payload_hash": tensor::shard_payload_hash(payload).to_hex(),
+            "container_bytes": container.len(),
+            "descriptor_hex": hex::encode(descriptor.canonical_bytes_with_limits(&limits)?),
+        }));
+    }
+    let (record, root) = tensor_record(dtype, &shape, &data, &limits)?;
+    if args.json {
+        let output = json!({
+            "schema": tensor::LOGICAL_SCHEMA,
+            "dtype": dtype.as_str(),
+            "shape": shape,
+            "axis": args.axis,
+            "shards": args.shards,
+            "element_count": record.element_count,
+            "values_hash": record.values_hash.to_hex(),
+            "logical_root": root.to_hex(),
+            "canonical_hex": hex::encode(record.canonical_bytes_with_limits(&limits)?),
+            "out_dir": args.out_dir,
+            "shard_files": entries,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output)
+                .map_err(|e| Error::io(format!("cannot serialize tensor split: {e}")))?
+        );
+    } else {
+        println!("{root}");
+    }
+    Ok(())
+}
+
+fn tensor_reassemble(args: &TensorReassembleArgs) -> Result<()> {
+    let limits = Limits::default();
+    let dtype = tensor::dtype_from_name(&args.dtype)?;
+    let shape = parse_extents(&args.shape, "shape")?;
+    let mut decoded = Vec::with_capacity(args.shards as usize);
+    for index in 0..args.shards {
+        let path = Path::new(&args.shards_dir).join(format!("shard-{index}.bin"));
+        let path = path
+            .to_str()
+            .ok_or_else(|| Error::parse("shard path is not valid UTF-8"))?;
+        let bytes = read_limited(path, limits.max_decoded_bytes)?;
+        let shard = tensor::decode_shard(&bytes, &limits)?;
+        let expected =
+            tensor::LayoutDescriptor::sharded(dtype, &shape, args.axis, args.shards, index);
+        if shard.descriptor != expected {
+            return Err(Error::malformed(format!(
+                "shard {index} descriptor does not match --dtype/--shape/--axis/--shards"
+            )));
+        }
+        decoded.push(shard);
+    }
+    let root = tensor::shard_root(&decoded, &limits)?;
+    let row_major = tensor::assemble_shards(&decoded, &limits)?;
+    let (record, recomputed) = tensor_record(dtype, &shape, &row_major, &limits)?;
+    if recomputed != root {
+        return Err(Error::corrupt(
+            "reassembled bytes do not reproduce the shard logical root",
+        ));
+    }
+    if let Some(expected) = &args.expect_root {
+        let expected = weftcodec::Hash32::from_hex(expected)
+            .map_err(|err| Error::parse(format!("--expect-root: {}", err.message())))?;
+        if expected != root {
+            return Err(Error::corrupt(format!(
+                "logical root {root} does not equal expected {expected}"
+            )));
+        }
+    }
+    if let Some(output) = &args.output {
+        write_output(output, &row_major)?;
+    }
+    if args.json {
+        let output = json!({
+            "schema": tensor::LOGICAL_SCHEMA,
+            "dtype": dtype.as_str(),
+            "shape": shape,
+            "axis": args.axis,
+            "shards": args.shards,
+            "element_count": record.element_count,
+            "values_hash": record.values_hash.to_hex(),
+            "logical_root": root.to_hex(),
+            "canonical_hex": hex::encode(record.canonical_bytes_with_limits(&limits)?),
+            "written": args.output,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output)
+                .map_err(|e| Error::io(format!("cannot serialize tensor reassembly: {e}")))?
+        );
+    } else {
+        println!("{root}");
+    }
+    Ok(())
 }
 
 fn read_limited(path: &str, max: u64) -> Result<Vec<u8>> {

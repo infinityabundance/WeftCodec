@@ -1,0 +1,7 @@
+{
+  "description": "unknown layout names are UnsupportedFeature",
+  "expect_error": "UnsupportedFeature",
+  "kind": "layout",
+  "name": "301_layout_unknown_layout",
+  "record_hex": "08040505647479706505046266313605057368617065070303040303030205066c61796f7574050574696c65640506736368656d610515776566742e74656e736f722e6c61796f75742e7631"
+}
