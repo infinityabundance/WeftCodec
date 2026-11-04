@@ -1,0 +1,67 @@
+# Canonical identity schema source (spec-as-code).
+#
+# This file is the single source of truth for the identity-layer wire strings,
+# domains, limits, and record field sets. Generated Rust and Go code carries a
+# copy of these values; `scripts/gen-types.sh --check` fails on drift. Editing a
+# generated file by hand is a defect.
+#
+# Grammar (line oriented, '#' starts a comment):
+#   family NAME
+#   schema KEY VALUE
+#   domain KEY VALUE
+#   const KEY VALUE
+#   limit KEY VALUE
+#   record KEY
+#   field RECORD KEY TYPE REQUIRED|OPTIONAL
+#
+# Field order is the logical/spec order, not the WCB wire order (WCB orders map
+# keys by encoded key bytes).
+
+family identity-v1
+
+schema context-root weft.context-root.v1
+schema causal weft.causal.v1
+schema capability weft.capability.v1
+
+domain context-root weft/context-root/v1
+domain causal weft/causal/v1
+domain capability weft/capability/v1
+domain selector weft/selector/v1
+
+const ordering-selector-then-object-id selector_then_object_id
+const default-resolver weft-resolver-v1
+const uri-prefix weft://
+
+limit max-namespace-bytes 128
+limit max-resolver-bytes 64
+limit max-causal-entries 4096
+limit max-capability-entries 4096
+
+record context-root
+field context-root namespace text required
+field context-root selector bytes required
+field context-root selector_id bytes32 required
+field context-root snapshot bytes32 required
+field context-root resolver text required
+field context-root causal bytes32_array required
+field context-root ordering text required
+field context-root capability_hash bytes32 optional
+field context-root budget budget optional
+
+record causal
+field causal parents bytes32_array required
+field causal closure bytes32_array required
+
+record capability
+field capability principal text required
+field capability namespaces text_array required
+field capability roots bytes32_array required
+field capability predicates text_array required
+field capability budget budget optional
+field capability expires_at i64 optional
+
+record budget
+field budget max_results u64 optional
+field budget max_bytes u64 optional
+field budget max_depth u64 optional
+field budget max_work u64 optional

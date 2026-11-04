@@ -75,6 +75,8 @@ pub enum Mode {
     Tensor = 6,
     /// Token-id sequence with WCB descriptor (WEFT-AI-CODEC §3).
     TokenSequence = 7,
+    /// Affine quantized tensor (i8/u8) with WCB descriptor (WEFT-AI-CODEC §4).
+    QuantizedTensor = 8,
 }
 
 impl Mode {
@@ -89,7 +91,8 @@ impl Mode {
             5 => Ok(Mode::Structured),
             6 => Ok(Mode::Tensor),
             7 => Ok(Mode::TokenSequence),
-            8..=127 => Err(Error::unsupported_mode(format!(
+            8 => Ok(Mode::QuantizedTensor),
+            9..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -114,6 +117,7 @@ impl Mode {
             Mode::Structured => "structured",
             Mode::Tensor => "tensor",
             Mode::TokenSequence => "tokens",
+            Mode::QuantizedTensor => "quantized_tensor",
         }
     }
 
@@ -128,6 +132,7 @@ impl Mode {
             "structured" => Ok(Mode::Structured),
             "tensor" => Ok(Mode::Tensor),
             "tokens" | "token_sequence" => Ok(Mode::TokenSequence),
+            "quantized" | "quantized_tensor" => Ok(Mode::QuantizedTensor),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -750,10 +755,10 @@ fn validate_mode_rules(
                 return Err(Error::malformed("DELTA must not be chunked"));
             }
         }
-        Mode::Tensor | Mode::TokenSequence => {
+        Mode::Tensor | Mode::TokenSequence | Mode::QuantizedTensor => {
             if header.domain != DOMAIN_PAYLOAD {
                 return Err(Error::malformed(
-                    "TENSOR/TOKEN_SEQUENCE frames must use the payload domain",
+                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR frames must use the payload domain",
                 ));
             }
             if dict_flag {
@@ -761,12 +766,12 @@ fn validate_mode_rules(
             }
             if header.dep_count != 0 {
                 return Err(Error::malformed(
-                    "TENSOR/TOKEN_SEQUENCE frames must not have dependencies in v1",
+                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR frames must not have dependencies in v1",
                 ));
             }
             if header.chunk_count != 0 {
                 return Err(Error::malformed(
-                    "TENSOR/TOKEN_SEQUENCE frames must not be chunked",
+                    "TENSOR/TOKEN_SEQUENCE/QUANTIZED_TENSOR frames must not be chunked",
                 ));
             }
             if header.body_len < 4 {

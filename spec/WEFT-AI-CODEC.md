@@ -1,12 +1,13 @@
 # WEFT-AI-CODEC v1.1.0 — AI-native codec modes
 
-**Status: PARTIALLY IMPLEMENTED.** Exactly two AI-native modes are normative
+**Status: PARTIALLY IMPLEMENTED.** Exactly three AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 
 | Value | Name | Status | Frozen vectors |
 |---:|---|---|---|
 | 6 | `TENSOR` | **implemented** | `100_tensor_f32_2x3`, `101_tensor_f16_scalar`, `102_tensor_u8_zero_element` + rejects |
 | 7 | `TOKEN_SEQUENCE` (CLI `tokens`) | **implemented** | `103_tokens_delta_boundaries`, `104_tokens_empty` + rejects |
+| 8 | `QUANTIZED_TENSOR` (CLI `quantized`) | **implemented** | `105_quantized_i8_2x3`, `106_quantized_u8_zero_element`, `107_quantized_i8_scalar` + rejects |
 
 Every other mode below is `specified, not implemented` and has **no allocated
 wire value**. Nothing in this document is a compression or performance claim.
@@ -233,7 +234,68 @@ canonical encoded payload bytes; token-id extraction is an API operation
 
 ---
 
-## 4. Specified, not implemented (no wire values)
+## 4. Mode 8 — `QUANTIZED_TENSOR` (implemented)
+
+### 4.1 Frame shape
+
+Identical to §2.1, with `mode = 8` and the descriptor/payload below.
+`decoded_len` is the packed element payload length and `content_hash` is
+`H("weft/chunk/v1", payload)`. No dependencies or chunks are permitted.
+
+### 4.2 Descriptor
+
+The WCB descriptor is a map with exactly these keys:
+
+| Key | WCB type | Value |
+|---|---|---|
+| `schema` | text | exactly `weft.quantized-tensor.v1` |
+| `dtype` | text | exactly `i8` or `u8` in v1 |
+| `shape` | array of u64 | logical extents, rank 0..=8 |
+| `layout` | text | exactly `row_major` in v1 |
+| `quantization` | text | exactly `affine-asymmetric-per-tensor` in v1 |
+| `scale_bits_le` | bytes(8) | the exact f64 IEEE-754 bit pattern, little-endian |
+| `zero_point` | i64 | affine zero point; must fit the dtype range |
+| `element_count` | u64 | product of `shape` (rank 0 ⇒ 1) |
+| `payload_bytes` | u64 | `element_count * 1` |
+| `payload_hash` | bytes(32) | `H("weft/quantized-tensor/payload/v1", payload)` |
+
+The payload is the packed `i8`/`u8` element bytes in row-major order. The codec
+never dequantizes, converts dtype, or interprets the affine parameters.
+`scale_bits_le` is carried as bytes so the f64 bit pattern is preserved exactly
+(including `-0.0` bits if they could occur); `scale` MUST be finite and > 0.
+`zero_point` MUST be in `-128..=127` for `i8` and `0..=255` for `u8`.
+
+### 4.3 Validation order
+
+1. Body split/`meta_len`/`decoded_len` consistency → `Malformed`.
+2. WCB canonical decode → `NonCanonical`, `Malformed`, or `LimitExceeded`.
+3. Descriptor key set, `schema` → `Malformed`.
+4. `dtype` not `i8`/`u8` → `Malformed`; `layout` or `quantization` not
+   implemented → `Malformed`.
+5. `scale_bits_le` length ≠ 8 or non-finite/non-positive scale → `Malformed`.
+6. `zero_point` type ≠ i64 or value outside the dtype range → `Malformed`.
+7. `shape` rank/product overflow or product > `max_tensor_elements` →
+   `LimitExceeded`.
+8. `element_count` ≠ shape product → `Malformed`.
+9. `payload_bytes` ≠ `element_count` (one-byte elements) → `Malformed`.
+10. `payload_bytes` ≠ actual payload length → `Malformed`.
+11. `payload_hash` length ≠ 32 → `Malformed`; value mismatch → `Corrupt`.
+
+### 4.4 CLI
+
+```
+weftcodec encode --mode quantized --input PAYLOAD --output FRAME \
+    --dtype i8 --shape 2,3 --scale 0.25 --zero-point -3
+```
+
+`--metadata META.json` accepts the same fields
+(`{"dtype":"i8","shape":[2,3],"scale":0.25,"zero_point":-3}`). `--scale` is
+required in flag mode. An omitted `--shape` is rank 0; `--zero-point` defaults
+to 0.
+
+---
+
+## 5. Specified, not implemented (no wire values)
 
 These designs have **no allocated mode value and no wire representation**.
 They are recorded so a future version cannot silently invent them by reusing a
@@ -244,7 +306,7 @@ reserved value or an existing descriptor field.
 | Tensor `column_major` layout | specified, not implemented | Do not infer from shape; reject the descriptor value |
 | Tensor `blocked` layout | specified, not implemented | No block extents/padding wire form |
 | Tensor `sharded` layout | specified, not implemented | No shard index/count/axis wire form; no assembly semantics |
-| Tensor `quantized` storage | specified, not implemented | No scale/zero-point/i4 nibble wire form; dequantization is out of codec scope |
+| Tensor `quantized` storage beyond affine per-tensor i8/u8 | specified, not implemented | i4 nibble packing, per-axis scales, and dequantization are out of codec scope |
 | Activation/gradient streams | specified, not implemented | No stream descriptor or element-hash list wire form |
 | Embedding / KV-cache pages | specified, not implemented | No layer/head/position wire form |
 | Vocabulary artifact binding | specified, not implemented | `vocab_schema` is a declaration only; no dependency hash field |
@@ -258,7 +320,7 @@ vectors, and the same cross-language gates.
 
 ---
 
-## 5. Limits (added by this document)
+## 6. Limits (added by this document)
 
 | Limit | Default | Applies to |
 |---|---:|---|
@@ -273,7 +335,7 @@ header rules reject them first).
 
 ---
 
-## 6. Acceptance tests (both implementations)
+## 7. Acceptance tests (both implementations)
 
 The committed suites and vectors cover:
 
@@ -291,8 +353,12 @@ The committed suites and vectors cover:
    unsupported encoding, hash mismatch, and count limit.
 7. **Resource limits**: rank, element count, token count, and payload limits
    fail closed with `LimitExceeded`.
-8. **Cross-language**: Rust→Go and Go→Rust decode equivalence plus
-   byte-identical frames for both modes (`WeftCodec-Go/hack/cross.sh`).
+8. **Quantized tensors**: i8 and u8 round-trips, scalar/zero-element shapes,
+   exact f64 scale bit preservation, dtype-range zero-point checks, non-finite/
+   non-positive scale rejection, payload/hash/length rejects, and checked shape
+   limits.
+9. **Cross-language**: Rust→Go and Go→Rust decode equivalence plus
+   byte-identical frames for all three modes (`WeftCodec-Go/hack/cross.sh`).
 
 Frozen vector names live in both codec repositories under
 `conformance/v1/codec/`. The Rust generator is
@@ -301,7 +367,7 @@ files without modification.
 
 ---
 
-## 7. Explicit non-goals and non-claims
+## 8. Explicit non-goals and non-claims
 
 - No training, inference, gradient computation, tokenization, dequantization,
   layout conversion, or model evaluation.

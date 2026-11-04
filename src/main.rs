@@ -79,7 +79,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -103,6 +103,12 @@ struct EncodeArgs {
     /// TENSOR metadata JSON file: `{"dtype":"f32","shape":[2,3]}`.
     #[arg(long)]
     metadata: Option<String>,
+    /// QUANTIZED_TENSOR affine scale (finite, > 0). Required for that mode.
+    #[arg(long)]
+    scale: Option<f64>,
+    /// QUANTIZED_TENSOR zero point (i64, within the dtype range).
+    #[arg(long = "zero-point", default_value_t = 0)]
+    zero_point: i64,
 }
 
 #[derive(serde::Deserialize)]
@@ -113,6 +119,10 @@ struct TensorMetaInput {
     layout: Option<String>,
     #[serde(default)]
     endianness: Option<String>,
+    #[serde(default)]
+    scale: Option<f64>,
+    #[serde(default)]
+    zero_point: Option<i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -407,6 +417,9 @@ fn encode(args: EncodeArgs) -> Result<()> {
     let frame = if args.mode == "tensor" {
         let (dtype, shape) = tensor_metadata_args(&args)?;
         modes::encode_tensor(&data, dtype, &shape, &limits)?
+    } else if args.mode == "quantized" || args.mode == "quantized_tensor" {
+        let (dtype, shape, scale, zero_point) = quantized_metadata_args(&args)?;
+        modes::encode_quantized_tensor(&data, dtype, &shape, scale, zero_point, &limits)?
     } else if args.mode == "tokens" {
         let input: TokensInput = serde_json::from_slice(&data).map_err(|err| {
             Error::malformed(format!(
@@ -474,6 +487,9 @@ fn encode_mode(
         Mode::TokenSequence => Err(Error::malformed(
             "TOKEN_SEQUENCE encoding requires a JSON token input",
         )),
+        Mode::QuantizedTensor => Err(Error::malformed(
+            "QUANTIZED_TENSOR encoding requires the dedicated CLI path with --dtype/--shape/--scale/--zero-point",
+        )),
     }
 }
 
@@ -525,6 +541,54 @@ fn tensor_metadata_args(args: &EncodeArgs) -> Result<(modes::TensorDtype, Vec<u6
             .collect::<Result<Vec<u64>>>()?,
     };
     Ok((dtype, shape))
+}
+
+/// Parse the QUANTIZED_TENSOR descriptor from `--metadata` or the scalar flags.
+fn quantized_metadata_args(args: &EncodeArgs) -> Result<(modes::TensorDtype, Vec<u64>, f64, i64)> {
+    if let Some(path) = &args.metadata {
+        if args.dtype.is_some() || args.shape.is_some() || args.scale.is_some() {
+            return Err(Error::malformed(
+                "--metadata cannot be combined with --dtype/--shape/--scale",
+            ));
+        }
+        let bytes = read_limited(path, Limits::default().max_string_bytes)?;
+        let input: TensorMetaInput = serde_json::from_slice(&bytes).map_err(|err| {
+            Error::malformed(format!(
+                "quantized tensor metadata must be JSON {{\"dtype\":string,\"shape\":[u64,...],\"scale\":number,\"zero_point\":integer}}: {err}"
+            ))
+        })?;
+        if let Some(layout) = input.layout {
+            if layout != "row_major" {
+                return Err(Error::malformed(format!(
+                    "quantized tensor layout `{layout}` is specified but not implemented in v1 (only row_major)"
+                )));
+            }
+        }
+        let scale = input.scale.ok_or_else(|| {
+            Error::malformed("quantized tensor metadata requires a `scale` number")
+        })?;
+        let dtype = modes::TensorDtype::from_name(&input.dtype)?;
+        return Ok((dtype, input.shape, scale, input.zero_point.unwrap_or(0)));
+    }
+    let dtype = args.dtype.as_deref().ok_or_else(|| {
+        Error::malformed("QUANTIZED_TENSOR encoding requires --dtype or --metadata")
+    })?;
+    let dtype = modes::TensorDtype::from_name(dtype)?;
+    let scale = args
+        .scale
+        .ok_or_else(|| Error::malformed("QUANTIZED_TENSOR encoding requires --scale"))?;
+    let shape = match args.shape.as_deref() {
+        None | Some("") => Vec::new(),
+        Some(text) => text
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<u64>()
+                    .map_err(|err| Error::malformed(format!("bad --shape extent `{part}`: {err}")))
+            })
+            .collect::<Result<Vec<u64>>>()?,
+    };
+    Ok((dtype, shape, scale, args.zero_point))
 }
 
 fn encode_auto(

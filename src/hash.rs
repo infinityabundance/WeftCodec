@@ -24,7 +24,12 @@ pub const DOMAIN_MANIFEST: &str = "weft/manifest/v1";
 /// Structured frame value.
 pub const DOMAIN_STRUCTURED: &str = "weft/structured/v1";
 /// Selector canonical expression.
-pub const DOMAIN_SELECTOR: &str = "weft/selector/v1";
+///
+/// The identity-layer domains are generated from
+/// `spec/schema/identity-v1.schema`; do not edit them here.
+pub use crate::generated::{
+    DOMAIN_CAPABILITY, DOMAIN_CAUSAL, DOMAIN_CONTEXT_ROOT, DOMAIN_SELECTOR,
+};
 /// Snapshot record.
 pub const DOMAIN_SNAPSHOT: &str = "weft/snapshot/v1";
 /// Commit record.
@@ -35,16 +40,12 @@ pub const DOMAIN_RELATION: &str = "weft/relation/v1";
 pub const DOMAIN_VERSION: &str = "weft/version/v1";
 /// Object identity seed.
 pub const DOMAIN_OBJECT: &str = "weft/object/v1";
-/// Context Root record (WEFT-CONTEXT-ROOT §1.2).
-pub const DOMAIN_CONTEXT_ROOT: &str = "weft/context-root/v1";
-/// Causal closure record (WEFT-CAUSAL §1.2).
-pub const DOMAIN_CAUSAL: &str = "weft/causal/v1";
-/// Capability scope record (WEFT-CAPABILITIES §1.1).
-pub const DOMAIN_CAPABILITY: &str = "weft/capability/v1";
 /// Tensor element payload binding (WEFT-AI-CODEC §2).
 pub const DOMAIN_TENSOR_PAYLOAD: &str = "weft/tensor/payload/v1";
 /// Token-sequence payload binding (WEFT-AI-CODEC §3).
 pub const DOMAIN_TOKENS_PAYLOAD: &str = "weft/tokens/payload/v1";
+/// Quantized-tensor payload binding (WEFT-AI-CODEC §4).
+pub const DOMAIN_QUANTIZED_TENSOR_PAYLOAD: &str = "weft/quantized-tensor/payload/v1";
 
 /// A 32-byte Weft digest.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

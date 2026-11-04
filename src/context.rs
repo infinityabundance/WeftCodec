@@ -23,22 +23,14 @@ use crate::limits::Limits;
 use crate::selector::{self, Selector};
 use crate::wcb::{self, Value};
 
-/// Context Root schema string.
-pub const CONTEXT_ROOT_SCHEMA: &str = "weft.context-root.v1";
-/// Causal closure schema string.
-pub const CAUSAL_SCHEMA: &str = "weft.causal.v1";
-/// Capability scope schema string.
-pub const CAPABILITY_SCHEMA: &str = "weft.capability.v1";
-/// The only ordering/tie-break policy in v1.
-pub const ORDERING_SELECTOR_THEN_OBJECT_ID: &str = "selector_then_object_id";
-/// Default resolver/policy version.
-pub const DEFAULT_RESOLVER: &str = "weft-resolver-v1";
-/// URI scheme prefix.
-pub const URI_PREFIX: &str = "weft://";
-/// Maximum namespace length in bytes.
-pub const MAX_NAMESPACE_BYTES: usize = 128;
-/// Maximum resolver text length in bytes.
-pub const MAX_RESOLVER_BYTES: usize = 64;
+// The schema strings, domains, policy names, and text limits below are
+// generated from `spec/schema/identity-v1.schema` (see `scripts/gen-types.sh`).
+// Editing these values by hand is a defect; the drift court compares the
+// canonical source against both generated files.
+pub use crate::generated::{
+    CAPABILITY_SCHEMA, CAUSAL_SCHEMA, CONTEXT_ROOT_SCHEMA, DEFAULT_RESOLVER, MAX_NAMESPACE_BYTES,
+    MAX_RESOLVER_BYTES, ORDERING_SELECTOR_THEN_OBJECT_ID, URI_PREFIX,
+};
 
 // ---------------------------------------------------------------------------
 // Budget

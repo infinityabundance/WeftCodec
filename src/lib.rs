@@ -27,6 +27,7 @@ pub mod context;
 pub mod dependency;
 pub mod error;
 pub mod frame;
+pub mod generated;
 pub mod hash;
 pub mod limits;
 pub mod modes;

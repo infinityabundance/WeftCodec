@@ -19,8 +19,8 @@ use crate::frame::{
     DOMAIN_PAYLOAD, DOMAIN_STRUCTURED, FORMAT_MAJOR, FORMAT_MINOR,
 };
 use crate::hash::{
-    hash_domain, Hash32, DOMAIN_CHUNK, DOMAIN_SELECTOR, DOMAIN_TENSOR_PAYLOAD,
-    DOMAIN_TOKENS_PAYLOAD,
+    hash_domain, Hash32, DOMAIN_CHUNK, DOMAIN_QUANTIZED_TENSOR_PAYLOAD, DOMAIN_SELECTOR,
+    DOMAIN_TENSOR_PAYLOAD, DOMAIN_TOKENS_PAYLOAD,
 };
 use crate::limits::Limits;
 use crate::modes;
@@ -207,6 +207,34 @@ fn tensor_meta_value(
         ),
         ("layout", Value::Str(layout.to_owned())),
         ("endianness", Value::Str(endianness.to_owned())),
+        ("element_count", Value::U64(count)),
+        ("payload_bytes", Value::U64(payload_bytes)),
+        ("payload_hash", Value::Bytes(payload_hash.to_vec())),
+    ])
+}
+
+fn quantized_meta_value(
+    dtype: &str,
+    shape: &[u64],
+    count: u64,
+    payload_bytes: u64,
+    payload_hash: &[u8],
+    layout: &str,
+    quantization: &str,
+    scale_bits: &[u8],
+    zero_point: i64,
+) -> Value {
+    Value::map([
+        ("schema", Value::Str("weft.quantized-tensor.v1".to_owned())),
+        ("dtype", Value::Str(dtype.to_owned())),
+        (
+            "shape",
+            Value::Array(shape.iter().map(|d| Value::U64(*d)).collect()),
+        ),
+        ("layout", Value::Str(layout.to_owned())),
+        ("quantization", Value::Str(quantization.to_owned())),
+        ("scale_bits_le", Value::Bytes(scale_bits.to_vec())),
+        ("zero_point", Value::I64(zero_point)),
         ("element_count", Value::U64(count)),
         ("payload_bytes", Value::U64(payload_bytes)),
         ("payload_hash", Value::Bytes(payload_hash.to_vec())),
@@ -424,11 +452,11 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     );
 
     let mut unknown_mode = good.clone();
-    unknown_mode[7] = 8;
+    unknown_mode[7] = 9;
     refix_header_and_trailer(&mut unknown_mode);
     push_error(
         &mut vectors,
-        &name("unknown_mode_reserved8"),
+        &name("unknown_mode_reserved9"),
         "raw",
         &unknown_mode,
         &[],
@@ -958,6 +986,228 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     )?;
     let frame = modes::encode_token_sequence(&[], "weft.test.vocab.v1", limits)?;
     push_ok(&mut vectors, "104_tokens_empty", &frame, b"", &[])?;
+
+    // --- QUANTIZED_TENSOR (mode 8) -----------------------------------------
+    let quant_payload = vec![0x00u8, 0x7f, 0x80, 0xff, 0x01, 0xfe];
+    let frame = modes::encode_quantized_tensor(
+        &quant_payload,
+        modes::TensorDtype::I8,
+        &[2, 3],
+        0.25,
+        -3,
+        limits,
+    )?;
+    push_ok(
+        &mut vectors,
+        "105_quantized_i8_2x3",
+        &frame,
+        &quant_payload,
+        &[],
+    )?;
+    let frame =
+        modes::encode_quantized_tensor(b"", modes::TensorDtype::U8, &[0, 4], 1.0, 128, limits)?;
+    push_ok(
+        &mut vectors,
+        "106_quantized_u8_zero_element",
+        &frame,
+        b"",
+        &[],
+    )?;
+    let scalar = vec![0x80u8];
+    let frame =
+        modes::encode_quantized_tensor(&scalar, modes::TensorDtype::I8, &[], 0.1, 0, limits)?;
+    push_ok(
+        &mut vectors,
+        "107_quantized_i8_scalar",
+        &frame,
+        &scalar,
+        &[],
+    )?;
+
+    let q_hash = hash_domain(DOMAIN_QUANTIZED_TENSOR_PAYLOAD, &quant_payload);
+    let scale_bits = 0.25f64.to_bits().to_le_bytes();
+    let q_layout = "row_major";
+    let q_quant = modes::QUANTIZED_TENSOR_QUANTIZATION;
+
+    let meta = quantized_meta_value(
+        "f32",
+        &[2, 3],
+        6,
+        6,
+        q_hash.as_bytes(),
+        q_layout,
+        q_quant,
+        &scale_bits,
+        -3,
+    );
+    let frame = ai_frame(Mode::QuantizedTensor, &meta, &quant_payload, limits)?;
+    push_error(
+        &mut vectors,
+        &name("quantized_dtype_f32"),
+        "quantized_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let nan_bits = f64::NAN.to_bits().to_le_bytes();
+    let meta = quantized_meta_value(
+        "i8",
+        &[2, 3],
+        6,
+        6,
+        q_hash.as_bytes(),
+        q_layout,
+        q_quant,
+        &nan_bits,
+        -3,
+    );
+    let frame = ai_frame(Mode::QuantizedTensor, &meta, &quant_payload, limits)?;
+    push_error(
+        &mut vectors,
+        &name("quantized_scale_nan"),
+        "quantized_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let meta = quantized_meta_value(
+        "i8",
+        &[2, 3],
+        6,
+        6,
+        q_hash.as_bytes(),
+        q_layout,
+        q_quant,
+        &scale_bits,
+        200,
+    );
+    let frame = ai_frame(Mode::QuantizedTensor, &meta, &quant_payload, limits)?;
+    push_error(
+        &mut vectors,
+        &name("quantized_zero_point_out_of_range"),
+        "quantized_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let meta = quantized_meta_value(
+        "i8",
+        &[2, 3],
+        6,
+        7,
+        q_hash.as_bytes(),
+        q_layout,
+        q_quant,
+        &scale_bits,
+        -3,
+    );
+    let frame = ai_frame(Mode::QuantizedTensor, &meta, &quant_payload, limits)?;
+    push_error(
+        &mut vectors,
+        &name("quantized_payload_bytes_mismatch"),
+        "quantized_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let meta = quantized_meta_value(
+        "i8",
+        &[2, 3],
+        6,
+        6,
+        &[0u8; 32],
+        q_layout,
+        q_quant,
+        &scale_bits,
+        -3,
+    );
+    let frame = ai_frame(Mode::QuantizedTensor, &meta, &quant_payload, limits)?;
+    push_error(
+        &mut vectors,
+        &name("quantized_payload_hash_mismatch"),
+        "quantized_tensor",
+        &frame,
+        &[],
+        ErrorClass::Corrupt,
+        None,
+    );
+
+    let meta = quantized_meta_value(
+        "i8",
+        &[2, 3],
+        6,
+        6,
+        q_hash.as_bytes(),
+        q_layout,
+        q_quant,
+        &scale_bits[..4],
+        -3,
+    );
+    let frame = ai_frame(Mode::QuantizedTensor, &meta, &quant_payload, limits)?;
+    push_error(
+        &mut vectors,
+        &name("quantized_scale_bytes_len"),
+        "quantized_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let meta = quantized_meta_value(
+        "i8",
+        &[2, 3],
+        6,
+        6,
+        q_hash.as_bytes(),
+        "column_major",
+        q_quant,
+        &scale_bits,
+        -3,
+    );
+    let frame = ai_frame(Mode::QuantizedTensor, &meta, &quant_payload, limits)?;
+    push_error(
+        &mut vectors,
+        &name("quantized_layout_not_implemented"),
+        "quantized_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
+
+    let mut wrong_zp = quantized_meta_value(
+        "i8",
+        &[2, 3],
+        6,
+        6,
+        q_hash.as_bytes(),
+        q_layout,
+        q_quant,
+        &scale_bits,
+        -3,
+    );
+    if let Value::Map(map) = &mut wrong_zp {
+        map.insert("zero_point".to_owned(), Value::U64(0));
+    }
+    let frame = ai_frame(Mode::QuantizedTensor, &wrong_zp, &quant_payload, limits)?;
+    push_error(
+        &mut vectors,
+        &name("quantized_zero_point_not_i64"),
+        "quantized_tensor",
+        &frame,
+        &[],
+        ErrorClass::Malformed,
+        None,
+    );
 
     for vector in &vectors {
         let file_name = format!("{}.json", vector["name"].as_str().unwrap_or("vector"));

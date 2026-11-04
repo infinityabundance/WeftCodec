@@ -13,7 +13,10 @@ use crate::frame::{
     encode_frame, ChunkEntry, Dependency, Frame, FrameParts, Mode, DEP_DOMAIN_DICTIONARY,
     DEP_DOMAIN_PAYLOAD, DOMAIN_PAYLOAD, DOMAIN_STRUCTURED, FORMAT_MAJOR, FORMAT_MINOR,
 };
-use crate::hash::{hash_domain, DOMAIN_CHUNK, DOMAIN_TENSOR_PAYLOAD, DOMAIN_TOKENS_PAYLOAD};
+use crate::hash::{
+    hash_domain, DOMAIN_CHUNK, DOMAIN_QUANTIZED_TENSOR_PAYLOAD, DOMAIN_TENSOR_PAYLOAD,
+    DOMAIN_TOKENS_PAYLOAD,
+};
 use crate::limits::{check_len, Limits};
 use crate::varint;
 use crate::wcb::{self, Value};
@@ -214,6 +217,7 @@ pub fn decode_bytes(
         }
         Mode::Tensor => decode_tensor(&frame, limits)?,
         Mode::TokenSequence => decode_token_sequence(&frame, limits)?,
+        Mode::QuantizedTensor => decode_quantized_tensor(&frame, limits)?,
     };
 
     if plaintext.len() as u64 != frame.header.decoded_len {
@@ -702,8 +706,24 @@ impl TensorDtype {
     }
 }
 
+/// Quantized tensor descriptor recovering the exact affine parameters.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuantizedTensorMeta {
+    pub dtype: TensorDtype,
+    pub shape: Vec<u64>,
+    pub element_count: u64,
+    pub payload_bytes: u64,
+    pub scale: f64,
+    pub zero_point: i64,
+}
+
 /// Token payload wire encoding implemented in v1.
 pub const TOKEN_ENCODING: &str = "u64-zigzag-delta-leb128";
+
+/// Canonical quantized-tensor schema.
+pub const QUANTIZED_TENSOR_SCHEMA: &str = "weft.quantized-tensor.v1";
+/// The only affine quantization layout implemented in v1.
+pub const QUANTIZED_TENSOR_QUANTIZATION: &str = "affine-asymmetric-per-tensor";
 
 /// Tensor descriptor recovered from a frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -760,6 +780,13 @@ fn meta_u64(map: &BTreeMap<String, Value>, key: &str) -> Result<u64> {
     match map.get(key) {
         Some(Value::U64(value)) => Ok(*value),
         _ => Err(Error::malformed(format!("metadata `{key}` must be u64"))),
+    }
+}
+
+fn meta_i64(map: &BTreeMap<String, Value>, key: &str) -> Result<i64> {
+    match map.get(key) {
+        Some(Value::I64(value)) => Ok(*value),
+        _ => Err(Error::malformed(format!("metadata `{key}` must be i64"))),
     }
 }
 
@@ -1002,6 +1029,238 @@ fn parse_tensor_body<'a>(frame: &'a Frame<'_>, limits: &Limits) -> Result<(Tenso
             shape,
             element_count: declared_count,
             payload_bytes: declared_bytes,
+        },
+        payload,
+    ))
+}
+
+/// Encode an affine-quantized tensor (WEFT-AI-CODEC §4).
+///
+/// The payload is the packed `i8`/`u8` element bytes in row-major order. The
+/// descriptor carries the exact f64 scale bit pattern and the i64 zero point;
+/// no dequantization or dtype conversion happens here.
+pub fn encode_quantized_tensor(
+    payload: &[u8],
+    dtype: TensorDtype,
+    shape: &[u64],
+    scale: f64,
+    zero_point: i64,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    if !matches!(dtype, TensorDtype::I8 | TensorDtype::U8) {
+        return Err(Error::malformed(format!(
+            "quantized tensor dtype `{}` is not implemented (v1 allows i8, u8)",
+            dtype.as_str()
+        )));
+    }
+    check_len(
+        payload.len() as u64,
+        limits.max_decoded_bytes,
+        "quantized tensor payload",
+    )?;
+    validate_quantized_scale(scale)?;
+    validate_zero_point(dtype, zero_point)?;
+    let element_count = tensor_product(shape, limits)?;
+    if element_count != payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "quantized tensor payload is {} bytes but shape {} has {element_count} elements",
+            payload.len(),
+            dtype.as_str()
+        )));
+    }
+
+    let meta = Value::map([
+        ("schema", Value::Str(QUANTIZED_TENSOR_SCHEMA.to_owned())),
+        ("dtype", Value::Str(dtype.as_str().to_owned())),
+        (
+            "shape",
+            Value::Array(shape.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        ("layout", Value::Str("row_major".to_owned())),
+        (
+            "quantization",
+            Value::Str(QUANTIZED_TENSOR_QUANTIZATION.to_owned()),
+        ),
+        (
+            "scale_bits_le",
+            Value::Bytes(scale.to_bits().to_le_bytes().to_vec()),
+        ),
+        ("zero_point", Value::I64(zero_point)),
+        ("element_count", Value::U64(element_count)),
+        ("payload_bytes", Value::U64(element_count)),
+        (
+            "payload_hash",
+            Value::Bytes(
+                hash_domain(DOMAIN_QUANTIZED_TENSOR_PAYLOAD, payload)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ),
+    ]);
+    let body = build_ai_body(&meta, payload, limits)?;
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::QuantizedTensor,
+        flags: 0,
+        level: 0,
+        decoded_len: payload.len() as u64,
+        content_hash: hash_domain(DOMAIN_CHUNK, payload),
+        dependencies: &[],
+        chunks: &[],
+        body: &body,
+    };
+    encode_frame(&parts, limits)
+}
+
+/// Validate and decode a QUANTIZED_TENSOR frame, returning the exact packed
+/// element payload.
+pub fn decode_quantized_tensor(frame: &Frame<'_>, limits: &Limits) -> Result<Vec<u8>> {
+    let (_, payload) = parse_quantized_tensor_body(frame, limits)?;
+    Ok(payload.to_vec())
+}
+
+/// Parse and validate a QUANTIZED_TENSOR descriptor, returning it with the
+/// payload slice.
+pub fn quantized_tensor_metadata(
+    frame: &Frame<'_>,
+    limits: &Limits,
+) -> Result<QuantizedTensorMeta> {
+    let (meta, _) = parse_quantized_tensor_body(frame, limits)?;
+    Ok(meta)
+}
+
+fn validate_quantized_scale(scale: f64) -> Result<()> {
+    if !scale.is_finite() {
+        return Err(Error::malformed(
+            "quantized tensor scale must be finite (no NaN or infinity)",
+        ));
+    }
+    if scale <= 0.0 {
+        return Err(Error::malformed(
+            "quantized tensor scale must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_zero_point(dtype: TensorDtype, zero_point: i64) -> Result<()> {
+    let (min, max) = match dtype {
+        TensorDtype::I8 => (i8::MIN as i64, i8::MAX as i64),
+        TensorDtype::U8 => (0, u8::MAX as i64),
+        _ => return Err(Error::malformed("quantized tensor dtype must be i8 or u8")),
+    };
+    if zero_point < min || zero_point > max {
+        return Err(Error::malformed(format!(
+            "quantized tensor zero_point {zero_point} is outside {} range {min}..={max}",
+            dtype.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn parse_quantized_tensor_body<'a>(
+    frame: &'a Frame<'_>,
+    limits: &Limits,
+) -> Result<(QuantizedTensorMeta, &'a [u8])> {
+    let (descriptor_bytes, payload) = split_ai_body(frame.body, frame.header.decoded_len)?;
+    let value = wcb::decode(descriptor_bytes, limits)?;
+    let map = ai_map(&value, "quantized tensor")?;
+    check_exact_keys(
+        map,
+        &[
+            "schema",
+            "dtype",
+            "shape",
+            "layout",
+            "quantization",
+            "scale_bits_le",
+            "zero_point",
+            "element_count",
+            "payload_bytes",
+            "payload_hash",
+        ],
+        "quantized tensor",
+    )?;
+    let schema = meta_text(map, "schema")?;
+    if schema != QUANTIZED_TENSOR_SCHEMA {
+        return Err(Error::malformed(format!(
+            "unsupported quantized tensor schema `{schema}`"
+        )));
+    }
+    let dtype = TensorDtype::from_name(meta_text(map, "dtype")?)?;
+    if !matches!(dtype, TensorDtype::I8 | TensorDtype::U8) {
+        return Err(Error::malformed(format!(
+            "quantized tensor dtype `{}` is specified but not implemented in v1 (only i8, u8)",
+            dtype.as_str()
+        )));
+    }
+    let layout = meta_text(map, "layout")?;
+    if layout != "row_major" {
+        return Err(Error::malformed(format!(
+            "quantized tensor layout `{layout}` is specified but not implemented in v1 (only row_major)"
+        )));
+    }
+    let quantization = meta_text(map, "quantization")?;
+    if quantization != QUANTIZED_TENSOR_QUANTIZATION {
+        return Err(Error::malformed(format!(
+            "quantized tensor quantization `{quantization}` is specified but not implemented in v1"
+        )));
+    }
+    let scale_bits = meta_bytes(map, "scale_bits_le")?;
+    if scale_bits.len() != 8 {
+        return Err(Error::malformed(format!(
+            "quantized tensor scale_bits_le must be 8 bytes, got {}",
+            scale_bits.len()
+        )));
+    }
+    let scale =
+        f64::from_bits(u64::from_le_bytes(scale_bits.try_into().map_err(|_| {
+            Error::malformed("quantized tensor scale_bits_le is not 8 bytes")
+        })?));
+    validate_quantized_scale(scale)?;
+    let zero_point = meta_i64(map, "zero_point")?;
+    validate_zero_point(dtype, zero_point)?;
+    let shape = meta_shape(map)?;
+    let declared_count = meta_u64(map, "element_count")?;
+    let declared_bytes = meta_u64(map, "payload_bytes")?;
+    let expected_count = tensor_product(&shape, limits)?;
+    if declared_count != expected_count {
+        return Err(Error::malformed(format!(
+            "quantized tensor element_count {declared_count} does not match shape product {expected_count}"
+        )));
+    }
+    if declared_bytes != declared_count {
+        return Err(Error::malformed(format!(
+            "quantized tensor payload_bytes {declared_bytes} does not match element_count {declared_count} for one-byte elements"
+        )));
+    }
+    if declared_bytes != payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "quantized tensor payload is {} bytes but metadata declares {declared_bytes}",
+            payload.len()
+        )));
+    }
+    let declared_hash = meta_bytes(map, "payload_hash")?;
+    if declared_hash.len() != 32 {
+        return Err(Error::malformed(format!(
+            "quantized tensor payload_hash must be 32 bytes, got {}",
+            declared_hash.len()
+        )));
+    }
+    let actual_hash = hash_domain(DOMAIN_QUANTIZED_TENSOR_PAYLOAD, payload);
+    if declared_hash != actual_hash.as_bytes().as_slice() {
+        return Err(Error::corrupt("quantized tensor payload_hash mismatch"));
+    }
+    Ok((
+        QuantizedTensorMeta {
+            dtype,
+            shape,
+            element_count: declared_count,
+            payload_bytes: declared_bytes,
+            scale,
+            zero_point,
         },
         payload,
     ))
