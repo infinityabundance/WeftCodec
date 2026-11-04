@@ -82,6 +82,23 @@ whose referenced object files all exist. Otherwise it falls back to the
 previous valid generation and reports the loss boundary. It never "repairs" by
 inventing data.
 
+Recovery MAY use a **bounded** replay window: start at the selected head
+generation, read `commits/<generation>.commit` downward, and stop at the newest
+commit whose `checkpoint` verifies (declared `generation` equal to the commit's
+generation, manifest hash and length valid). In that mode the implementation
+need not enumerate commit files below the checkpoint, because the checkpoint
+state is content-addressed, hash-verified, and pinned to that generation. The
+recovered state is therefore exact for the head.
+
+Bounded replay MUST be reported: an implementation that stops at a checkpoint
+MUST surface a recovery note naming the checkpoint generation and stating that
+older commit files were not enumerated. Any inconsistency found while walking
+the window (missing file, generation/name disagreement, hash or parent
+mismatch, truncated record, unverifiable or mislabelled checkpoint) MUST fall
+back to the full enumeration path, which is authoritative for its rejected set
+and notes. `verify --full` MUST enumerate every commit file and report gaps in
+older history that bounded open did not observe.
+
 ### 2.2 Commit record
 
 Canonical WCB map:
@@ -141,6 +158,42 @@ experimental profile, not v1 persistence). The manifest is:
 Manifest identity is the manifest hash; whole-content identity is
 `H("weft/chunk/v1", plaintext)` and MUST be verified after assembly. Empty files
 have zero chunks and content hash of the empty byte string.
+
+### 2.3.1 Representation manifests (experimental, opt-in)
+
+A store MAY persist a file through a **representation manifest**, schema
+`"weft.manifest.v2"` (one spelling, no alias), which has the v1 fields plus a
+canonical WCB `representation` map:
+
+```
+{
+  "kind": "raw" | "codec",
+  "frame": bytes32 | null,        # WFT1 frame blob for codec
+  "dependencies": [bytes32, ...], # base content roots (manifest ids)
+  "strategy": "raw" | "zstd" | "delta" | "reference",
+  "decoded_size": u64            # MUST equal size
+}
+```
+
+Rules:
+
+- A v1 manifest MUST NOT contain `representation`; a v2 manifest MUST.
+  `kind:"raw"` is a v2 manifest whose `chunks` are the physical layout.
+  `kind:"codec"` stores bytes only inside the named frame and has no chunks.
+- `strategy` MUST equal the decoded frame's payload mode; a mismatch is
+  `Corrupt`. The frame is validated with the codec's own limits.
+- `dependencies` are content roots (manifest ids). Decoding a dependent MUST
+  fail closed if a dependency is missing, unreadable, or cyclic; dependency
+  depth MUST be bounded (default 8). No approximate or partial reconstruction
+  is permitted.
+- `content_hash` remains the frozen whole-content digest
+  `H("weft/chunk/v1", plaintext)` and MUST verify over the decoded bytes.
+- Retention MUST follow dependencies: a GC that keeps a dependent MUST keep
+  its transitive dependency closure, or refuse the deletion.
+- Writers MUST select this representation explicitly. Absent that selection,
+  the v1 chunked manifest is written and remains byte-identical.
+- v2 is **experimental**; an implementation that does not understand it MUST
+  reject the store/manifest (`UnsupportedVersion`) rather than guess.
 
 ### 2.3.1 Derived identities
 
@@ -246,11 +299,16 @@ a reader MUST validate the named commit by replay. Names are UTF-8 without
 ## 3. Operations and state transitions
 
 - `create(parent, name, bytes)`: allocate ObjectId, write chunks, put_object,
-  put_entry, set_tip, commit.
-- `write(path, offset, bytes)`: read current content, apply bounded splice in
-  memory (v1 bound: 256 MiB per file for random writes; larger writes must be
-  streaming append or truncate), create a new VersionId, update content root,
-  commit. Old versions remain readable through snapshots.
+  put_entry, set_tip, commit. Implementations SHOULD also provide a streaming
+  form that reads the source in bounded memory and commits once.
+- `write(path, offset, bytes)`: read the current manifest, materialise only the
+  intersecting chunks, store new chunks for changed regions, reuse unchanged
+  chunk references verbatim, create a new VersionId, update content root,
+  commit. Old versions remain readable through snapshots. The defensive file
+  bound is 1 TiB; the effective bound for a chunked file is also the manifest
+  decode limit (`max_array_items` chunks), which at the default 64 KiB chunk
+  size is far below 1 TiB. Implementations MUST fail with `LimitExceeded`
+  rather than truncate.
 - `truncate`, `unlink` (delete entry; object remains while referenced by a
   snapshot or open handle), `rename` (delete + insert entry atomically in one
   commit), `link`, `mkdir`, `rmdir`, `symlink`, `setattr`, `xattr`.

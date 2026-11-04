@@ -141,7 +141,24 @@ return one item from a truncated ambiguous set.
 
 `max_work` is implementation-defined but MUST be deterministic for a given
 resolver version. Implementations MUST document their work unit; v1 uses
-"authorized objects inspected plus relation edges traversed plus bytes hashed".
+"authorized objects inspected plus visible relation edges traversed plus bytes
+hashed".
+
+Work accounting MUST be computed over the **authorized universe only**:
+objects the principal may read, and relation edges whose subject and (for
+object targets) target the principal may read. Unauthorized objects and edges
+MUST NOT contribute to the count, whether or not the selector mentions
+relations. Therefore, two stores with identical authorized views and different
+unauthorized contents MUST report the same work units and the same budget
+outcome for the same selector and principal.
+
+A budget denial MUST be non-disclosing: it MUST NOT include the computed work
+count, the configured bound, or any object/relation identifier. v1 emits the
+fixed messages `resolver work budget exceeded` and `traversal depth exceeds
+max_depth`. The precise value MAY be logged privately. Authorization (namespace,
+root, predicate, and namespace-root readability) MUST be decided before work
+accounting so that a budget failure cannot distinguish an unauthorized store
+from an empty one.
 
 ---
 
@@ -175,7 +192,8 @@ store MAY log the precise class privately.
    non-disclosure applies), and truncation flags MUST be computed over the
    authorized set only.
 2. Denial MUST NOT reveal the existence, size, type, mtime, or hash of an
-   unauthorized object.
+   unauthorized object, nor the number of unauthorized objects or relations
+   (directly, through work accounting, or through budget failures).
 3. A capability hash MUST NOT be usable to enumerate namespaces, roots, or
    predicates. Probing a hash returns at most "valid/revoked/expired" if the
    caller is already authorized to learn that.
@@ -204,9 +222,14 @@ store MAY log the precise class privately.
 - **Not an OS sandbox.** FUSE/kernel permissions still apply. Capabilities add
   restrictions; they do not replace the kernel's.
 - **Not constant-time.** See §6.6.
-- **Not implemented end-to-end yet.** F1 implements the record, strict
-  canonicalization, identity, and CLI. Enforcement points 2–7 are **specified,
-  not implemented** until F2/F3. No test claims otherwise.
+- **Not per-object visibility in the kernel.** FUSE applies the mount's
+  capability context and `default_permissions`; v1 does not claim a
+  per-inode capability protocol.
+- **Not deployment-tested at scale.** Enforcement points 2–7 are implemented
+  and exercised by `tests/context.rs`, `tests/capability_nondisclosure.rs`, and
+  the FUSE context-mount court. The adversarial two-store non-disclosure court
+  covers authorized-universe work accounting; it is not a proof against timing
+  channels (§6.6).
 
 ---
 
