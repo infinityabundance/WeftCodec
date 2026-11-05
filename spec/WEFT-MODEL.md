@@ -195,6 +195,77 @@ Rules:
 - v2 is **experimental**; an implementation that does not understand it MUST
   reject the store/manifest (`UnsupportedVersion`) rather than guess.
 
+#### Tensor representations (additive within v2)
+
+A v2 manifest MAY use `kind:"tensor"` to name a WeftTensor frame as the
+physical representation. `kind:"raw"` and `kind:"codec"` are unchanged; the
+tensor key set is exactly:
+
+```
+{
+  "kind": "tensor",
+  "frame": bytes32,               # WFT1 frame blob id, never null
+  "tensor_mode": 10|11|12|13|14,  # u32 carried as WCB u64
+  "dtype": text,                  # WEFT-TENSOR dtype, or q8_0/q4_0
+  "shape": [u64, ...],            # logical extents
+  "logical_root": bytes32,        # WEFT-TENSOR LogicalTensorRoot
+  "layout": map,                  # canonical weft.tensor.layout.v1
+  "dependencies": [bytes32, ...], # base content roots for 11 and 14
+  "decoded_size": u64,            # logical element bytes; MUST equal size
+  "strategy": text                # mode name (below)
+}
+```
+
+The `strategy` text is fixed by `tensor_mode`: `10 = "tensor-sharded"`,
+`11 = "weight-delta"`, `12 = "kv-cache"`, `13 = "activation"`,
+`14 = "semantic-delta"`. A mismatch is `Malformed`; a frame whose actual mode
+disagrees with `tensor_mode` is `Corrupt` on read. No other mode is legal, and
+no planner bookkeeping field may be added to this map.
+
+Rules:
+
+- `frame` MUST be a manifest-domain blob; the reader verifies its blob id and
+the frame's own checksum, mode, and descriptor.
+- `dtype` and `shape` MUST agree with the frame descriptor. The logical bytes
+are the canonical row-major element bytes implied by `(dtype, shape)`; for
+`q8_0` the bytes are one sign-extended byte per logical element and the root is
+the additive quantized root of `WEFT-AI-CODEC.md` §11.5. `decoded_size` MUST
+equal the manifest `size` and the decoded logical byte length.
+- `layout` MUST be the canonical `weft.tensor.layout.v1` map from
+`WEFT-TENSOR.md` §4, with `dtype`/`shape` equal to the manifest fields. The
+store canonicalises the caller's physical arrangement to row-major before
+writing, so the same tensor written row-major, column-major, blocked, or as a
+single shard has the same `logical_root` (`WEFT-TENSOR.md` §3).
+- `dependencies` follows the frozen v2 content-root rule. Modes 11 and 14 have
+exactly one dependency: the base representation's content root. The base frame
+is reconstructed deterministically as a self-contained mode-6 `TENSOR` frame
+over the base's canonical element bytes; its content hash MUST equal the delta
+descriptor's `base`. No extra base-frame blob is stored. Modes 10, 12, and 13
+have no dependencies. Missing, unreadable, cyclic, or mismatched dependencies
+fail closed with `Corrupt`; depth is bounded by the codec dependency bound.
+- `content_hash` remains the frozen whole-content digest over the decoded
+logical bytes and MUST verify on a full read. `verify --full` decodes every
+tensor representation, recomputes `logical_root`, and checks dtype/shape,
+frames, and dependencies.
+- Retention follows dependencies, exactly as for `kind:"codec"`: a live tensor
+dependent keeps its base's transitive closure and frame blobs.
+- **B1 choice:** one object per tensor with exactly one frame. A multi-shard
+tensor is therefore not a single bulk object; a `sharded` write with
+`shards > 1` is rejected with `InvalidArgument` rather than silently
+truncated. Modes 12 and 13 are readable but are not produced by the B1 writer
+(they require workload metadata outside the tensor contract).
+- A tensor written through `kind:"raw"` or `kind:"codec"` (the planner may
+choose either) records the same identity in reserved object attributes:
+`weft.tensor.dtype`, `weft.tensor.shape`, `weft.tensor.logical_root`,
+`weft.tensor.layout` (canonical WCB bytes), and `weft.tensor.strategy`. These
+are ordinary additive attributes, not manifest fields.
+- `q8_0` is only stored through mode 10 because its additive identity binds the
+mode-10 scale plane; `q4_0` store support is not implemented in B1.
+- **The planner is not part of the format.** The cost function
+`physical_bytes + lambda_ns * estimated_decode_ns` and the chosen/runner-up
+prices are exposed by `weft plan --json` and `Store::plan_tensor` only. The
+manifest records exactly the chosen representation, never a cost table.
+
 ### 2.3.1 Derived identities
 
 ```
@@ -350,6 +421,92 @@ loss.
 Replay is idempotent: a generation is applied at most once, selected by the
 superblock. Torn commit files fail CRC or hash and are ignored; a torn
 superblock slot fails CRC and the other slot is used.
+
+### 4.1 Storage backend contract
+
+The store addresses durable artifacts through typed keys and performs all
+physical I/O through a storage backend. The on-disk logical layout in §2 and the
+commit protocol above are unchanged; a backend supplies the publication and
+`fsync` primitives. The Rust reference implementation defines:
+
+```
+trait StorageBackend {
+    fn read(&self, key, offset, len) -> Result<Vec<u8>>;
+    fn read_all(&self, key) -> Result<Vec<u8>>;
+    fn write_at(&mut self, key, offset, bytes) -> Result<()>;   // superblock slots
+    fn put_atomic(&mut self, key, bytes) -> Result<()>;         // all-or-nothing
+    fn create_zeroed(&mut self, key, len) -> Result<()>;
+    fn delete(&mut self, key) -> Result<()>;
+    fn list_prefix(&self, prefix) -> Result<Vec<Key>>;
+    fn sync(&mut self, key) -> Result<()>;
+    fn sync_dir(&mut self, key) -> Result<()>;
+    // plus len, exists, modified, layout, writer lock, staging cleanup
+}
+```
+
+A backend declares `Capabilities { atomic_publish, durable_fsync,
+  true_range_reads, max_object_bytes, consistency, publication }`.
+
+Required guarantees:
+
+- `atomic_publish` — a `put_atomic` write becomes visible all-or-nothing under
+  its final key. Every content blob, manifest, commit record, index segment,
+  and snapshot pointer is published this way after its bytes are durable.
+- `durable_fsync` — `sync`, `put_atomic`, and `write_at` return only after the
+  data is stable. The commit protocol depends on this for the commit file and
+  the superblock slot.
+- `true_range_reads` — `read(offset, len)` reads only the requested range. If
+  false, a backend may still be used, but range reads materialise whole
+  objects; this is a performance property, not a durability guarantee, and the
+  store never claims otherwise.
+- `max_object_bytes` — a hard per-object bound. Blobs and pages above it are
+  `LimitExceeded`, never silently split or truncated.
+
+Publication primitive. `LocalBackend` is the normative POSIX namespace:
+temporary file, `fsync`, `rename(2)`, parent `fsync`. `ObjectBackend` maps keys
+to an immutable object namespace (`objects/<2-hex>/<name>`) and publishes with
+temporary file, `fsync`, `link(2)`, unlink of the temporary name, parent
+`fsync`. The final name appears only after the inode is complete, so it does not
+rely on POSIX rename replacement. If `link(2)` is unavailable, the backend
+falls back to `rename(2)` and states that in `Capabilities::publication` and in
+its diagnostics; it never claims a link-published run.
+
+Commit protocol mapping. The sequence in §4 maps one-to-one onto backend calls:
+
+1. content and checkpoint blobs: `put_atomic` per blob;
+2. commit record: `put_atomic` of `commits/<generation>.commit`, then its
+   directory fsync;
+3. superblock: `write_at` the inactive 4096-byte slot, then `sync`;
+4. store root: `sync_dir`.
+
+A crash between any two steps leaves either the previous whole generation or
+the new whole generation. `put_atomic` supplies the property `create_new` plus
+rename supplies on the local backend: an existing key with different bytes is
+an error, and identical bytes are a no-op.
+
+Fail-closed capability enforcement. The store consults capabilities rather than
+assuming them:
+
+- a writable open or initialization requires `durable_fsync` and refuses with
+  `UnsupportedVersion` if it is absent;
+- every publication requires `atomic_publish` and refuses rather than
+  degrading to a non-atomic write;
+- a read-only open may use a backend that declares weaker write guarantees,
+  because it performs no publication.
+
+Backend selection is explicit (`Store::init_with_backend`,
+`Store::open_with_backend`, `Options`-equivalent CLI `--backend local|object`).
+The default is `LocalBackend`, so every existing fixture and handoff is
+unchanged.
+
+Network and distributed filesystems. A POSIX-namespace target (for example 3FS)
+can be addressed through the local backend because it exposes files, `rename`,
+and `fsync`. That path is **not exercised by this repository**: no 3FS instance
+is available in the courts. A caller that configures a POSIX target must declare
+its real capabilities with `BackendKind::Posix { capabilities }`. If the target
+cannot honour `fsync` or atomic publication, the store refuses writable mode;
+before any production use its consistency and durability claims must be
+measured, not inferred from the API shape.
 
 ---
 
