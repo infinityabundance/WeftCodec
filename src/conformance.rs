@@ -13,6 +13,7 @@ use std::path::Path;
 use serde_json::{json, Value as Json};
 
 use crate::activation_stream;
+use crate::capability::{self, CapabilityEnvelope};
 use crate::context::{self, Budget, CausalClosure, ContextRoot, DEFAULT_RESOLVER};
 use crate::error::{Error, ErrorClass, Result};
 use crate::frame::{
@@ -51,6 +52,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let semantic_delta_dir = dir.join("semantic-delta");
     let kv_cache_dir = dir.join("kv-cache");
     let activation_stream_dir = dir.join("activation-stream");
+    let capability_dir = dir.join("capability");
     for sub in [
         &codec_dir,
         &structured_dir,
@@ -64,6 +66,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
         &semantic_delta_dir,
         &kv_cache_dir,
         &activation_stream_dir,
+        &capability_dir,
     ] {
         fs::create_dir_all(sub)
             .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
@@ -81,7 +84,17 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_semantic_delta_vectors(&semantic_delta_dir, limits)?;
     write_kv_cache_vectors(&kv_cache_dir, limits)?;
     write_activation_stream_vectors(&activation_stream_dir, limits)?;
+    write_capability_vectors(&capability_dir, limits)?;
     Ok(())
+}
+
+/// Generate only the authenticated capability-envelope vectors into
+/// `<dir>/capability`.
+pub fn generate_capability_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let capability_dir = dir.join("capability");
+    fs::create_dir_all(&capability_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", capability_dir.display())))?;
+    write_capability_vectors(&capability_dir, limits)
 }
 
 /// Generate only the additive WEFT-TENSOR vectors into `<dir>/tensor`.
@@ -4698,6 +4711,197 @@ fn write_semantic_delta_vectors(dir: &Path, limits: &Limits) -> Result<()> {
         ErrorClass::Malformed,
         "declared payload_len is one byte larger than the stored payload",
         false,
+    )?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated capability envelopes (WEFT-CAPABILITIES §9)
+// ---------------------------------------------------------------------------
+
+fn capability_seed() -> [u8; 32] {
+    [0x07u8; 32]
+}
+
+fn capability_envelope(minimal: bool) -> Result<CapabilityEnvelope> {
+    let seed = capability_seed();
+    let grantor = capability::public_key_for_seed(&seed)?;
+    let grantee = Hash32::from_bytes([0x42u8; 32]);
+    let revocation = Hash32::from_bytes([0x33u8; 32]);
+    let nonce = Hash32::from_bytes([0x44u8; 32]);
+    let roots = if minimal {
+        Vec::new()
+    } else {
+        vec![
+            Hash32::from_bytes([0x11u8; 32]),
+            Hash32::from_bytes([0x22u8; 32]),
+        ]
+    };
+    let budget = if minimal {
+        None
+    } else {
+        Some(Budget {
+            max_results: Some(10),
+            max_bytes: Some(4096),
+            max_depth: Some(2),
+            max_work: Some(100),
+        })
+    };
+    CapabilityEnvelope::new(
+        grantor,
+        grantee,
+        if minimal {
+            "conformance-minimal"
+        } else {
+            "conformance-tenant"
+        },
+        roots,
+        vec!["default".to_owned()],
+        vec!["derived_from".to_owned()],
+        if minimal {
+            None
+        } else {
+            Some(2_000_000_000_000_000_000)
+        },
+        budget,
+        revocation,
+        1_700_000_000_000_000_000,
+        nonce,
+    )
+}
+
+fn write_capability_valid(dir: &Path, name: &str, description: &str, minimal: bool) -> Result<()> {
+    let envelope = capability_envelope(minimal)?;
+    let canonical = envelope.canonical_bytes()?;
+    let envelope_id = envelope.id()?;
+    let sign_input = envelope.sign_input()?;
+    let blob = capability::sign_envelope(&envelope, &capability_seed())?;
+    let blob_bytes = blob.encode()?;
+    let vector = json!({
+        "name": name,
+        "description": description,
+        "schema": capability::ENVELOPE_SCHEMA,
+        "envelope_json": envelope.to_json(),
+        "canonical_hex": hexs(&canonical),
+        "envelope_id": envelope_id.to_hex(),
+        "sign_input": sign_input.to_hex(),
+        "blob_id": blob.id()?.to_hex(),
+        "blob_hex": hexs(&blob_bytes),
+        "seed_hex": hexs(&capability_seed()),
+        "grantee": envelope.grantee.to_hex(),
+        "now_ns": 1_700_000_000_000_000_001i64,
+        "expect": { "ok": true },
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_capability_reject(
+    dir: &Path,
+    name: &str,
+    description: &str,
+    blob: &[u8],
+    now_ns: i64,
+    grantee: Option<&str>,
+    revocations: &[&str],
+    expect_error: &str,
+) -> Result<()> {
+    let mut vector = json!({
+        "name": name,
+        "description": description,
+        "blob_hex": hexs(blob),
+        "now_ns": now_ns,
+        "expect_error": expect_error,
+    });
+    if let Some(grantee) = grantee {
+        vector["grantee"] = json!(grantee);
+    }
+    if !revocations.is_empty() {
+        vector["revocations"] = json!(revocations);
+    }
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_capability_vectors(dir: &Path, _limits: &Limits) -> Result<()> {
+    write_capability_valid(
+        dir,
+        "001_valid_envelope",
+        "Canonical signed envelope with roots, namespaces, predicates, budget, expiry, and revocation id.",
+        false,
+    )?;
+    write_capability_valid(
+        dir,
+        "002_valid_minimal_envelope",
+        "Canonical signed envelope with no roots, budget, or expiry (null fields are canonical).",
+        true,
+    )?;
+
+    let envelope = capability_envelope(false)?;
+    let blob = capability::sign_envelope(&envelope, &capability_seed())?;
+    let blob_bytes = blob.encode()?;
+    let other_grantee = Hash32::from_bytes([0xAAu8; 32]).to_hex();
+    let revocation = envelope.revocation_id.to_hex();
+
+    let mut bad_signature = blob_bytes.clone();
+    let last = bad_signature
+        .last_mut()
+        .ok_or_else(|| Error::malformed("empty capability blob"))?;
+    *last ^= 0xFF;
+    write_capability_reject(
+        dir,
+        "101_bad_signature",
+        "A well-formed blob whose Ed25519 signature was flipped at the last byte.",
+        &bad_signature,
+        1_700_000_000_000_000_001,
+        None,
+        &[],
+        "BadSignature",
+    )?;
+
+    write_capability_reject(
+        dir,
+        "102_wrong_grantee",
+        "A valid blob presented for a different grantee.",
+        &blob_bytes,
+        1_700_000_000_000_000_001,
+        Some(&other_grantee),
+        &[],
+        "WrongGrantee",
+    )?;
+
+    write_capability_reject(
+        dir,
+        "103_expired",
+        "A valid blob verified after its inclusive expiry.",
+        &blob_bytes,
+        2_000_000_000_000_000_001,
+        None,
+        &[],
+        "Expired",
+    )?;
+
+    write_capability_reject(
+        dir,
+        "104_revoked",
+        "A valid blob whose revocation id is present in the caller-supplied set.",
+        &blob_bytes,
+        1_700_000_000_000_000_001,
+        None,
+        &[revocation.as_str()],
+        "Revoked",
+    )?;
+
+    let mut non_canonical = blob_bytes.clone();
+    non_canonical.push(0);
+    write_capability_reject(
+        dir,
+        "105_non_canonical",
+        "A well-formed blob with one trailing zero byte; canonical re-encoding must fail.",
+        &non_canonical,
+        1_700_000_000_000_000_001,
+        None,
+        &[],
+        "NonCanonical",
     )?;
 
     Ok(())

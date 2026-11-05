@@ -591,6 +591,10 @@ struct ConformanceArgs {
     /// `<dir>/activation-stream`.
     #[arg(long)]
     activation_stream_only: bool,
+    /// Write only the authenticated capability-envelope vectors into
+    /// `<dir>/capability`.
+    #[arg(long)]
+    capability_only: bool,
 }
 
 fn main() -> ExitCode {
@@ -695,6 +699,9 @@ fn run(cli: Cli) -> Result<()> {
                     "wrote activation-stream vectors to {}/activation-stream",
                     args.dir
                 );
+            } else if args.capability_only {
+                weftcodec::conformance::generate_capability_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote capability vectors to {}/capability", args.dir);
             } else {
                 weftcodec::conformance::generate_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote conformance vectors to {}", args.dir);
@@ -2341,6 +2348,7 @@ fn capability_id(envelope_path: &str, json: bool) -> Result<()> {
                 "schema": capability::ENVELOPE_SCHEMA,
                 "envelope_id": id.to_hex(),
                 "sign_input": sign_input.to_hex(),
+                "canonical_hex": hex::encode(envelope.canonical_bytes()?),
                 "tenant": envelope.tenant,
                 "grantor": envelope.grantor.to_hex(),
                 "grantee": envelope.grantee.to_hex(),

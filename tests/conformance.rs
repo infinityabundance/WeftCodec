@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
+use weftcodec::capability::{self, CapabilityEnvelope};
 use weftcodec::dependency::MapResolver;
 use weftcodec::hash::hash_domain;
 use weftcodec::hash::DOMAIN_CHUNK;
@@ -11,6 +12,7 @@ use weftcodec::limits::Limits;
 use weftcodec::modes;
 use weftcodec::selector;
 use weftcodec::wcb;
+use weftcodec::Hash32;
 
 fn v1_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/v1")
@@ -221,6 +223,80 @@ fn vectors_are_not_empty_and_cover_modes() {
         assert!(
             errors_seen.contains(class),
             "missing error class vector: {class}"
+        );
+    }
+}
+
+#[test]
+fn capability_vectors() {
+    let dir = v1_dir().join("capability");
+    let files = json_files(&dir);
+    assert!(
+        files.len() >= 6,
+        "expected the authenticated capability vector set"
+    );
+    for path in files {
+        let vector = load(&path);
+        let name = vector["name"].as_str().unwrap_or("?");
+        let blob = hex_field(&vector, "blob_hex");
+        let now_ns = vector["now_ns"].as_i64().unwrap_or(1_700_000_000_000_000_001);
+        let grantee = vector["grantee"]
+            .as_str()
+            .map(|text| Hash32::from_hex(text).expect("grantee hex"));
+        let mut revocations = Vec::new();
+        if let Some(items) = vector["revocations"].as_array() {
+            for item in items {
+                revocations.push(
+                    Hash32::from_hex(item.as_str().expect("revocation hex"))
+                        .expect("revocation hex"),
+                );
+            }
+        }
+
+        if let Some(expected) = vector["expect_error"].as_str() {
+            let error = capability::verify_envelope(&blob, &revocations, now_ns, grantee)
+                .expect_err(&format!("{name} must be rejected"));
+            assert_eq!(error.rejection().as_str(), expected, "{name}: {error}");
+            continue;
+        }
+
+        let envelope_json = vector["envelope_json"].to_string();
+        let envelope = CapabilityEnvelope::from_json_str(&envelope_json)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let canonical = envelope.canonical_bytes().expect("canonical bytes");
+        assert_eq!(
+            hex::encode(&canonical),
+            vector["canonical_hex"].as_str().unwrap(),
+            "{name} canonical bytes"
+        );
+        assert_eq!(
+            envelope.id().expect("envelope id").to_hex(),
+            vector["envelope_id"].as_str().unwrap(),
+            "{name} envelope id"
+        );
+        assert_eq!(
+            envelope.sign_input().expect("sign input").to_hex(),
+            vector["sign_input"].as_str().unwrap(),
+            "{name} sign input"
+        );
+
+        let verified = capability::verify_envelope(&blob, &[], now_ns, None)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            verified.envelope_id.to_hex(),
+            vector["envelope_id"].as_str().unwrap(),
+            "{name} verified envelope id"
+        );
+        assert_eq!(
+            verified.blob_id.to_hex(),
+            vector["blob_id"].as_str().unwrap(),
+            "{name} blob id"
+        );
+        let stored = capability::CapabilityBlob::decode(&blob).expect("blob decode");
+        assert_eq!(
+            hex::encode(stored.encode().expect("blob encode")),
+            vector["blob_hex"].as_str().unwrap(),
+            "{name} canonical blob bytes"
         );
     }
 }
