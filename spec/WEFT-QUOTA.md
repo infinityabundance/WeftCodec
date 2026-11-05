@@ -1,8 +1,10 @@
 # WEFT-QUOTA v1 — write budgets and branching time travel
 
-Status: **normative for the store-level quota record and the branch/merge
-surface, both languages.** It does not change any frozen v1 content, commit,
-manifest, or commit-chain byte.
+Status: **normative for the store-level quota accounting and policy record and
+the branch/merge surface, both languages.** It does not change any frozen v1
+content, manifest, checkpoint, or commit-record schema; quota-enabled commits
+carry one additive `set_quota_usage` op (WEFT-MODEL §2.2). Existing commits
+without that op replay unchanged.
 
 ## 1. Write budgets (quotas)
 
@@ -59,59 +61,98 @@ Denial text is **non-disclosing**: it names neither the current usage, nor the
 limit, nor the principal, nor any other principal's data. `quota show` returns
 only the caller's own counters and own limits.
 
-### 1.3 Persisted record
+### 1.3 Committed usage (`set_quota_usage`)
 
-Key `quota` at the store root. Bytes:
-
-```
-WFQ1 || u64le(len) || WCB || BLAKE3("weft/quota/v1", WCB)
-```
-
-WCB map (`weftfs.quota.v1`):
+Usage is committed state. When a policy is configured, every commit appends
+one `set_quota_usage` op as its **last** op:
 
 ```
 {
-  "schema": "weftfs.quota.v1",
-  "generation": u64,                # committed head this record describes
-  "commit": bytes32,                # committed head hash
-  "budgets": [ principal_fields..., "max_new_bytes": u64, "max_objects": u64 ],
-  "usage":   [ principal_fields..., "used_bytes": u64,   "used_objects": u64 ]
+  "op": "set_quota_usage",
+  "reset": bool,
+  "usage": [
+    { "kind":"posix",  "uid": u64, "gid": u64, "used_bytes": u64, "used_objects": u64 },
+    { "kind":"tenant", "tenant": text,        "used_bytes": u64, "used_objects": u64 }
+  ]
 }
-principal_fields = { "kind":"posix", "uid":u64, "gid":u64 }
-                 | { "kind":"tenant", "tenant":text }
 ```
 
-Arrays are sorted by principal key and contain no duplicates:
+- `reset == false`: the array is the cumulative admitted usage **after** every
+  other op in the same commit. It is sorted by principal key and contains no
+  duplicates.
+- `reset == true`: the explicit admin reset. It MUST be the only op in its
+  commit and MUST declare an empty array. It establishes a new accounting
+  baseline for later commits and for `quota rebuild`.
+
+The op changes no namespace state; checkpoints therefore do not carry usage.
+Usage is recovered from the commit log (the head assertion, or replay when the
+head has none), so it survives reopen without any separate durable write. The
+commit schema remains `weftfs.commit.v1`: the op is an additive extension, and
+commits written before it existed replay unchanged (usage is derived from
+their object ops).
+
+On replay, the store recomputes the admission totals for every commit. A
+`reset:false` assertion that disagrees with those totals is `Corrupt` (fail
+closed). A `reset:true` assertion that is not alone or is non-empty is also
+`Corrupt`. `verify --full` and `quota rebuild` perform this replay; the
+recomputed totals are also checked against the in-memory counters.
+
+### 1.4 Policy file and migration
+
+Policy is configuration, not accounting. It is written once to the store-root
+`quota` file when a policy is installed or replaced:
 
 ```
-posix  -> "p:%020u:%020u"
-tenant -> "t:<name>"
+WFQ2 || u64le(len) || WCB || BLAKE3("weft/quota/v2", WCB)
+WCB  = { "schema":"weftfs.quota.v2", "budgets": [ ... ] }
 ```
 
-POSIX principals sort before tenant principals. Decoding rejects an unsorted
-array, an unknown key, a wrong schema, a bad digest, or a length mismatch
-(`Corrupt` / `UnsupportedVersion` / `NonCanonical`).
+Budget arrays are sorted by principal key with no duplicates. Decoding
+rejects an unsorted array, an unknown key, a wrong schema, a bad digest, or a
+length mismatch (`Corrupt` / `UnsupportedVersion` / `NonCanonical`). This file
+is never rewritten by an ordinary commit.
 
-The record is written atomically after the commit (`tmp` + fsync +
-`rename(2)` + directory fsync). It is never authoritative over content.
+`WFQ1` (schema `weftfs.quota.v1`) is the legacy combined policy+usage record.
+It is read only for migration. On a **writable** open:
 
-### 1.4 Consistency and rebuild
+1. the legacy policy is installed in memory;
+2. usage is recomputed from the published commit chain (a committed usage op,
+   when present, is validated first);
+3. the exact legacy bytes are preserved at `quota.migrated`;
+4. `quota` is replaced by the `WFQ2` policy-only record;
+5. if the recomputed usage is non-empty and the head has no usage op, one
+   corrective `set_quota_usage` op is published.
 
-On open, the record is compared with the committed head. If it names a
-different generation or commit, or cannot be decoded:
+A read-only open imports the legacy policy and recomputed usage in memory and
+writes nothing.
 
-- quota-enforcing writes fail closed with `Corrupt`;
-- `verify` reports the problem;
-- `quota rebuild` recomputes cumulative usage from the **published** commit
-  chain (never from unpublished commit files or process memory) and rewrites
-  the record. If the record is unusable and no policy is known, rebuild is
-  refused (re-supply `--quota`), because rebuilding an empty policy would
-  silently disable enforcement.
+Rules when records coexist:
 
-`quota reset` zeroes every counter; the policy is unchanged. `quota rebuild`
-and `quota reset` are the only operations that rewrite usage other than an
-admitted commit. A missing record means "no policy, no usage"; creating one is
-an explicit store-local admin act.
+- `quota` is `WFQ1` and `quota.migrated` exists with **different** bytes: the
+  migration is ambiguous; open marks quota invalid and writes fail closed with
+  `Corrupt`.
+- `quota` is `WFQ2` and `quota.migrated` exists: the preserved record is
+  historical. If it names the **current** head and its usage differs from the
+  committed usage for that head, open marks quota invalid and writes fail
+  closed. An older-generation record is evidence only and is not compared.
+- A legacy record that names the current head with a different usage is
+  `Corrupt` during migration. A stale legacy record (different generation or
+  commit) has its usage recomputed from the authoritative chain; the repair is
+  recorded in the store notes.
+
+### 1.5 Consistency and rebuild
+
+On open, usage is the head commit's `reset:false` assertion. If the head has no
+assertion (older chain, or a checkpoint boundary), the chain is replayed,
+validated, and used. Any inconsistent assertion fails closed for writes.
+
+`quota rebuild` replays the chain, validates every assertion, and publishes a
+corrective `set_quota_usage` op. It respects an earlier `reset` baseline. If
+the policy is unknown (unusable legacy/record), rebuild is refused
+(`Corrupt`); re-supply `--quota` instead. `quota reset` publishes one reset op
+and zeroes usage; both are explicit admin operations and are the only ways
+usage changes other than an admitted commit. `quota show` returns only the
+caller's own counters and own limits.
 
 ## 2. Branching time travel
 
