@@ -97,7 +97,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "kv_cache", "kv-cache", "activation_stream", "activation-stream", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "tensor_tiled", "tensor-tiled", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "kv_cache", "kv-cache", "activation_stream", "activation-stream", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -142,6 +142,10 @@ struct EncodeArgs {
     /// TENSOR_SHARDED per-block zero points, comma-separated i64 values.
     #[arg(long = "zero-points")]
     zero_points: Option<String>,
+    /// TENSOR_TILED tile extents as comma-separated u64 values (rank-equal and
+    /// dividing every shape extent).
+    #[arg(long = "tile-shape")]
+    tile_shape: Option<String>,
     /// SEMANTIC_DELTA policy: `none`, `mantissa_truncate:N`, or
     /// `block_quantize:B:L`.
     #[arg(long = "semantic-policy")]
@@ -591,6 +595,9 @@ struct ConformanceArgs {
     /// `<dir>/activation-stream`.
     #[arg(long)]
     activation_stream_only: bool,
+    /// Write only the TENSOR_TILED (mode 15) vectors into `<dir>/tensor-tiled`.
+    #[arg(long)]
+    tensor_tiled_only: bool,
     /// Write only the authenticated capability-envelope vectors into
     /// `<dir>/capability`.
     #[arg(long)]
@@ -699,6 +706,9 @@ fn run(cli: Cli) -> Result<()> {
                     "wrote activation-stream vectors to {}/activation-stream",
                     args.dir
                 );
+            } else if args.tensor_tiled_only {
+                weftcodec::conformance::generate_tiled_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote tensor-tiled vectors to {}/tensor-tiled", args.dir);
             } else if args.capability_only {
                 weftcodec::conformance::generate_capability_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote capability vectors to {}/capability", args.dir);
@@ -743,6 +753,10 @@ fn encode(args: EncodeArgs) -> Result<()> {
                 .map_err(|e| Error::io(format!("cannot write {}: {e}", path.display())))?;
         }
         return Ok(());
+    } else if args.mode == "tensor_tiled" || args.mode == "tensor-tiled" {
+        let (dtype, shape) = tensor_metadata_args(&args)?;
+        let tile_shape = tile_shape_arg(&args)?;
+        modes::encode_tiled_tensor(&data, dtype, &shape, &tile_shape, &limits)?
     } else if args.mode == "weight_delta" || args.mode == "weight-delta" {
         let (dtype, shape) = weight_delta_metadata_args(&args)?;
         let base_frame = base
@@ -850,6 +864,9 @@ fn encode_mode(
         Mode::ActivationStream => Err(Error::malformed(
             "ACTIVATION_STREAM encoding requires the dedicated CLI path with --metadata",
         )),
+        Mode::TensorTiled => Err(Error::malformed(
+            "TENSOR_TILED encoding requires the dedicated CLI path with --dtype/--shape/--tile-shape",
+        )),
     }
 }
 
@@ -949,6 +966,23 @@ fn quantized_metadata_args(args: &EncodeArgs) -> Result<(modes::TensorDtype, Vec
             .collect::<Result<Vec<u64>>>()?,
     };
     Ok((dtype, shape, scale, args.zero_point))
+}
+
+/// Parse `--tile-shape` for TENSOR_TILED.
+fn tile_shape_arg(args: &EncodeArgs) -> Result<Vec<u64>> {
+    let text = args
+        .tile_shape
+        .as_deref()
+        .ok_or_else(|| Error::malformed("TENSOR_TILED encoding requires --tile-shape A,B,..."))?;
+    let mut shape = Vec::new();
+    for part in text.split(',') {
+        shape.push(
+            part.trim().parse::<u64>().map_err(|err| {
+                Error::malformed(format!("bad --tile-shape extent `{part}`: {err}"))
+            })?,
+        );
+    }
+    Ok(shape)
 }
 
 /// Parse the FLOAT_TENSOR descriptor from `--metadata` or `--dtype`/`--shape`.

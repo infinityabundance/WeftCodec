@@ -64,7 +64,11 @@ pub use kv_cache::{
     KvCacheInput, KvCacheMeta, KvDtype, KvPageSet, KV_CACHE_SCHEMA,
 };
 pub use limits::Limits;
-pub use modes::TensorDtype;
+pub use modes::{
+    decode_tiled_tensor, encode_tiled_tensor, parse_tiled_tensor, read_region as read_tiled_region,
+    tensor_tile_root, tiled_tensor_metadata, TensorDtype, TiledTensorDescriptor, TiledTensorEntry,
+    TiledTensorMeta, TENSOR_TILED_SCHEMA, TENSOR_TILE_CODEC, TENSOR_TILE_LAYOUT,
+};
 pub use semantic::{
     select_semantic_base, semantic_matches, semantic_record, semantic_root,
     semantic_root_with_limits, SemanticPolicy, SemanticRootRecord, DOMAIN_TENSOR_SEMANTIC,

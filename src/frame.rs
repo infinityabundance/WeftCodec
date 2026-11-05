@@ -93,6 +93,9 @@ pub enum Mode {
     /// Exact word-wise delta against a semantically matched base frame
     /// (WEFT-AI-CODEC §15).
     SemanticDelta = 14,
+    /// Independently decodable tensor tiles with a WCB descriptor
+    /// (WEFT-AI-CODEC §16).
+    TensorTiled = 15,
 }
 
 impl Mode {
@@ -114,7 +117,8 @@ impl Mode {
             12 => Ok(Mode::KvCache),
             13 => Ok(Mode::ActivationStream),
             14 => Ok(Mode::SemanticDelta),
-            15..=127 => Err(Error::unsupported_mode(format!(
+            15 => Ok(Mode::TensorTiled),
+            16..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -146,6 +150,7 @@ impl Mode {
             Mode::KvCache => "kv_cache",
             Mode::ActivationStream => "activation_stream",
             Mode::SemanticDelta => "semantic_delta",
+            Mode::TensorTiled => "tensor_tiled",
         }
     }
 
@@ -167,6 +172,7 @@ impl Mode {
             "kv_cache" | "kv-cache" | "kvcache" => Ok(Mode::KvCache),
             "activation_stream" | "activation-stream" | "activation" => Ok(Mode::ActivationStream),
             "semantic_delta" | "semantic-delta" | "semanticdelta" => Ok(Mode::SemanticDelta),
+            "tensor_tiled" | "tensor-tiled" | "tiled" => Ok(Mode::TensorTiled),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -447,84 +453,13 @@ impl<'a> Frame<'a> {
             )));
         }
 
-        // Verify the header checksum before trusting any length field.
-        let stored_header_crc = le_u32(bytes, 72);
-        let mut crc_input = Vec::with_capacity(92);
-        crc_input.extend_from_slice(&bytes[0..72]);
-        crc_input.extend_from_slice(&bytes[76..96]);
-        if crc32c::crc32c(&crc_input) != stored_header_crc {
-            return Err(Error::corrupt("header CRC32C mismatch"));
-        }
-
-        let domain = bytes[6];
-        let mode = Mode::from_u8(bytes[7])?;
-        let flags = le_u16(bytes, 8);
-        let level = le_u16(bytes, 10);
-        let decoded_len = le_u64(bytes, 12);
-        let body_len = le_u64(bytes, 20);
-        let dep_count = le_u32(bytes, 28);
-        let chunk_count = le_u32(bytes, 32);
-        let feature_bits = le_u16(bytes, 36);
-        let reserved0 = le_u16(bytes, 38);
-        let content_hash = Hash32::from_slice(&bytes[40..72])?;
-        let table_len = le_u64(bytes, 76);
-        let reserved1 = le_u32(bytes, 84);
-        let reserved2 = le_u64(bytes, 88);
-
-        if reserved0 != 0 || reserved1 != 0 || reserved2 != 0 {
-            return Err(Error::malformed("reserved header fields must be zero"));
-        }
-        if domain > DOMAIN_STRUCTURED {
-            return Err(Error::malformed(format!("invalid domain value {domain}")));
-        }
-        if flags
-            & !(flags::CHUNKED | flags::SELF_CONTAINED | flags::DICT_RAW | flags::ORIGINAL_HASH)
-            != 0
-        {
-            return Err(Error::unsupported_feature(format!(
-                "unknown critical flag bits 0x{:04x}",
-                flags & !0x000f
-            )));
-        }
-        if flags & flags::ORIGINAL_HASH != 0 {
-            return Err(Error::unsupported_feature(
-                "ORIGINAL_HASH flag is reserved in v1",
-            ));
-        }
-        if flags & flags::SELF_CONTAINED != 0 {
-            return Err(Error::unsupported_feature(
-                "SELF_CONTAINED is reserved and not produced in v1",
-            ));
-        }
-        if feature_bits & !(features::DEPENDENCIES | features::CHUNK_HASHES) != 0 {
-            return Err(Error::unsupported_feature(format!(
-                "unknown critical feature bits 0x{:04x}",
-                feature_bits & !0x0003
-            )));
-        }
-
-        check_len(decoded_len, limits.max_decoded_bytes, "decoded data")?;
-        check_len(
-            u64::from(dep_count),
-            limits.max_dependency_count,
-            "dependency count",
-        )?;
-        check_len(u64::from(chunk_count), limits.max_chunks, "chunk count")?;
-
-        let expected_table_len = (u64::from(dep_count))
-            .checked_mul(DEP_ENTRY_LEN as u64)
-            .and_then(|v| {
-                (u64::from(chunk_count))
-                    .checked_mul(CHUNK_ENTRY_LEN as u64)
-                    .and_then(|c| v.checked_add(c))
-            })
-            .ok_or_else(|| Error::malformed("table length overflow"))?;
-        if table_len != expected_table_len {
-            return Err(Error::malformed(format!(
-                "table_len {table_len} does not match {} dependencies and {} chunks",
-                dep_count, chunk_count
-            )));
-        }
+        let (header, table_len_usize) = parse_header_fields(bytes, limits)?;
+        let table_len = header.table_len;
+        let body_len = header.body_len;
+        let decoded_len = header.decoded_len;
+        let dep_count = header.dep_count;
+        let chunk_count = header.chunk_count;
+        let chunked = header.is_chunked();
 
         let expected_total = (HEADER_LEN as u64)
             .checked_add(table_len)
@@ -538,36 +473,6 @@ impl<'a> Frame<'a> {
             )));
         }
 
-        let chunked = flags & flags::CHUNKED != 0;
-        if chunked {
-            if chunk_count == 0 {
-                return Err(Error::malformed("CHUNKED set with an empty chunk table"));
-            }
-            if feature_bits & features::CHUNK_HASHES == 0 {
-                return Err(Error::malformed(
-                    "CHUNKED set without the CHUNK_HASHES feature",
-                ));
-            }
-        } else {
-            if chunk_count != 0 {
-                return Err(Error::malformed(
-                    "chunk table present without the CHUNKED flag",
-                ));
-            }
-            if feature_bits & features::CHUNK_HASHES != 0 {
-                return Err(Error::malformed(
-                    "CHUNK_HASHES set without the CHUNKED flag",
-                ));
-            }
-        }
-        if dep_count > 0 && feature_bits & features::DEPENDENCIES == 0 {
-            return Err(Error::malformed(
-                "dependency table present without the DEPENDENCIES feature",
-            ));
-        }
-
-        let table_len_usize = usize::try_from(table_len)
-            .map_err(|_| Error::malformed("table length does not fit usize"))?;
         let body_start = HEADER_LEN
             .checked_add(table_len_usize)
             .ok_or_else(|| Error::malformed("body offset overflow"))?;
@@ -685,9 +590,138 @@ impl<'a> Frame<'a> {
             }
         }
 
-        let header = FrameHeader {
-            format_major,
-            format_minor,
+        validate_mode_rules(&header, &dependencies, limits)?;
+
+        Ok(Frame {
+            header,
+            dependencies,
+            chunks,
+            body,
+            bytes,
+        })
+    }
+}
+
+fn parse_header_fields(bytes: &[u8], limits: &Limits) -> Result<(FrameHeader, usize)> {
+    if bytes.len() < HEADER_LEN {
+        return Err(Error::malformed(format!(
+            "frame prefix is {} bytes, shorter than the {HEADER_LEN}-byte header",
+            bytes.len()
+        )));
+    }
+
+    // Verify the header checksum before trusting any length field.
+    let stored_header_crc = le_u32(bytes, 72);
+    let mut crc_input = Vec::with_capacity(92);
+    crc_input.extend_from_slice(&bytes[0..72]);
+    crc_input.extend_from_slice(&bytes[76..96]);
+    if crc32c::crc32c(&crc_input) != stored_header_crc {
+        return Err(Error::corrupt("header CRC32C mismatch"));
+    }
+
+    let domain = bytes[6];
+    let mode = Mode::from_u8(bytes[7])?;
+    let flags = le_u16(bytes, 8);
+    let level = le_u16(bytes, 10);
+    let decoded_len = le_u64(bytes, 12);
+    let body_len = le_u64(bytes, 20);
+    let dep_count = le_u32(bytes, 28);
+    let chunk_count = le_u32(bytes, 32);
+    let feature_bits = le_u16(bytes, 36);
+    let reserved0 = le_u16(bytes, 38);
+    let content_hash = Hash32::from_slice(&bytes[40..72])?;
+    let table_len = le_u64(bytes, 76);
+    let reserved1 = le_u32(bytes, 84);
+    let reserved2 = le_u64(bytes, 88);
+
+    if reserved0 != 0 || reserved1 != 0 || reserved2 != 0 {
+        return Err(Error::malformed("reserved header fields must be zero"));
+    }
+    if domain > DOMAIN_STRUCTURED {
+        return Err(Error::malformed(format!("invalid domain value {domain}")));
+    }
+    if flags & !(flags::CHUNKED | flags::SELF_CONTAINED | flags::DICT_RAW | flags::ORIGINAL_HASH)
+        != 0
+    {
+        return Err(Error::unsupported_feature(format!(
+            "unknown critical flag bits 0x{:04x}",
+            flags & !0x000f
+        )));
+    }
+    if flags & flags::ORIGINAL_HASH != 0 {
+        return Err(Error::unsupported_feature(
+            "ORIGINAL_HASH flag is reserved in v1",
+        ));
+    }
+    if flags & flags::SELF_CONTAINED != 0 {
+        return Err(Error::unsupported_feature(
+            "SELF_CONTAINED is reserved and not produced in v1",
+        ));
+    }
+    if feature_bits & !(features::DEPENDENCIES | features::CHUNK_HASHES) != 0 {
+        return Err(Error::unsupported_feature(format!(
+            "unknown critical feature bits 0x{:04x}",
+            feature_bits & !0x0003
+        )));
+    }
+
+    check_len(decoded_len, limits.max_decoded_bytes, "decoded data")?;
+    check_len(
+        u64::from(dep_count),
+        limits.max_dependency_count,
+        "dependency count",
+    )?;
+    check_len(u64::from(chunk_count), limits.max_chunks, "chunk count")?;
+
+    let expected_table_len = (u64::from(dep_count))
+        .checked_mul(DEP_ENTRY_LEN as u64)
+        .and_then(|v| {
+            (u64::from(chunk_count))
+                .checked_mul(CHUNK_ENTRY_LEN as u64)
+                .and_then(|c| v.checked_add(c))
+        })
+        .ok_or_else(|| Error::malformed("table length overflow"))?;
+    if table_len != expected_table_len {
+        return Err(Error::malformed(format!(
+            "table_len {table_len} does not match {} dependencies and {} chunks",
+            dep_count, chunk_count
+        )));
+    }
+
+    let chunked = flags & flags::CHUNKED != 0;
+    if chunked {
+        if chunk_count == 0 {
+            return Err(Error::malformed("CHUNKED set with an empty chunk table"));
+        }
+        if feature_bits & features::CHUNK_HASHES == 0 {
+            return Err(Error::malformed(
+                "CHUNKED set without the CHUNK_HASHES feature",
+            ));
+        }
+    } else {
+        if chunk_count != 0 {
+            return Err(Error::malformed(
+                "chunk table present without the CHUNKED flag",
+            ));
+        }
+        if feature_bits & features::CHUNK_HASHES != 0 {
+            return Err(Error::malformed(
+                "CHUNK_HASHES set without the CHUNKED flag",
+            ));
+        }
+    }
+    if dep_count > 0 && feature_bits & features::DEPENDENCIES == 0 {
+        return Err(Error::malformed(
+            "dependency table present without the DEPENDENCIES feature",
+        ));
+    }
+
+    let table_len_usize = usize::try_from(table_len)
+        .map_err(|_| Error::malformed("table length does not fit usize"))?;
+    Ok((
+        FrameHeader {
+            format_major: bytes[4],
+            format_minor: bytes[5],
             domain,
             mode,
             flags,
@@ -699,17 +733,28 @@ impl<'a> Frame<'a> {
             features: feature_bits,
             content_hash,
             table_len,
-        };
-        validate_mode_rules(&header, &dependencies, limits)?;
+        },
+        table_len_usize,
+    ))
+}
 
-        Ok(Frame {
-            header,
-            dependencies,
-            chunks,
-            body,
-            bytes,
-        })
+/// Parse and validate only the fixed header and its tables.
+///
+/// Returns the header and the bytes after the tables (which may be a strict
+/// prefix of the frame body). No trailer or whole-frame length check is made;
+/// the caller is a range reader that deliberately does not materialise the
+/// whole frame.
+pub fn parse_prefix<'a>(bytes: &'a [u8], limits: &Limits) -> Result<(FrameHeader, &'a [u8])> {
+    let (header, table_len) = parse_header_fields(bytes, limits)?;
+    let start = HEADER_LEN
+        .checked_add(table_len)
+        .ok_or_else(|| Error::malformed("body offset overflow"))?;
+    if bytes.len() < start {
+        return Err(Error::malformed(
+            "frame prefix is shorter than its header tables",
+        ));
     }
+    Ok((header, &bytes[start..]))
 }
 
 fn validate_mode_rules(
@@ -795,7 +840,8 @@ fn validate_mode_rules(
         | Mode::FloatTensor
         | Mode::TensorSharded
         | Mode::KvCache
-        | Mode::ActivationStream => {
+        | Mode::ActivationStream
+        | Mode::TensorTiled => {
             if header.domain != DOMAIN_PAYLOAD {
                 return Err(Error::malformed(
                     "AI-mode frames must use the payload domain",

@@ -53,6 +53,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let kv_cache_dir = dir.join("kv-cache");
     let activation_stream_dir = dir.join("activation-stream");
     let capability_dir = dir.join("capability");
+    let tensor_tiled_dir = dir.join("tensor-tiled");
     for sub in [
         &codec_dir,
         &structured_dir,
@@ -67,6 +68,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
         &kv_cache_dir,
         &activation_stream_dir,
         &capability_dir,
+        &tensor_tiled_dir,
     ] {
         fs::create_dir_all(sub)
             .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
@@ -85,6 +87,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_kv_cache_vectors(&kv_cache_dir, limits)?;
     write_activation_stream_vectors(&activation_stream_dir, limits)?;
     write_capability_vectors(&capability_dir, limits)?;
+    write_tiled_vectors(&tensor_tiled_dir, limits)?;
     Ok(())
 }
 
@@ -646,11 +649,24 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     let mut unknown_mode = good.clone();
     unknown_mode[7] = 15;
     refix_header_and_trailer(&mut unknown_mode);
-    // Keep the historical 017 numbering; reserved14 above already consumed
-    // the shared sequence step, so this fixed name does not disturb 018.
-    push_error(
+    push_error_superseded(
         &mut vectors,
         "017_unknown_mode_reserved15",
+        "raw",
+        &unknown_mode,
+        &[],
+        ErrorClass::UnsupportedMode,
+        None,
+        "017_unknown_mode_reserved16",
+        "Historical: this vector asserted that mode value 15 was reserved. WEFT-AI-CODEC allocates 15 to TENSOR_TILED, so the authoritative unknown-mode vector is 017_unknown_mode_reserved16. The frozen bytes and original expectation are retained unchanged.",
+    );
+
+    let mut unknown_mode = good.clone();
+    unknown_mode[7] = 16;
+    refix_header_and_trailer(&mut unknown_mode);
+    push_error(
+        &mut vectors,
+        "017_unknown_mode_reserved16",
         "raw",
         &unknown_mode,
         &[],
@@ -4904,5 +4920,323 @@ fn write_capability_vectors(dir: &Path, _limits: &Limits) -> Result<()> {
         "NonCanonical",
     )?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// TENSOR_TILED (mode 15, WEFT-AI-CODEC §16)
+// ---------------------------------------------------------------------------
+
+/// Generate only the mode-15 tensor-tiled vectors into `<dir>/tensor-tiled`.
+pub fn generate_tiled_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let tiled_dir = dir.join("tensor-tiled");
+    fs::create_dir_all(&tiled_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", tiled_dir.display())))?;
+    write_tiled_vectors(&tiled_dir, limits)
+}
+
+fn tiled_pattern(len: usize, mut state: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.push((state & 0xff) as u8);
+    }
+    out
+}
+
+fn tiled_body_parts(frame: &[u8], limits: &Limits) -> Result<(Value, Vec<u8>, u64, Hash32)> {
+    let parsed = Frame::parse(frame, limits)?;
+    let body = parsed.body;
+    if body.len() < 4 {
+        return Err(Error::malformed("tiled frame body is shorter than 4 bytes"));
+    }
+    let meta_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let end = 4usize
+        .checked_add(meta_len)
+        .ok_or_else(|| Error::malformed("tiled metadata length overflows"))?;
+    if end > body.len() {
+        return Err(Error::malformed("tiled metadata extends past the body"));
+    }
+    let meta = wcb::decode(&body[4..end], limits)?;
+    Ok((
+        meta,
+        body[end..].to_vec(),
+        parsed.header.decoded_len,
+        parsed.header.content_hash,
+    ))
+}
+
+fn tiled_rebuild(
+    meta: &Value,
+    stored: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let body = ai_body(meta, stored, limits)?;
+    build_frame(
+        Mode::TensorTiled,
+        DOMAIN_PAYLOAD,
+        0,
+        decoded_len,
+        content_hash,
+        &[],
+        &body,
+        limits,
+    )
+}
+
+fn tiled_meta_map(meta: &Value) -> Result<BTreeMap<String, Value>> {
+    match meta {
+        Value::Map(map) => Ok(map.clone()),
+        _ => Err(Error::malformed("tiled descriptor is not a WCB map")),
+    }
+}
+
+fn tiled_tile_map(
+    meta: &BTreeMap<String, Value>,
+    position: usize,
+) -> Result<BTreeMap<String, Value>> {
+    let tiles = match meta.get("tiles") {
+        Some(Value::Array(items)) => items,
+        _ => return Err(Error::malformed("tiled descriptor has no tiles array")),
+    };
+    let entry = tiles
+        .get(position)
+        .ok_or_else(|| Error::malformed("tiled descriptor is missing a tile entry"))?;
+    match entry {
+        Value::Map(map) => Ok(map.clone()),
+        _ => Err(Error::malformed("tile entry is not a WCB map")),
+    }
+}
+
+fn write_tiled_valid(
+    dir: &Path,
+    name: &str,
+    dtype: modes::TensorDtype,
+    shape: &[u64],
+    tile_shape: &[u64],
+    plaintext: &[u8],
+    region: Option<(&[u64], &[u64])>,
+    limits: &Limits,
+) -> Result<()> {
+    let frame = modes::encode_tiled_tensor(plaintext, dtype, shape, tile_shape, limits)?;
+    let parsed = Frame::parse(&frame, limits)?;
+    let descriptor = modes::parse_tiled_tensor(&parsed, limits)?;
+    let decoded = modes::decode_tiled_tensor(&parsed, limits)?;
+    if decoded != plaintext {
+        return Err(Error::corrupt(format!(
+            "{name}: tiled round trip is not exact"
+        )));
+    }
+    let mut value = json!({
+        "name": name,
+        "mode": "tensor_tiled",
+        "mode_value": 15,
+        "dtype": dtype.as_str(),
+        "shape": shape,
+        "tile_shape": tile_shape,
+        "tile_counts": descriptor.meta.tile_counts,
+        "tile_count": descriptor.meta.tiles.len(),
+        "logical_root": descriptor.meta.logical_root.to_hex(),
+        "payload_len": descriptor.meta.payload_len,
+        "decoded_len": plaintext.len(),
+        "content_hash": parsed.header.content_hash.to_hex(),
+        "plaintext_hex": hexs(plaintext),
+        "frame_hex": hexs(&frame),
+        "tiles": descriptor.meta.tiles.iter().map(|entry| json!({
+            "index": entry.index,
+            "offset": entry.offset,
+            "compressed_len": entry.compressed_len,
+            "element_len": entry.element_len,
+            "tile_root": entry.tile_root.to_hex(),
+        })).collect::<Vec<_>>(),
+        "expect": { "ok": true },
+    });
+    if let Some((start, end)) = region {
+        let region = tensor::Region::new(start.to_vec(), end.to_vec());
+        let (bytes, tiles_touched) = modes::read_region(&descriptor, &region, limits)?;
+        value["region"] = json!({
+            "start": start,
+            "end": end,
+            "bytes_hex": hexs(&bytes),
+            "tiles_touched": tiles_touched,
+        });
+    }
+    write_json(&dir.join(format!("{name}.json")), &value)
+}
+
+fn write_tiled_reject(dir: &Path, name: &str, class: ErrorClass, frame: &[u8]) -> Result<()> {
+    let parsed = Frame::parse(frame, &Limits::default())?;
+    let mut value = json!({
+        "name": name,
+        "mode": "tensor_tiled",
+        "mode_value": 15,
+        "frame_hex": hexs(frame),
+        "decoded_len": parsed.header.decoded_len,
+        "content_hash": parsed.header.content_hash.to_hex(),
+        "dependencies": [],
+        "expect": { "error": class.as_str() },
+    });
+    value["name"] = json!(name);
+    write_json(&dir.join(format!("{name}.json")), &value)
+}
+
+fn write_tiled_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    // Valid vectors: bf16 4x4 (2x2 tiles), fp32 2x2x2 (1x2x2 tiles), and a
+    // single-tile f16 2x3 tensor.
+    let bf16_bytes = tiled_pattern(16 * 2, 0x51);
+    write_tiled_valid(
+        dir,
+        "001_tiled_bf16_4x4",
+        modes::TensorDtype::Bf16,
+        &[4, 4],
+        &[2, 2],
+        &bf16_bytes,
+        Some((&[0, 0], &[3, 3])),
+        limits,
+    )?;
+    let fp32_bytes = tiled_pattern(8 * 4, 0x77);
+    write_tiled_valid(
+        dir,
+        "002_tiled_fp32_2x2x2",
+        modes::TensorDtype::F32,
+        &[2, 2, 2],
+        &[1, 2, 2],
+        &fp32_bytes,
+        Some((&[0, 0, 0], &[2, 1, 2])),
+        limits,
+    )?;
+    let f16_bytes = tiled_pattern(6 * 2, 0x33);
+    write_tiled_valid(
+        dir,
+        "003_tiled_f16_single_tile",
+        modes::TensorDtype::F16,
+        &[2, 3],
+        &[2, 3],
+        &f16_bytes,
+        None,
+        limits,
+    )?;
+
+    // Reject vectors start from a valid mode-15 frame and change exactly one
+    // descriptor field, so each vector isolates one rule.
+    let base = modes::encode_tiled_tensor(
+        &bf16_bytes,
+        modes::TensorDtype::Bf16,
+        &[4, 4],
+        &[2, 2],
+        limits,
+    )?;
+    let (meta, stored, decoded_len, content_hash) = tiled_body_parts(&base, limits)?;
+
+    // 101: tile shape does not divide the extent.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert(
+        "tile_shape".to_owned(),
+        Value::Array(vec![Value::U64(3), Value::U64(2)]),
+    );
+    let frame = tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_tiled_reject(
+        dir,
+        "101_non_dividing_tile_shape",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 102: tile_counts disagrees with shape / tile_shape.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert(
+        "tile_counts".to_owned(),
+        Value::Array(vec![Value::U64(3), Value::U64(2)]),
+    );
+    let frame = tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_tiled_reject(
+        dir,
+        "102_tile_count_mismatch",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 103: overlapping / non-monotonic tile offsets.
+    let mut map = tiled_meta_map(&meta)?;
+    let mut second = tiled_tile_map(&map, 1)?;
+    let first_offset = match tiled_tile_map(&map, 0)?.get("offset") {
+        Some(Value::U64(value)) => *value,
+        _ => return Err(Error::malformed("tile entry has no offset")),
+    };
+    second.insert("offset".to_owned(), Value::U64(first_offset));
+    let mut tiles = match map.get("tiles") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => return Err(Error::malformed("tiled descriptor has no tiles array")),
+    };
+    tiles[1] = Value::Map(second);
+    map.insert("tiles".to_owned(), Value::Array(tiles));
+    let frame = tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_tiled_reject(
+        dir,
+        "103_overlapping_tile_offsets",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 104: a tile root that does not match its decoded tile.
+    let mut map = tiled_meta_map(&meta)?;
+    let mut first = tiled_tile_map(&map, 0)?;
+    first.insert("tile_root".to_owned(), Value::Bytes(vec![0u8; 32]));
+    let mut tiles = match map.get("tiles") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => return Err(Error::malformed("tiled descriptor has no tiles array")),
+    };
+    tiles[0] = Value::Map(first);
+    map.insert("tiles".to_owned(), Value::Array(tiles));
+    let frame = tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_tiled_reject(dir, "104_tile_root_mismatch", ErrorClass::Corrupt, &frame)?;
+
+    // 105: declared payload_len differs from the stored payload.
+    let mut map = tiled_meta_map(&meta)?;
+    let payload_len = match map.get("payload_len") {
+        Some(Value::U64(value)) => *value,
+        _ => return Err(Error::malformed("tiled descriptor has no payload_len")),
+    };
+    map.insert("payload_len".to_owned(), Value::U64(payload_len + 1));
+    let frame = tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_tiled_reject(
+        dir,
+        "105_payload_length_mismatch",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 106: unknown tile codec.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert(
+        "tile_codec".to_owned(),
+        Value::Str("zstd-native-v1".to_owned()),
+    );
+    let frame = tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_tiled_reject(dir, "106_unknown_tile_codec", ErrorClass::Malformed, &frame)?;
+
+    // 107: zero shape dimension.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert(
+        "shape".to_owned(),
+        Value::Array(vec![Value::U64(4), Value::U64(0)]),
+    );
+    let frame = tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_tiled_reject(dir, "107_zero_dimension", ErrorClass::Malformed, &frame)?;
+
+    // 108: logical root that does not match the assembled tensor.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert("logical_root".to_owned(), Value::Bytes(vec![0u8; 32]));
+    let frame = tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_tiled_reject(
+        dir,
+        "108_logical_root_mismatch",
+        ErrorClass::Corrupt,
+        &frame,
+    )?;
     Ok(())
 }

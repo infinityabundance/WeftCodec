@@ -209,6 +209,31 @@ region intersects:
 The API reports the number of units touched. This count, not a timing, is the
 proof that region addressing does not fan out across the whole topology.
 
+### 5.1 Independently decodable tiles (mode 15, WEFT-AI-CODEC §16)
+
+Mode 15 adds a physical unit finer than a shard: a **tile**. A tile grid is
+defined by a rank-equal `tile_shape` that divides every logical extent, giving
+`tile_counts[k] = shape[k] / tile_shape[k]`. Tiles are ordered row-major over
+the grid; tile `i` has `dims = tile_shape` and stores its canonical row-major
+element bytes exactly (full tiles only; partial boundary tiles
+are not defined in v1).
+
+For a region read, the intersecting tile-index range on each axis is
+
+```
+first[k] = start[k] / tile_shape[k]
+last[k]  = ceil(end[k] / tile_shape[k])
+```
+
+and only those tiles are decoded. The API returns the bytes plus
+`tiles_touched`, and every decoded tile is verified against its own
+`tile_root = H("weft/tensor/tile/v1", WCB({dtype, dims, element_len,
+values_hash}))`, where `values_hash = H("weft/tensor/values/v1", tile bytes)`.
+The whole-tensor `LogicalTensorRoot` is unchanged by tiling.
+
+This is a physical arrangement, not a new logical identity: the tiled and
+untiled bytes of the same tensor have the same `LogicalTensorRoot`.
+
 ## 6. Shard container
 
 A stored shard is a self-describing container:

@@ -1,6 +1,6 @@
 # WEFT-AI-CODEC v1.2.0 — AI-native codec modes
 
-**Status: PARTIALLY IMPLEMENTED.** Exactly eight AI-native modes are normative
+**Status: PARTIALLY IMPLEMENTED.** Exactly ten AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 
 | Value | Name | Status | Frozen vectors |
@@ -13,6 +13,8 @@ and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 | 11 | `WEIGHT_DELTA` (CLI `weight-delta`) | **implemented** | `conformance/v1/weight-delta/001`–`003` + eight rejects |
 | 12 | `KV_CACHE` (CLI `kv-cache`) | **implemented** | `conformance/v1/kv-cache/001`–`003` + eight rejects |
 | 13 | `ACTIVATION_STREAM` (CLI `activation-stream`) | **implemented** | `conformance/v1/activation-stream/001`–`003` + eight rejects |
+| 14 | `SEMANTIC_DELTA` (CLI `semantic-delta`) | **implemented** | `conformance/v1/semantic-delta/001`–`003` + eight rejects |
+| 15 | `TENSOR_TILED` (CLI `tensor-tiled`) | **implemented** | `conformance/v1/tensor-tiled/001`–`003` + eight rejects |
 
 Every other mode below is `specified, not implemented` and has **no allocated
 wire value**. Nothing in this document is a compression or performance claim.
@@ -1464,3 +1466,163 @@ byte-identical in both codec repositories:
 Both implementations replay every valid vector, decode, and re-encode to the
 same bytes; invalid vectors are rejected with the stated class. The
 cross-language gate reports byte-identical mode-14 frames in both directions.
+
+---
+
+## 16. Mode 15 — `TENSOR_TILED` (implemented)
+
+Mode 15 stores one tensor as **independently decodable tiles**. A region read
+decodes only the tiles it intersects; it never decodes the whole tensor. Mode
+10 (`TENSOR_SHARDED`) is unchanged and remains the default checkpoint shard
+representation.
+
+### 16.1 Frame shape
+
+```
+domain        = 0 (payload)
+mode          = 15
+flags         = 0
+dep_count     = 0
+chunk_count   = 0
+decoded_len   = product(shape) * element_size
+content_hash  = H("weft/chunk/v1", canonical row-major element bytes)
+body          = u32le(meta_len) || WCB(meta) || stored_payload
+```
+
+`meta_len` is the descriptor length only. The decoder checks the descriptor
+prefix and `stored_payload.len() == payload_len` with checked arithmetic. The
+stored payload is `sum(tile.compressed_len)` bytes; it is normally smaller than
+`decoded_len`.
+
+### 16.2 Descriptor
+
+Schema `weft.ai.tensor_tiled.v1`. Exactly these keys:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `schema` | text | `"weft.ai.tensor_tiled.v1"` |
+| `dtype` | text | one of the v1 element dtypes (`WEFT-TENSOR` §2) |
+| `shape` | `[u64]` | logical shape; rank ≥ 1, every extent > 0, rank ≤ `max_tensor_rank` |
+| `element_count` | u64 | must equal `product(shape)` |
+| `layout` | text | `"row_major"` (the only layout implemented in v1) |
+| `tile_shape` | `[u64]` | rank-equal to `shape`; every extent > 0 and divides the corresponding shape extent |
+| `tile_counts` | `[u64]` | `shape[i] / tile_shape[i]` |
+| `tile_codec` | text | `"huffman-canonical-v1"` |
+| `tiles` | array | one entry per tile, in canonical order |
+| `payload_len` | u64 | exact stored payload length |
+| `logical_root` | bytes32 | `LogicalTensorRoot` of the whole tensor (`WEFT-TENSOR` §3) |
+
+A tile entry has exactly `index`, `dims`, `offset`, `compressed_len`,
+`element_len`, `tile_root`:
+
+* `index` is the canonical grid position (row-major over `tile_counts`); the
+  array position MUST equal `index`.
+* `dims` MUST equal `tile_shape`. v1 defines full tiles only; partial boundary
+  tiles are not defined. A non-dividing `tile_shape` is `Malformed`.
+* `offset` is the byte offset of the stored tile inside `stored_payload`.
+  Offsets MUST be contiguous: the first is `0`, each next offset equals the
+  previous `offset + compressed_len`, and the last end equals `payload_len`.
+  A gap, overlap, or non-monotonic offset is `Malformed`.
+* `compressed_len` is the stored tile length; zero is `Malformed`.
+* `element_len` MUST equal `product(dims) * element_size`.
+* `tile_root` is bytes32 (see §16.4).
+
+### 16.3 Tile payload
+
+A tile's decoded bytes are its canonical row-major element bytes. The tile is
+split into `element_size` **byte planes**: plane `p` is byte `p` of each
+element, in row-major element order. Each plane is coded independently with
+`huffman-canonical-v1` (its own 256-byte table plus bitstream). A stored tile is
+the concatenation of its planes in plane order. The decoder decodes each plane
+with `huffman-canonical-v1` expecting `product(dims)` bytes; it consumes exactly
+the plane's own table and stream and rejects trailing bytes inside the declared
+tile range. This makes every tile independently decodable and verifiable.
+
+### 16.4 Tile identity
+
+```
+values_hash = H("weft/tensor/values/v1", tile canonical row-major bytes)
+tile_root   = H("weft/tensor/tile/v1",
+                WCB({dtype, dims, element_len, values_hash}))
+```
+
+`WCB` keys are exactly `dtype` (text), `dims` (`[u64]`), `element_len` (u64),
+and `values_hash` (bytes32).
+
+### 16.5 Decoding and region reads
+
+Full decode assembles every tile into the canonical row-major tensor, verifies
+each `tile_root`, then recomputes `LogicalTensorRoot` and requires it to equal
+`logical_root`. The frame content hash is verified as usual.
+
+A region read (`read_region`) takes a half-open hyper-rectangle in logical
+coordinates and:
+
+1. Computes the tile-index range intersecting the region on every axis.
+2. Decodes only those tiles, verifying each `tile_root`.
+3. Copies the intersection box from each decoded tile into the region's
+   canonical row-major output.
+4. Returns the bytes and the number of tiles decoded (`tiles_touched`).
+
+Tiles outside the region are never read or decoded. A range reader that does
+not materialise the whole frame must read the fixed header, the descriptor, and
+only the stored ranges of intersecting tiles. In that mode the frame trailer
+and whole-frame content hash cannot be verified; the per-tile roots are the
+exactness guarantee. Full decode continues to verify both.
+
+### 16.6 Validation order (normative for error classes)
+
+1. Frame header/tables (`Malformed`, `UnsupportedVersion`, `UnsupportedFeature`).
+2. Descriptor WCB canonical decode (`Malformed`, `NonCanonical`).
+3. Schema, dtype, layout, tile codec (`Malformed`; unknown values fail closed).
+4. Shape/tile arithmetic: zero dimension, rank, non-dividing tile shape,
+   `element_count`, `tile_counts` (`Malformed`, `LimitExceeded`).
+5. `decoded_len` consistency (`Corrupt`).
+6. Tiles array length, canonical index order, `dims`, `element_len`, offsets,
+   `payload_len` (`Malformed`, `LimitExceeded`).
+7. Tile plane decode (`Corrupt`, `NonCanonical`) and `tile_root` (`Corrupt`).
+8. `logical_root` and frame content hash (`Corrupt`).
+
+### 16.7 Limits
+
+`max_tensor_elements`, `max_tensor_rank`, `max_decoded_bytes`,
+`max_structured_items` (tile count), `max_string_bytes` (descriptor), and
+`max_frame_bytes` all apply. Tile count is checked before allocating per-tile
+state. A prefix reader additionally bounds the descriptor read by
+`max_string_bytes`.
+
+### 16.8 API and CLI (maintainer tools, not wire formats)
+
+Rust: `modes::encode_tiled_tensor`, `modes::parse_tiled_tensor`,
+`modes::parse_tiled_descriptor`, `modes::decode_tiled_tensor`,
+`modes::tiled_tensor_metadata`, `modes::tensor_tile_root`,
+`modes::read_region`, and `modes::read_region_with` (caller-supplied stored
+tile fetch for a range reader).
+
+Go: `modes.EncodeTiledTensor`, `modes.ParseTiledTensor`,
+`modes.DecodeTiledTensor`, `modes.TiledTensorMetadata`,
+`modes.TensorTileRoot`, and `modes.ReadRegion` (the stored-tile fetch is the
+caller's in the store-side range reader).
+
+CLI: `weftcodec encode --mode tensor-tiled --input PAYLOAD --dtype D
+--shape A,B,... --tile-shape X,Y,...`; decode uses the ordinary `decode`
+verb.
+
+The WeftFS store writes mode 15 through `checkpoint write --tile-shape` and
+reads it through per-tile backend range reads; mode 10 remains the default.
+
+### 16.9 Conformance vectors
+
+`conformance/v1/tensor-tiled/` (byte-identical in both codec repositories):
+
+* `001_tiled_bf16_4x4` — bf16 4×4, tile 2×2, with a region read.
+* `002_tiled_fp32_2x2x2` — fp32 rank 3, tile 1×2×2, with a region read.
+* `003_tiled_f16_single_tile` — f16 2×3, single tile.
+
+Rejects: `101_non_dividing_tile_shape`, `102_tile_count_mismatch`,
+`103_overlapping_tile_offsets`, `104_tile_root_mismatch`,
+`105_payload_length_mismatch`, `106_unknown_tile_codec`, `107_zero_dimension`,
+`108_logical_root_mismatch`.
+
+The cross-language gate asserts byte-identical frames for mode 15 and
+decode-equivalence in both directions.
