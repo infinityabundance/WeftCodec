@@ -93,8 +93,9 @@ resolve to the recorded ObjectId is `Corrupt`.
 
 ### 2.6 Cost envelope
 
-Before reading any file bytes for materialization and before creating anything,
-the implementation computes:
+Before reading any materialized object payload and before creating anything,
+the implementation computes (checkpoint manifest metadata may be read first to
+expand the shard set; those reads are themselves hash-verified):
 
 ```
 estimated_bytes   = sum of decoded sizes of the training-ready set
