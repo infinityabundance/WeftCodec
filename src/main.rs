@@ -11,6 +11,7 @@ use serde_json::json;
 
 use weftcodec::activation_stream;
 use weftcodec::archive;
+use weftcodec::capability::{self, CapabilityEnvelope};
 use weftcodec::context::{self, Budget, ContextRoot, ContextUri, DEFAULT_RESOLVER};
 use weftcodec::dependency::{
     decode_frame_dag, DirectoryFrameSource, DirectoryResolver, MapResolver, Resolver,
@@ -69,6 +70,11 @@ enum Command {
     Causal {
         #[command(subcommand)]
         command: CausalCommand,
+    },
+    /// Authenticated capability envelope operations.
+    Capability {
+        #[command(subcommand)]
+        command: CapabilityCommand,
     },
     /// Logical tensor identity, sharding, and region addressing.
     Tensor {
@@ -403,6 +409,52 @@ enum ContextCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum CapabilityCommand {
+    /// Sign an envelope JSON document, writing the canonical blob.
+    Sign {
+        /// Envelope JSON file (`weft.capability.envelope.v1`).
+        #[arg(long)]
+        envelope: String,
+        /// File containing a 32-byte Ed25519 seed (hex or raw).
+        #[arg(long)]
+        key: String,
+        /// Output blob path, or `-` for stdout.
+        #[arg(long, default_value = "-")]
+        out: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify a canonical `{envelope, signature}` blob offline.
+    Verify {
+        #[arg(long)]
+        blob: String,
+        /// Revocation ids: hex lines, comma-separated, or a JSON array.
+        #[arg(long)]
+        revocations: Option<String>,
+        /// Override the verification clock (UTC ns).
+        #[arg(long = "now-ns")]
+        now_ns: Option<i64>,
+        /// Require this grantee (64 hex digits).
+        #[arg(long)]
+        grantee: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print an envelope identity from JSON or canonical hex.
+    Id {
+        #[arg(long)]
+        envelope: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the Ed25519 public key derived from a seed file.
+    Key {
+        #[arg(long)]
+        key: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum CausalCommand {
     /// Print the causal closure record hash (hex, or JSON).
     Id {
@@ -582,6 +634,29 @@ fn run(cli: Cli) -> Result<()> {
         },
         Command::Causal { command } => match command {
             CausalCommand::Id { parents, json } => causal_id(&parents, json),
+        },
+        Command::Capability { command } => match command {
+            CapabilityCommand::Sign {
+                envelope,
+                key,
+                out,
+                json,
+            } => capability_sign(&envelope, &key, &out, json),
+            CapabilityCommand::Verify {
+                blob,
+                revocations,
+                now_ns,
+                grantee,
+                json,
+            } => capability_verify(
+                &blob,
+                revocations.as_deref(),
+                now_ns,
+                grantee.as_deref(),
+                json,
+            ),
+            CapabilityCommand::Id { envelope, json } => capability_id(&envelope, json),
+            CapabilityCommand::Key { key } => capability_key(&key),
         },
         Command::Tensor { command } => match command {
             TensorCommand::Root(args) => tensor_root(&args),
@@ -2103,6 +2178,177 @@ fn tensor_reassemble(args: &TensorReassembleArgs) -> Result<()> {
         );
     } else {
         println!("{root}");
+    }
+    Ok(())
+}
+
+fn read_envelope(path: &str) -> Result<CapabilityEnvelope> {
+    let bytes = fs::read(path).map_err(|e| Error::io(format!("cannot read {path}: {e}")))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| Error::parse("capability envelope file is not UTF-8"))?;
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        CapabilityEnvelope::from_json_str(trimmed)
+    } else {
+        let raw = hex::decode(trimmed).map_err(|_| {
+            Error::parse("capability envelope file is neither JSON nor canonical hex")
+        })?;
+        CapabilityEnvelope::from_canonical_bytes(&raw, &Limits::default())
+    }
+}
+
+fn read_seed(path: &str) -> Result<Vec<u8>> {
+    let bytes = fs::read(path).map_err(|e| Error::io(format!("cannot read {path}: {e}")))?;
+    if bytes.len() == 32 {
+        return Ok(bytes);
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| Error::parse("key file must be 32 raw bytes or 64 hex digits"))?;
+    let trimmed = text.trim();
+    let decoded = hex::decode(trimmed)
+        .map_err(|_| Error::parse("key file must be 32 raw bytes or 64 hex digits"))?;
+    if decoded.len() != 32 {
+        return Err(Error::parse("Ed25519 seed must be 32 bytes"));
+    }
+    Ok(decoded)
+}
+
+fn read_revocations(spec: Option<&str>) -> Result<Vec<weftcodec::Hash32>> {
+    let Some(path) = spec else {
+        return Ok(Vec::new());
+    };
+    let text =
+        fs::read_to_string(path).map_err(|e| Error::io(format!("cannot read {path}: {e}")))?;
+    let trimmed = text.trim();
+    let mut out = Vec::new();
+    if trimmed.starts_with('[') {
+        let items: Vec<String> = serde_json::from_str(trimmed)
+            .map_err(|err| Error::parse(format!("bad revocation JSON: {err}")))?;
+        for item in items {
+            out.push(weftcodec::Hash32::from_hex(item.trim())?);
+        }
+    } else {
+        for item in trimmed.split(|c: char| c == ',' || c.is_whitespace()) {
+            if item.is_empty() {
+                continue;
+            }
+            out.push(weftcodec::Hash32::from_hex(item)?);
+        }
+    }
+    Ok(out)
+}
+
+fn capability_sign(envelope_path: &str, key_path: &str, out: &str, json: bool) -> Result<()> {
+    let envelope = read_envelope(envelope_path)?;
+    let seed = read_seed(key_path)?;
+    let blob = capability::sign_envelope(&envelope, &seed)?;
+    let bytes = blob.encode()?;
+    let envelope_id = envelope.id()?;
+    let blob_id = blob.id()?;
+    write_output(out, &bytes)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "envelope_id": envelope_id.to_hex(),
+                "blob_id": blob_id.to_hex(),
+                "tenant": envelope.tenant,
+                "grantor": envelope.grantor.to_hex(),
+                "grantee": envelope.grantee.to_hex(),
+                "expires_at_ns": envelope.expires_at_ns,
+                "revocation_id": envelope.revocation_id.to_hex(),
+                "signature": hex::encode(&blob.signature),
+                "blob_bytes": bytes.len(),
+            }))
+            .map_err(|e| Error::io(format!("cannot serialize sign result: {e}")))?
+        );
+    } else {
+        println!("envelope_id={envelope_id}");
+        println!("blob_id={blob_id}");
+    }
+    Ok(())
+}
+
+fn capability_verify(
+    blob_path: &str,
+    revocations_path: Option<&str>,
+    now_ns: Option<i64>,
+    grantee: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let bytes =
+        fs::read(blob_path).map_err(|e| Error::io(format!("cannot read {blob_path}: {e}")))?;
+    let revocations = read_revocations(revocations_path)?;
+    let expected = match grantee {
+        Some(text) => Some(weftcodec::Hash32::from_hex(text.trim())?),
+        None => None,
+    };
+    let now = now_ns.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0)
+    });
+    let verified =
+        capability::verify_envelope(&bytes, &revocations, now, expected).map_err(|err| {
+            Error::new(
+                err.class(),
+                format!("{}: {}", err.rejection(), err.message()),
+            )
+        })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "valid": true,
+                "envelope_id": verified.envelope_id.to_hex(),
+                "blob_id": verified.blob_id.to_hex(),
+                "tenant": verified.envelope.tenant,
+                "grantor": verified.envelope.grantor.to_hex(),
+                "grantee": verified.envelope.grantee.to_hex(),
+                "namespaces": verified.envelope.namespaces,
+                "roots": verified.envelope.roots.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+                "predicates": verified.envelope.predicates,
+                "expires_at_ns": verified.envelope.expires_at_ns,
+                "revocation_id": verified.envelope.revocation_id.to_hex(),
+            }))
+            .map_err(|e| Error::io(format!("cannot serialize verify result: {e}")))?
+        );
+    } else {
+        println!("valid=true");
+        println!("envelope_id={}", verified.envelope_id);
+        println!("blob_id={}", verified.blob_id);
+        println!("tenant={}", verified.envelope.tenant);
+        println!("grantee={}", verified.envelope.grantee);
+    }
+    Ok(())
+}
+
+fn capability_key(key_path: &str) -> Result<()> {
+    let seed = read_seed(key_path)?;
+    println!("{}", capability::public_key_for_seed(&seed)?);
+    Ok(())
+}
+
+fn capability_id(envelope_path: &str, json: bool) -> Result<()> {
+    let envelope = read_envelope(envelope_path)?;
+    let id = envelope.id()?;
+    let sign_input = envelope.sign_input()?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": capability::ENVELOPE_SCHEMA,
+                "envelope_id": id.to_hex(),
+                "sign_input": sign_input.to_hex(),
+                "tenant": envelope.tenant,
+                "grantor": envelope.grantor.to_hex(),
+                "grantee": envelope.grantee.to_hex(),
+            }))
+            .map_err(|e| Error::io(format!("cannot serialize envelope id: {e}")))?
+        );
+    } else {
+        println!("{id}");
     }
     Ok(())
 }
