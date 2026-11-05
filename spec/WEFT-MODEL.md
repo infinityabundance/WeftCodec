@@ -266,6 +266,73 @@ mode-10 scale plane; `q4_0` store support is not implemented in B1.
 prices are exposed by `weft plan --json` and `Store::plan_tensor` only. The
 manifest records exactly the chosen representation, never a cost table.
 
+### 2.3.2 Merkle content identity (v3, opt-in)
+
+A writer MAY persist a raw chunk table under schema `"weft.manifest.v3"`
+(one spelling, no alias) so that a small range write costs O(changed chunks +
+tree hashing) instead of O(file size):
+
+```
+{
+  "schema": "weft.manifest.v3",
+  "size": u64,
+  "chunk_size": u64,
+  "chunks": [ {"hash":bytes32,"len":u64}, ... ],
+  "content_root": bytes32,
+  "content_identity": "merkle-v1",
+  "representation": map            # optional, kind:"raw" only
+}
+```
+
+The key set is exactly the fields above: `content_root` replaces `content_hash`,
+`content_identity` is required and MUST be `"merkle-v1"`, and
+`representation` may be omitted. A v3 manifest MUST NOT carry a frame-backed
+(codec or tensor) representation; that is `Corrupt`.
+
+Construction (all hashes are the domain-separated construction of §2.3.1):
+
+```
+chunk_hash_i = H("weft/chunk/v1", chunk_bytes_i)      # unchanged chunk domain
+leaf_i       = H("weft/merkle/leaf/v1", u64le(chunk_len_i) || chunk_hash_i)
+parent(l,r)  = H("weft/merkle/node/v1", l || r)
+empty_root   = H("weft/merkle/empty/v1", empty)
+```
+
+The tree is built over chunk order. At every level, nodes are paired left to
+right; an odd trailing node is **promoted unchanged** to the next level (it is
+never duplicated and never hashed with itself). With one chunk the root is that
+chunk's leaf. An empty file has zero chunks and root `empty_root`.
+
+`content_root` MUST equal the fold of the manifest's own chunk table; a
+mismatch is `Corrupt` on parse. Because `chunk_size` and each chunk's `len` are
+part of the leaf preimage, the root is deliberately **chunk-size dependent**:
+writing the same bytes with a different `chunk_size` produces a different root.
+The chunk size is recorded in the manifest, so the identity is unambiguous.
+
+Rules:
+
+- A file's `ContentId` for a v3 manifest is `content_root`. The manifest id
+  remains `H("weft/manifest/v1", WCB(manifest))`.
+- A range write re-hashes and re-stores only chunks whose bytes change; every
+  other chunk reference is reused verbatim and its blob is not read. The root
+  is folded from the manifest's stored chunk hashes plus the changed leaves; no
+  whole-file read is performed for hashing.
+- A full read verifies every chunk blob and recomputes the root from the chunk
+table. A range read verifies the touched blobs and their declared hashes.
+`verify_region(content_root, offset, len)` verifies the touched blobs, then
+recomputes the root from all chunk hashes (O(#chunks) small hashes) and compares
+it with the declared root; no per-level sibling table is stored. A failure
+names the chunk index.
+- A v3 file MUST NOT be rewritten as v1/v2 implicitly. Conversion is an
+explicit operation; absent one, every rewrite of a v3 file keeps v3. Reading
+dispatches by schema and an unknown schema is `UnsupportedVersion` (fail
+closed).
+- The default remains the frozen v1 whole-file identity. A writer selects v3
+only through the `content_identity = merkle` option / `--content-identity
+merkle` flag; otherwise v1 (or v2) bytes are unchanged.
+- v3 is byte-identical across implementations: the same bytes and `chunk_size`
+MUST produce the same root in Rust and Go.
+
 ### 2.3.1 Derived identities
 
 ```
