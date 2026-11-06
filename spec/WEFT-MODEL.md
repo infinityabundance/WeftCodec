@@ -713,13 +713,42 @@ A backend that cannot provide both conditional forms must not be used for this
 store. The refusal is the required behaviour, not a limitation to work around.
 
 Network and distributed filesystems. A POSIX-namespace target (for example 3FS)
-can be addressed through the local backend because it exposes files, `rename`,
-and `fsync`. That path is **not exercised by this repository**: no 3FS instance
-is available in the courts. A caller that configures a POSIX target must declare
-its real capabilities with `BackendKind::Posix { capabilities }`. If the target
-cannot honour `fsync` or atomic publication, the store refuses writable mode;
-before any production use its consistency and durability claims must be
-measured, not inferred from the API shape.
+is addressed through `BackendKind::ThreeFs { config }`, which has two
+transports over the **same** normative layout:
+
+- `posix` — ordinary positional `pread`/`pwrite`, `fsync`, and `rename` through
+the target's mount. This is the correctness baseline and it is what carries all
+control-state I/O in both modes.
+- `usrbio` — the hf3fs user-space ring API (`libhf3fs_api_shared.so`) for the
+immutable data plane only: one shared region, a read ring and a write ring,
+batched `hf3fs_prep_io`/`hf3fs_submit_ios`/`hf3fs_wait_for_ios`. The library is
+loaded with `dlopen`, never linked, and a missing library or missing symbol is
+`UnsupportedVersion` — never a silent fall back to POSIX.
+
+The buffer boundary is explicit. `BlobPlane::read_into` and
+`StorageBackend::read_into` fill a caller-owned buffer (one positional read; no
+intermediate `Vec`), and `read_ranges`/`read_ranges_into` express a batch. For
+`usrbio`, a destination that lies inside the shared region is passed to
+`hf3fs_prep_io` directly; any other destination is staged through the region
+and copied once. A request whose `[ptr, ptr+len)` is outside the region, an
+unregistered descriptor, or a batch larger than the ring or region bound is
+refused before submission.
+
+What is exercised, and what is not: the `posix` transport is tested for
+byte-identical state against the local backend, and the `usrbio` transport is
+tested against a conformance implementation of the published ABI over real
+POSIX I/O (`bench/threefs/hf3fs_shim.c`), including struct layout, registration
+lifetime, batched submission counts, partial completion, short reads, and error
+paths. **No 3FS deployment is run by this repository**, and that conformance
+library reports `hf3fs_is_hf3fs = 0`, which the transport records in
+diagnostics and receipts. No 3FS throughput, latency, RDMA, durability, or
+multi-node consistency claim follows.
+
+A caller that configures any other POSIX target must declare its real
+capabilities with `BackendKind::Posix { capabilities }`. If the target cannot
+honour `fsync` or atomic publication, the store refuses writable mode; before
+any production use its consistency and durability claims must be measured, not
+inferred from the API shape.
 
 ---
 
