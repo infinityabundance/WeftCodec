@@ -142,8 +142,14 @@ A reader MUST reject:
 | 6 | `TENSOR` | body is `u32le(meta_len) || WCB(meta) || element payload`; WEFT-AI-CODEC §2 |
 | 7 | `TOKEN_SEQUENCE` | body is `u32le(meta_len) || WCB(meta) || token payload`; WEFT-AI-CODEC §3 |
 | 8 | `QUANTIZED_TENSOR` | body is `u32le(meta_len) || WCB(meta) || packed element payload`; WEFT-AI-CODEC §4 |
-| 9 | `FLOAT_TENSOR` | body is `u32le(meta_len) || WCB(meta) || zstd exponent plane || raw sign+mantissa plane`; WEFT-AI-CODEC §5 |
-| 10..127 | — | reserved; `UnsupportedMode` |
+| 9 | `FLOAT_TENSOR` | body is `u32le(meta_len) || WCB(meta) || huffman-canonical-v1 exponent plane || raw sign+mantissa plane`; WEFT-AI-CODEC §5 |
+| 10 | `TENSOR_SHARDED` | body is `u32le(meta_len) || WCB(meta) || huffman-canonical-v1 stream`; WEFT-AI-CODEC §11 |
+| 11 | `WEIGHT_DELTA` | body is `u32le(meta_len) || WCB(meta) || huffman-canonical-v1 planes`; one dependency; WEFT-AI-CODEC §12 |
+| 12 | `KV_CACHE` | body is `u32le(meta_len) || WCB(meta) || huffman-canonical-v1 planes`; one page per frame; WEFT-AI-CODEC §13 |
+| 13 | `ACTIVATION_STREAM` | body is `u32le(meta_len) || WCB(meta) || huffman-canonical-v1 planes`; one chunk per frame; WEFT-AI-CODEC §14 |
+| 14 | `SEMANTIC_DELTA` | body is `u32le(meta_len) || WCB(meta) || huffman-canonical-v1 planes`; one dependency; WEFT-AI-CODEC §15 |
+| 15 | `TENSOR_TILED` | body is `u32le(meta_len) || WCB(meta) || tile payload`; WEFT-AI-CODEC §16 |
+| 16..127 | — | reserved; `UnsupportedMode` |
 | 128..255 | — | experimental; MUST be rejected for persistence |
 
 Global mode rules:
@@ -160,16 +166,19 @@ Global mode rules:
   body decodes with the dependency bytes as a raw content dictionary.
 - `STRUCTURED`: `domain == 1`, `mode == 5`, `body_len == decoded_len`; body is
   canonical WCB; `dep_count` MUST be `0` in v1; `chunk_count` MUST be `0`.
-- `TENSOR` (6) and `TOKEN_SEQUENCE` (7): `domain == 0`, `dep_count == 0`,
-  `chunk_count == 0`, `flags.DICT_RAW` clear, `body_len >= 4`. The frame's
-  `decoded_len` is the payload length and `content_hash` is
-  `H("weft/chunk/v1", payload)`. The body is exactly
+- AI modes 6–15: `domain == 0`, `chunk_count == 0`, `flags.DICT_RAW` clear,
+  `body_len >= 4`. The frame's `decoded_len` is the reconstructed payload
+  length and `content_hash` is `H("weft/chunk/v1", reconstructed payload)`.
+  Modes 6, 7, 8, 9, 10, 12, 13, and 15 have `dep_count == 0`; modes 11 and 14
+  have `dep_count == 1` naming the base tensor. The body is exactly
   `u32le(meta_len) || WCB(meta) || payload`, where the WCB descriptor is
   canonical and binds the payload with the mode-specific domain from §1.1.
-  Full descriptor validation, dtype tables, and token delta encoding are
-  normative in `WEFT-AI-CODEC.md` §2–§3. A decoder that does not implement
-  these modes MUST reject them as `UnsupportedMode`; it MUST NOT treat the
-  payload as opaque bytes.
+  Every entropy-coded plane uses `huffman-canonical-v1` (WEFT-AI-CODEC
+  §5.3.1), never a library zstd frame, so these modes are deterministic and
+  Rust and Go MUST emit byte-identical frames. Full descriptor, payload, and
+  validation rules are normative in `WEFT-AI-CODEC.md` §2–§16. A decoder that
+  does not implement one of these modes MUST reject it as `UnsupportedMode`;
+  it MUST NOT treat the payload as opaque bytes.
 
 Zstd decoding limits: window log ≤ 27, decoded output ≤ `decoded_len`, and
 `decoded_len` MUST be stated before decompression. Implementations MUST fail

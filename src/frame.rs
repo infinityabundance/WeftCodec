@@ -77,8 +77,8 @@ pub enum Mode {
     TokenSequence = 7,
     /// Affine quantized tensor (i8/u8) with WCB descriptor (WEFT-AI-CODEC §4).
     QuantizedTensor = 8,
-    /// Split float tensor: zstd exponent plane plus raw sign+mantissa plane
-    /// with WCB descriptor (WEFT-AI-CODEC §5).
+    /// Split float tensor: `huffman-canonical-v1` exponent plane plus raw
+    /// sign+mantissa plane with WCB descriptor (WEFT-AI-CODEC §5).
     FloatTensor = 9,
     /// Sharded quantized tensor shard with WCB descriptor (WEFT-AI-CODEC §11).
     TensorSharded = 10,
