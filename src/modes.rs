@@ -1460,17 +1460,6 @@ fn push_bits(out: &mut Vec<u8>, bit_len: &mut usize, value: u64, count: usize) {
     }
 }
 
-/// Read `count` bits, most significant first, from `plane` at `pos`.
-fn take_bits(plane: &[u8], pos: &mut usize, count: usize) -> u64 {
-    let mut value = 0u64;
-    for _ in 0..count {
-        let bit = (plane[*pos / 8] >> (7 - (*pos % 8))) & 1;
-        value = (value << 1) | u64::from(bit);
-        *pos += 1;
-    }
-    value
-}
-
 /// Split a little-endian float tensor payload into its two planes.
 ///
 /// Returns `(exponent_plane_huffman, mantissa_plane)`. The exponent plane is
@@ -1562,24 +1551,52 @@ pub fn join_float_tensor_payload(
 
     let capacity = usize::try_from(decoded_bytes)
         .map_err(|_| Error::limit_exceeded("float tensor decoded bytes do not fit usize"))?;
-    let mut out = Vec::with_capacity(capacity.min(1 << 20));
-    let mut bit_pos = 0usize;
-    for &exponent_byte in exponent_plane.iter() {
+
+    // The output is exactly the declared decoded byte count, which was bounded
+    // by `max_decoded_bytes` above, so the allocation is bounded as well.
+    let mut out = vec![0u8; capacity];
+    let mantissa_mask = (1u64 << mantissa_bits) - 1;
+    let width = sign_bits + mantissa_bits;
+    let width_bits = width as u32;
+
+    // MSB-first 64-bit accumulator holding the next `accumulated_bits` bits in
+    // its high positions and zeros below: refill eight bits at a time while a
+    // whole byte still fits, then read the whole sign+mantissa width in one
+    // shift and drop it by shifting left. `accumulated_bits >= width` always
+    // holds because the mantissa plane is exactly
+    // ceil(element_count * width / 8) bytes and `width <= 24`.
+    let mut accumulator = 0u64;
+    let mut accumulated_bits = 0u32;
+    let mut plane_pos = 0usize;
+    for (chunk, &exponent_byte) in out
+        .chunks_exact_mut(element_bytes)
+        .zip(exponent_plane.iter())
+    {
         if u64::from(exponent_byte) >> exponent_bits != 0 {
             return Err(Error::corrupt(
                 "float tensor exponent byte exceeds the dtype exponent width",
             ));
         }
-        let sign = take_bits(mantissa_plane, &mut bit_pos, sign_bits);
-        let mantissa = take_bits(mantissa_plane, &mut bit_pos, mantissa_bits);
+        while accumulated_bits <= 56 && plane_pos < mantissa_plane.len() {
+            accumulator |= u64::from(mantissa_plane[plane_pos]) << (56 - accumulated_bits);
+            plane_pos += 1;
+            accumulated_bits += 8;
+        }
+        let value = accumulator >> (64 - width_bits);
+        accumulator <<= width_bits;
+        accumulated_bits -= width_bits;
+
+        let sign = value >> mantissa_bits;
+        let mantissa = value & mantissa_mask;
         let word = (sign << (exponent_bits + mantissa_bits))
             | (u64::from(exponent_byte) << mantissa_bits)
             | mantissa;
-        out.extend_from_slice(&word.to_le_bytes()[..element_bytes]);
+        chunk.copy_from_slice(&word.to_le_bytes()[..element_bytes]);
     }
 
     // Unused low bits of the final mantissa byte are canonical zero padding.
-    let used_bytes_bits = mantissa_plane.len() * 8;
+    let bit_pos = expected_mantissa_bits;
+    let used_bytes_bits = (mantissa_plane.len() as u64) * 8;
     let padding = used_bytes_bits - bit_pos;
     if padding > 0 {
         let last = *mantissa_plane.last().expect("non-empty mantissa plane");
