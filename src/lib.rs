@@ -53,8 +53,9 @@ pub use activation_stream::{
     DecodedActivationChunk, StreamDtype, StreamKind, ACTIVATION_STREAM_SCHEMA,
 };
 pub use capability::{
-    public_key_for_seed, sign_envelope, verify_envelope, verify_envelope_for_tenant,
-    CapabilityBlob, CapabilityEnvelope, EnvelopeError, EnvelopeResult, Rejection, VerifiedEnvelope,
+    public_key_for_seed, sign_bytes, sign_envelope, verify_bytes, verify_envelope,
+    verify_envelope_for_tenant, CapabilityBlob, CapabilityEnvelope, EnvelopeError, EnvelopeResult,
+    Rejection, VerifiedEnvelope,
 };
 pub use error::{Error, ErrorClass, Result};
 pub use frame::{Dependency, Frame, FrameHeader, Mode};

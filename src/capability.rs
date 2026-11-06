@@ -833,6 +833,43 @@ pub fn public_key_for_seed(seed: &[u8]) -> Result<Hash32> {
     ))
 }
 
+/// Sign an arbitrary message with a 32-byte Ed25519 seed.
+///
+/// This is the same Ed25519 construction used by [`sign_envelope`], exposed so
+/// other Weft artifacts (for example a signed receipt bundle) reuse one
+/// implementation instead of adding a second signing path.
+pub fn sign_bytes(seed: &[u8], message: &[u8]) -> Result<Vec<u8>> {
+    if seed.len() != 32 {
+        return Err(Error::malformed(format!(
+            "Ed25519 seed must be 32 bytes, got {}",
+            seed.len()
+        )));
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(seed);
+    let signing_key = SigningKey::from_bytes(&key_bytes);
+    Ok(signing_key.sign(message).to_bytes().to_vec())
+}
+
+/// Verify a detached Ed25519 signature over an arbitrary message.
+///
+/// Uses `verify_strict`, the same primitive as [`verify_envelope`].
+pub fn verify_bytes(public_key: &Hash32, message: &[u8], signature: &[u8]) -> Result<()> {
+    if signature.len() != SIGNATURE_LEN {
+        return Err(Error::malformed(format!(
+            "Ed25519 signature must be {SIGNATURE_LEN} bytes, got {}",
+            signature.len()
+        )));
+    }
+    let verifying_key = VerifyingKey::from_bytes(public_key.as_bytes())
+        .map_err(|err| Error::corrupt(format!("invalid Ed25519 public key: {err}")))?;
+    let signature = Signature::from_slice(signature)
+        .map_err(|err| Error::malformed(format!("invalid signature encoding: {err}")))?;
+    verifying_key
+        .verify_strict(message, &signature)
+        .map_err(|_| Error::corrupt("Ed25519 signature does not verify"))
+}
+
 /// Sign a canonical envelope with a 32-byte Ed25519 seed.
 pub fn sign_envelope(envelope: &CapabilityEnvelope, seed: &[u8]) -> Result<CapabilityBlob> {
     if seed.len() != 32 {
