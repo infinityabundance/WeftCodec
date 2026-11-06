@@ -345,6 +345,94 @@ merkle` flag; otherwise v1 (or v2) bytes are unchanged.
 - v3 is byte-identical across implementations: the same bytes and `chunk_size`
 MUST produce the same root in Rust and Go.
 
+### 2.3.3 Immutable overlay manifests (v4, experimental)
+
+A writer MAY represent a file as an immutable **base** manifest plus an ordered
+list of immutable **extents**, schema `"weft.manifest.v4"` (one spelling, no
+alias). The key set is exact:
+
+```
+{
+  "schema": "weft.manifest.v4",
+  "size": u64,
+  "chunk_size": u64,
+  "content_root": bytes32,
+  "content_identity": "merkle-v1",
+  "representation": map
+}
+```
+
+A v4 manifest carries **no top-level chunk table**. The `representation` map is
+`kind:"overlay"` with exactly these fields:
+
+```
+{
+  "kind": "overlay",
+  "base": bytes32,               # previous manifest id
+  "base_content_root": bytes32,
+  "base_size": u64,
+  "depth": u64,                  # chained overlay manifests, this one included
+  "overlay_bytes": u64,          # total logical bytes carried by the chain
+  "decoded_size": u64,           # MUST equal size
+  "extents": [ extent, ... ],
+  "strategy": "overlay"
+}
+
+extent = {
+  "offset": u64,                 # chunk-grid aligned
+  "length": u64,                 # positive
+  "chunks": [ {"hash":bytes32,"len":u64}, ... ]
+}
+```
+
+Rules:
+
+- **Base binding.** `base` MUST be the manifest id of an immutable base, and
+  `base_content_root` / `base_size` MUST equal that base manifest's
+  `content_root` / `size`. The base MUST itself be a Merkle chunk table: a
+  `weft.manifest.v3` raw manifest or another v4 overlay. A frame-backed v2
+  representation, a v1/v2 whole-file manifest, a missing base, or a mismatched
+  base is `Corrupt` on read. A base chain MUST be acyclic.
+- **Depth.** `depth` MUST equal one for a v3 base and `base.depth + 1` for a v4
+  base. Readers MUST reject a chain deeper than 256 manifests with
+  `LimitExceeded`; a writer MUST compact rather than exceed that bound.
+- **Extent grid.** Extents in one manifest MUST be sorted by ascending
+  `offset`, MUST NOT overlap, and MAY be adjacent (`end == next.offset`).
+  `offset` MUST be a multiple of `chunk_size`; `length` MUST be positive and
+  MUST end at EOF or on a chunk boundary. Each listed chunk MUST have the full
+  `chunk_size` except the final chunk of the file. The chunk count MUST equal
+  `ceil(length / chunk_size)` and the chunk lengths MUST sum to `length`. A
+  manifest lists between 1 and 64 extents. Non-canonical ordering or overlap
+  is `Malformed`; an extent past EOF, a zero-length chunk, a chunk-count or
+  length-sum mismatch, or a chunk-length disagreement is `Corrupt`.
+- **Accounting.** `overlay_bytes` MUST equal the base chain's `overlay_bytes`
+  (zero for a v3 base) plus the sum of this manifest's extent lengths. A value
+  smaller than either component is `Corrupt`.
+- **Derived table.** The canonical chunk table starts from the base's canonical
+  table and applies this manifest's extents in order. An extent replaces the
+  chunk references at its grid positions and may append past the base's end;
+  a hole between the base end and an extent is `Corrupt`. The resulting table
+  MUST sum to `size` and MUST have every chunk full except the final one.
+- **Logical identity.** `content_root` MUST equal the Merkle root of the derived
+  canonical chunk table. This is exactly the root a canonical single-table
+  `weft.manifest.v3` over the same logical bytes at the same `chunk_size`
+  produces. A mismatch is `Corrupt`. Overlap between layers follows
+  newest-wins: the later (higher) layer's extent replaces the earlier
+  representation at those chunks.
+- **Reads.** Resolving an overlay reads manifest blobs only; it MUST NOT fetch
+  a content chunk merely to reconstruct the table. A range read MUST fetch only
+  the chunks intersecting the requested range, verify each chunk blob against
+  its declared hash, and, for a whole-file read, recompute the Merkle root.
+- **Retention.** While any object, snapshot, checkpoint, or pin reaches a v4
+  manifest, GC MUST retain that manifest blob, its base chain, and every chunk
+  named by every retained layer. A chunk or base manifest reachable only
+  through an unreferenced overlay is collectable.
+- **Additive.** v1, v2, and v3 encodings and decodings are unchanged. A v4
+  manifest is written only when overlay representation is selected explicitly;
+  absent that selection the existing writers emit their existing bytes. v4 is
+  experimental: an implementation that does not understand it MUST reject it
+  with `UnsupportedVersion` rather than guess.
+
 ### 2.3.1 Derived identities
 
 ```
