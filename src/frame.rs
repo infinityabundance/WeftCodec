@@ -96,6 +96,9 @@ pub enum Mode {
     /// Independently decodable tensor tiles with a WCB descriptor
     /// (WEFT-AI-CODEC §16).
     TensorTiled = 15,
+    /// Zero-run coded exact word-wise delta against a base frame
+    /// (WEFT-AI-CODEC §17).
+    SparseDelta = 16,
 }
 
 impl Mode {
@@ -118,7 +121,8 @@ impl Mode {
             13 => Ok(Mode::ActivationStream),
             14 => Ok(Mode::SemanticDelta),
             15 => Ok(Mode::TensorTiled),
-            16..=127 => Err(Error::unsupported_mode(format!(
+            16 => Ok(Mode::SparseDelta),
+            17..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -151,6 +155,7 @@ impl Mode {
             Mode::ActivationStream => "activation_stream",
             Mode::SemanticDelta => "semantic_delta",
             Mode::TensorTiled => "tensor_tiled",
+            Mode::SparseDelta => "sparse_delta",
         }
     }
 
@@ -173,6 +178,7 @@ impl Mode {
             "activation_stream" | "activation-stream" | "activation" => Ok(Mode::ActivationStream),
             "semantic_delta" | "semantic-delta" | "semanticdelta" => Ok(Mode::SemanticDelta),
             "tensor_tiled" | "tensor-tiled" | "tiled" => Ok(Mode::TensorTiled),
+            "sparse_delta" | "sparse-delta" | "sparsedelta" => Ok(Mode::SparseDelta),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -864,10 +870,11 @@ fn validate_mode_rules(
                 ));
             }
         }
-        Mode::WeightDelta | Mode::SemanticDelta => {
+        Mode::WeightDelta | Mode::SemanticDelta | Mode::SparseDelta => {
             let mode_name = match header.mode {
                 Mode::WeightDelta => "WEIGHT_DELTA",
-                _ => "SEMANTIC_DELTA",
+                Mode::SemanticDelta => "SEMANTIC_DELTA",
+                _ => "SPARSE_DELTA",
             };
             if header.domain != DOMAIN_PAYLOAD {
                 return Err(Error::malformed(format!(

@@ -451,7 +451,7 @@ pub(crate) fn push_word(dtype: WeightDtype, word: u32, out: &mut Vec<u8>) {
     }
 }
 
-fn mod_mask(dtype: WeightDtype) -> u32 {
+pub(crate) fn mod_mask(dtype: WeightDtype) -> u32 {
     match dtype.word_bits() {
         32 => u32::MAX,
         16 => 0xFFFF,
@@ -461,11 +461,11 @@ fn mod_mask(dtype: WeightDtype) -> u32 {
     }
 }
 
-fn delta_word(dtype: WeightDtype, target: u32, base: u32) -> u32 {
+pub(crate) fn delta_word(dtype: WeightDtype, target: u32, base: u32) -> u32 {
     target.wrapping_sub(base) & mod_mask(dtype)
 }
 
-fn target_word(dtype: WeightDtype, delta: u32, base: u32) -> u32 {
+pub(crate) fn target_word(dtype: WeightDtype, delta: u32, base: u32) -> u32 {
     delta.wrapping_add(base) & mod_mask(dtype)
 }
 
@@ -555,14 +555,18 @@ pub fn base_frame_descriptor(
             let meta = modes::float_tensor_metadata(frame, limits)?;
             Ok((float_dtype_to_weight(meta.dtype)?, meta.shape))
         }
-        Mode::WeightDelta | Mode::SemanticDelta => {
+        Mode::WeightDelta | Mode::SemanticDelta | Mode::SparseDelta => {
             let (dtype, shape) = match frame.header.mode {
                 Mode::WeightDelta => {
                     let meta = weight_delta_metadata(frame, limits)?;
                     (meta.dtype, meta.shape)
                 }
-                _ => {
+                Mode::SemanticDelta => {
                     let meta = crate::semantic_delta::semantic_delta_metadata(frame, limits)?;
+                    (meta.dtype, meta.shape)
+                }
+                _ => {
+                    let meta = crate::sparse_delta::sparse_delta_metadata(frame, limits)?;
                     (meta.dtype, meta.shape)
                 }
             };

@@ -194,28 +194,33 @@ An implementation MUST NOT silently downgrade a `causal_exact` artifact to
 | 13 | `ACTIVATION_STREAM` | `u32le(meta_len) || WCB(meta) || huffman-canonical-v1 planes`; one chunk per frame |
 | 14 | `SEMANTIC_DELTA` | `u32le(meta_len) || WCB(weft.ai.semantic_delta.v1) || huffman-canonical-v1 planes`; one dependency |
 | 15 | `TENSOR_TILED` | `u32le(meta_len) || WCB(meta) || tile payload` |
+| 16 | `SPARSE_DELTA` | `u32le(meta_len) || WCB(weft.ai.sparse_delta.v1) || u32le(run_count) || zero-run records`; one dependency |
 
 This is an additive extension of the `weftcodec-format 1.0` mode space, not a
 change to existing modes. Rules:
 
 - A reader that does not implement these modes MUST reject them as
   `UnsupportedMode`. It MUST NOT treat the payload as opaque bytes.
-- Mode values `16..=127` stay reserved and `128..=255` stay experimental.
+- Mode values `17..=127` stay reserved and `128..=255` stay experimental.
 - The new hash domains `weft/tensor/payload/v1`,
   `weft/tokens/payload/v1`, `weft/quantized-tensor/payload/v1`,
   `weft/float-tensor/payload/v1`, and `weft/tensor-sharded/payload/v1` are
-  additive; existing domains are unchanged. Modes 10, 11, 14, and 15 also bind
-  logical identity under `weft/tensor/values/v1`, mode 15 adds
+  additive; existing domains are unchanged. Modes 10, 11, 14, 15, and 16 also
+  bind logical identity under `weft/tensor/values/v1`, mode 15 adds
   `weft/tensor/tile/v1`, and mode 14 adds `weft/tensor/semantic/v1` and
-  `weft/tensor/semantic-values/v1`.
+  `weft/tensor/semantic-values/v1`. Mode 16 introduces no hash domain of its
+  own: it reuses `weft/tensor/values/v1` for `delta_root` and
+  `weft/chunk/v1` for the reconstructed content.
 - Neither mode changes RAW, ZSTD, REFERENCE, DELTA, DICTIONARY, STRUCTURED, the
   header, the tables, WCB, or selector bytes.
 - Historical vector `017_unknown_mode` asserted that value 6 was unknown. It is
   retained byte-for-byte and marked `superseded_by`
   `017_unknown_mode_reserved8`; both replay suites skip superseded vectors.
-  The authoritative reserved-value reject is now mode 16.
-- Modes 6–15 are deterministic. Entropy-coded planes use
+  The authoritative reserved-value reject is now mode 17.
+- Modes 6–16 are deterministic. Entropy-coded planes use
   `huffman-canonical-v1` (WEFT-AI-CODEC §5.3.1), not a library zstd frame, so
   cross-language conformance requires byte-identical frames **and** decode
-  equivalence in both directions. This includes `FLOAT_TENSOR`; the historical
+  equivalence in both directions. Mode 16 is a varint run stream with no
+  entropy coder; it is byte-identical for the same input by construction. This
+  includes `FLOAT_TENSOR`; the historical
   "byte identity depends on the two zstd encoders" note is superseded.

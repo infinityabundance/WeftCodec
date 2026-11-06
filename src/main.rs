@@ -25,6 +25,7 @@ use weftcodec::modes;
 use weftcodec::selector;
 use weftcodec::semantic::SemanticPolicy;
 use weftcodec::semantic_delta;
+use weftcodec::sparse_delta;
 use weftcodec::tensor;
 use weftcodec::tensor_sharded;
 use weftcodec::wcb;
@@ -97,7 +98,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "tensor_tiled", "tensor-tiled", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "kv_cache", "kv-cache", "activation_stream", "activation-stream", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "tensor_tiled", "tensor-tiled", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "sparse_delta", "sparse-delta", "kv_cache", "kv-cache", "activation_stream", "activation-stream", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -238,6 +239,8 @@ struct LimitArgs {
     max_tensor_rank: u64,
     #[arg(long, default_value_t = limits::DEFAULT_MAX_TOKENS)]
     max_tokens: u64,
+    #[arg(long, default_value_t = limits::DEFAULT_MAX_SPARSE_RUNS)]
+    max_sparse_runs: u64,
     #[arg(long, default_value_t = limits::DEFAULT_MAX_STRUCTURED_DEPTH)]
     max_structured_depth: u64,
     #[arg(long, default_value_t = limits::DEFAULT_MAX_STRUCTURED_ITEMS)]
@@ -266,6 +269,7 @@ impl LimitArgs {
             max_tensor_elements: self.max_tensor_elements,
             max_tensor_rank: self.max_tensor_rank,
             max_tokens: self.max_tokens,
+            max_sparse_runs: self.max_sparse_runs,
             max_structured_depth: self.max_structured_depth,
             max_structured_items: self.max_structured_items,
             max_selector_bytes: self.max_selector_bytes,
@@ -584,6 +588,9 @@ struct ConformanceArgs {
     /// Write only the WEIGHT_DELTA (mode 11) vectors into `<dir>/weight-delta`.
     #[arg(long)]
     weight_delta_only: bool,
+    /// Write only the SPARSE_DELTA (mode 16) vectors into `<dir>/sparse-delta`.
+    #[arg(long)]
+    sparse_delta_only: bool,
     /// Write only the SEMANTIC_DELTA (mode 14) and semantic-root vectors into
     /// `<dir>/semantic-delta` and `<dir>/semantic-root`.
     #[arg(long)]
@@ -688,6 +695,9 @@ fn run(cli: Cli) -> Result<()> {
             } else if args.weight_delta_only {
                 weftcodec::conformance::generate_weight_delta_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote weight-delta vectors to {}/weight-delta", args.dir);
+            } else if args.sparse_delta_only {
+                weftcodec::conformance::generate_sparse_delta_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote sparse-delta vectors to {}/sparse-delta", args.dir);
             } else if args.semantic_delta_only {
                 weftcodec::conformance::generate_semantic_delta_v1(Path::new(&args.dir), &limits)?;
                 eprintln!(
@@ -763,6 +773,12 @@ fn encode(args: EncodeArgs) -> Result<()> {
             .as_deref()
             .ok_or_else(|| Error::malformed("WEIGHT_DELTA encoding requires --base FRAME"))?;
         weight_delta::encode_weight_delta(&data, dtype, &shape, base_frame, &limits)?
+    } else if args.mode == "sparse_delta" || args.mode == "sparse-delta" {
+        let (dtype, shape) = weight_delta_metadata_args(&args)?;
+        let base_frame = base
+            .as_deref()
+            .ok_or_else(|| Error::malformed("SPARSE_DELTA encoding requires --base FRAME"))?;
+        sparse_delta::encode_sparse_delta(&data, dtype, &shape, base_frame, &limits)?
     } else if args.mode == "semantic_delta" || args.mode == "semantic-delta" {
         let (dtype, shape) = weight_delta_metadata_args(&args)?;
         let policy = semantic_policy_arg(&args)?;
@@ -854,6 +870,9 @@ fn encode_mode(
         )),
         Mode::WeightDelta => Err(Error::malformed(
             "WEIGHT_DELTA encoding requires the dedicated CLI path with --base/--dtype/--shape",
+        )),
+        Mode::SparseDelta => Err(Error::malformed(
+            "SPARSE_DELTA encoding requires the dedicated CLI path with --base/--dtype/--shape",
         )),
         Mode::SemanticDelta => Err(Error::malformed(
             "SEMANTIC_DELTA encoding requires the dedicated CLI path with --base/--dtype/--shape/--semantic-policy",
@@ -1366,7 +1385,10 @@ fn decode(args: DecodeArgs) -> Result<()> {
     // `--base` supplies the base frame explicitly. `--resolve` is an explicit
     // opt-in to the DAG resolver, which also verifies the base frame's own
     // dtype/shape descriptor.
-    if root.header.mode == Mode::WeightDelta || root.header.mode == Mode::SemanticDelta {
+    if root.header.mode == Mode::WeightDelta
+        || root.header.mode == Mode::SemanticDelta
+        || root.header.mode == Mode::SparseDelta
+    {
         if args.resolve && args.frame_source.is_none() {
             return Err(Error::malformed(
                 "delta modes require --frame-source with --resolve",
@@ -1377,6 +1399,13 @@ fn decode(args: DecodeArgs) -> Result<()> {
             let resolver = resolver_for(args.deps.as_deref());
             let plaintext = if root.header.mode == Mode::SemanticDelta {
                 semantic_delta::decode_with_base_frame(
+                    &root,
+                    &base_bytes,
+                    resolver.as_ref(),
+                    &limits,
+                )?
+            } else if root.header.mode == Mode::SparseDelta {
+                sparse_delta::decode_with_base_frame(
                     &root,
                     &base_bytes,
                     resolver.as_ref(),
@@ -1394,7 +1423,7 @@ fn decode(args: DecodeArgs) -> Result<()> {
         }
     } else if args.resolve {
         return Err(Error::malformed(
-            "--resolve applies only to WEIGHT_DELTA and SEMANTIC_DELTA frames",
+            "--resolve applies only to WEIGHT_DELTA, SEMANTIC_DELTA, and SPARSE_DELTA frames",
         ));
     }
 
@@ -1500,6 +1529,17 @@ fn inspect(args: InspectArgs) -> Result<()> {
             output["delta_root"] = json!(meta.delta_root.to_hex());
             output["payload_len"] = json!(meta.payload_len);
         }
+        if header.mode == Mode::SparseDelta {
+            let meta = sparse_delta::sparse_delta_metadata(&frame, &limits)?;
+            output["dtype"] = json!(meta.dtype.as_str());
+            output["shape"] = json!(meta.shape);
+            output["element_count"] = json!(meta.element_count);
+            output["storage_bytes"] = json!(meta.storage_bytes);
+            output["op"] = json!(meta.op);
+            output["sparse_codec"] = json!(meta.sparse_codec);
+            output["base_content_root"] = json!(meta.base.to_hex());
+            output["delta_root"] = json!(meta.delta_root.to_hex());
+        }
         if header.mode == Mode::SemanticDelta {
             let meta = semantic_delta::semantic_delta_metadata(&frame, &limits)?;
             output["dtype"] = json!(meta.dtype.as_str());
@@ -1585,6 +1625,17 @@ fn inspect(args: InspectArgs) -> Result<()> {
             println!("plane_codec: {}", meta.plane_codec);
             println!("delta_root: {}", meta.delta_root);
             println!("payload_len: {}", meta.payload_len);
+        }
+        if header.mode == Mode::SparseDelta {
+            let meta = sparse_delta::sparse_delta_metadata(&frame, &limits)?;
+            println!("dtype: {}", meta.dtype.as_str());
+            println!("shape: {:?}", meta.shape);
+            println!("element_count: {}", meta.element_count);
+            println!("storage_bytes: {}", meta.storage_bytes);
+            println!("op: {}", meta.op);
+            println!("sparse_codec: {}", meta.sparse_codec);
+            println!("base_content_root: {}", meta.base);
+            println!("delta_root: {}", meta.delta_root);
         }
         if header.mode == Mode::SemanticDelta {
             let meta = semantic_delta::semantic_delta_metadata(&frame, &limits)?;

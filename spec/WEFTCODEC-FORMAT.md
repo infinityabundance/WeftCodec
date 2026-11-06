@@ -149,7 +149,8 @@ A reader MUST reject:
 | 13 | `ACTIVATION_STREAM` | body is `u32le(meta_len) || WCB(meta) || huffman-canonical-v1 planes`; one chunk per frame; WEFT-AI-CODEC §14 |
 | 14 | `SEMANTIC_DELTA` | body is `u32le(meta_len) || WCB(meta) || huffman-canonical-v1 planes`; one dependency; WEFT-AI-CODEC §15 |
 | 15 | `TENSOR_TILED` | body is `u32le(meta_len) || WCB(meta) || tile payload`; WEFT-AI-CODEC §16 |
-| 16..127 | — | reserved; `UnsupportedMode` |
+| 16 | `SPARSE_DELTA` | body is `u32le(meta_len) || WCB(meta) || u32le(run_count) || zero-run records`; one dependency; WEFT-AI-CODEC §17 |
+| 17..127 | — | reserved; `UnsupportedMode` |
 | 128..255 | — | experimental; MUST be rejected for persistence |
 
 Global mode rules:
@@ -166,19 +167,21 @@ Global mode rules:
   body decodes with the dependency bytes as a raw content dictionary.
 - `STRUCTURED`: `domain == 1`, `mode == 5`, `body_len == decoded_len`; body is
   canonical WCB; `dep_count` MUST be `0` in v1; `chunk_count` MUST be `0`.
-- AI modes 6–15: `domain == 0`, `chunk_count == 0`, `flags.DICT_RAW` clear,
+- AI modes 6–16: `domain == 0`, `chunk_count == 0`, `flags.DICT_RAW` clear,
   `body_len >= 4`. The frame's `decoded_len` is the reconstructed payload
   length and `content_hash` is `H("weft/chunk/v1", reconstructed payload)`.
-  Modes 6, 7, 8, 9, 10, 12, 13, and 15 have `dep_count == 0`; modes 11 and 14
-  have `dep_count == 1` naming the base tensor. The body is exactly
+  Modes 6, 7, 8, 9, 10, 12, 13, and 15 have `dep_count == 0`; modes 11, 14, and
+  16 have `dep_count == 1` naming the base tensor. The body is exactly
   `u32le(meta_len) || WCB(meta) || payload`, where the WCB descriptor is
   canonical and binds the payload with the mode-specific domain from §1.1.
   Every entropy-coded plane uses `huffman-canonical-v1` (WEFT-AI-CODEC
   §5.3.1), never a library zstd frame, so these modes are deterministic and
-  Rust and Go MUST emit byte-identical frames. Full descriptor, payload, and
-  validation rules are normative in `WEFT-AI-CODEC.md` §2–§16. A decoder that
-  does not implement one of these modes MUST reject it as `UnsupportedMode`;
-  it MUST NOT treat the payload as opaque bytes.
+  Rust and Go MUST emit byte-identical frames. Mode 16 is not entropy-coded at
+  all: its payload is a varint run stream (WEFT-AI-CODEC §17.3). Full
+  descriptor, payload, and validation rules are normative in
+  `WEFT-AI-CODEC.md` §2–§17. A decoder that does not implement one of these
+  modes MUST reject it as `UnsupportedMode`; it MUST NOT treat the payload as
+  opaque bytes.
 
 Zstd decoding limits: window log ≤ 27, decoded output ≤ `decoded_len`, and
 `decoded_len` MUST be stated before decompression. Implementations MUST fail
@@ -370,6 +373,7 @@ a snapshot, or evidence that any object matches.
 | `max_tensor_elements` | 4,294,967,296 |
 | `max_tensor_rank` | 8 |
 | `max_tokens` | 16,777,216 |
+| `max_sparse_runs` | 16,777,216 |
 
 A decoder MUST enforce every applicable limit before allocating. A frame that
 would exceed a limit is `LimitExceeded`, even if it is otherwise well formed.
@@ -424,11 +428,12 @@ compressed or descriptor bytes.
   readers already implement; otherwise it requires a major version.
 - Allocating a previously reserved mode value is an additive extension that
   old readers must reject as `UnsupportedMode` (fail closed). `TENSOR` (6),
-  `TOKEN_SEQUENCE` (7), `QUANTIZED_TENSOR` (8), and `FLOAT_TENSOR` (9) were
-  allocated this way; `WEFT-AI-CODEC.md` is normative for their bodies.
-  Historical vector `017_unknown_mode` asserted that value 6 was unknown; it is
-  retained byte-for-byte and marked `superseded_by` the current reserved-value
-  vector `017_unknown_mode_reserved10`.
+  `TOKEN_SEQUENCE` (7), `QUANTIZED_TENSOR` (8), `FLOAT_TENSOR` (9),
+  `TENSOR_TILED` (15), and `SPARSE_DELTA` (16) were allocated this way;
+  `WEFT-AI-CODEC.md` is normative for their bodies. Historical vector
+  `017_unknown_mode` asserted that value 6 was unknown; it is retained
+  byte-for-byte and marked `superseded_by` the current reserved-value vector
+  `017_unknown_mode_reserved17`.
 - Unknown critical flags/features/modes fail closed.
 - Frozen v1 vectors are append-only; they are never regenerated to hide a
   change.

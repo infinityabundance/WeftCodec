@@ -31,6 +31,7 @@ use crate::modes;
 use crate::selector;
 use crate::semantic::{SemanticPolicy, SemanticRootRecord, SEMANTIC_SCHEMA};
 use crate::semantic_delta::{self, SemanticDeltaMeta, SEMANTIC_DELTA_SCHEMA};
+use crate::sparse_delta::{self, SparseDeltaMeta};
 use crate::tensor::{self, LayoutDescriptor, LogicalRecord, TensorLayout};
 use crate::tensor_sharded;
 use crate::varint;
@@ -54,6 +55,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let activation_stream_dir = dir.join("activation-stream");
     let capability_dir = dir.join("capability");
     let tensor_tiled_dir = dir.join("tensor-tiled");
+    let sparse_delta_dir = dir.join("sparse-delta");
     for sub in [
         &codec_dir,
         &structured_dir,
@@ -69,6 +71,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
         &activation_stream_dir,
         &capability_dir,
         &tensor_tiled_dir,
+        &sparse_delta_dir,
     ] {
         fs::create_dir_all(sub)
             .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
@@ -88,6 +91,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_activation_stream_vectors(&activation_stream_dir, limits)?;
     write_capability_vectors(&capability_dir, limits)?;
     write_tiled_vectors(&tensor_tiled_dir, limits)?;
+    write_sparse_delta_vectors(&sparse_delta_dir, limits)?;
     Ok(())
 }
 
@@ -123,6 +127,14 @@ pub fn generate_weight_delta_v1(dir: &Path, limits: &Limits) -> Result<()> {
     fs::create_dir_all(&weight_delta_dir)
         .map_err(|e| Error::io(format!("cannot create {}: {e}", weight_delta_dir.display())))?;
     write_weight_delta_vectors(&weight_delta_dir, limits)
+}
+
+/// Generate only the SPARSE_DELTA (mode 16) vectors into `<dir>/sparse-delta`.
+pub fn generate_sparse_delta_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let sparse_delta_dir = dir.join("sparse-delta");
+    fs::create_dir_all(&sparse_delta_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", sparse_delta_dir.display())))?;
+    write_sparse_delta_vectors(&sparse_delta_dir, limits)
 }
 
 /// Generate only the SEMANTIC_DELTA (mode 14) and semantic-root vectors into
@@ -664,9 +676,24 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     let mut unknown_mode = good.clone();
     unknown_mode[7] = 16;
     refix_header_and_trailer(&mut unknown_mode);
-    push_error(
+    push_error_superseded(
         &mut vectors,
         "017_unknown_mode_reserved16",
+        "raw",
+        &unknown_mode,
+        &[],
+        ErrorClass::UnsupportedMode,
+        None,
+        "017_unknown_mode_reserved17",
+        "Historical: this vector asserted that mode value 16 was reserved. WEFT-AI-CODEC allocates 16 to SPARSE_DELTA, so the authoritative unknown-mode vector is 017_unknown_mode_reserved17. The frozen bytes and original expectation are retained unchanged.",
+    );
+
+    let mut unknown_mode = good.clone();
+    unknown_mode[7] = 17;
+    refix_header_and_trailer(&mut unknown_mode);
+    push_error(
+        &mut vectors,
+        "017_unknown_mode_reserved17",
         "raw",
         &unknown_mode,
         &[],
@@ -3529,6 +3556,498 @@ fn write_weight_delta_vectors(dir: &Path, limits: &Limits) -> Result<()> {
 
 fn blake3_hex(bytes: &[u8]) -> String {
     hash_domain(DOMAIN_CHUNK, bytes).to_hex()
+}
+
+// ---------------------------------------------------------------------------
+// Mode 16 SPARSE_DELTA
+// ---------------------------------------------------------------------------
+
+/// Build a `zero-run-v1` payload from explicit records.
+fn sparse_payload(run_count: u32, records: &[(u64, [u8; 4])], storage: usize) -> Vec<u8> {
+    let mut out = run_count.to_le_bytes().to_vec();
+    for (zero_run, word) in records {
+        varint::encode(*zero_run, &mut out);
+        out.extend_from_slice(&word[..storage]);
+    }
+    out
+}
+
+fn sparse_delta_frame(
+    meta: &SparseDeltaMeta,
+    payload: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    base_mode: u32,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    sparse_delta::encode_descriptor_frame(
+        meta,
+        payload,
+        decoded_len,
+        content_hash,
+        base_mode,
+        limits,
+    )
+}
+
+fn sparse_parts(frame_bytes: &[u8], limits: &Limits) -> Result<(SparseDeltaMeta, Vec<u8>)> {
+    let parsed = Frame::parse(frame_bytes, limits)?;
+    let meta = sparse_delta::sparse_delta_metadata(&parsed, limits)?;
+    let body = parsed.body;
+    let meta_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    Ok((meta, body[4 + meta_len..].to_vec()))
+}
+
+fn write_sparse_delta_valid(
+    dir: &Path,
+    name: &str,
+    dtype: WeightDtype,
+    shape: &[u64],
+    base_frame: &[u8],
+    target: &[u8],
+    limits: &Limits,
+) -> Result<()> {
+    let frame = sparse_delta::encode_sparse_delta(target, dtype, shape, base_frame, limits)?;
+    let (meta, payload) = sparse_parts(&frame, limits)?;
+    let parsed = Frame::parse(&frame, limits)?;
+    let decoded = sparse_delta::decode_with_base_frame(
+        &parsed,
+        base_frame,
+        &crate::dependency::MapResolver::new(),
+        limits,
+    )?;
+    if decoded != target {
+        return Err(Error::corrupt("SPARSE_DELTA vector does not reconstruct"));
+    }
+    if payload.len() < 4 {
+        return Err(Error::corrupt("SPARSE_DELTA payload has no run_count"));
+    }
+    let run_count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let vector = json!({
+        "name": name,
+        "schema": sparse_delta::SPARSE_DELTA_SCHEMA,
+        "dtype": meta.dtype.as_str(),
+        "shape": meta.shape,
+        "element_count": meta.element_count,
+        "storage_bytes": meta.storage_bytes,
+        "op": meta.op,
+        "sparse_codec": meta.sparse_codec,
+        "base": meta.base.to_hex(),
+        "delta_root": meta.delta_root.to_hex(),
+        "run_count": run_count,
+        "payload_len": payload.len(),
+        "target_hash": blake3_hex(target),
+        "target_hex": hexs(target),
+        "base_frame_hex": hexs(base_frame),
+        "delta_frame_hex": hexs(&frame),
+        "expect": { "ok": true },
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_sparse_delta_reject(
+    dir: &Path,
+    name: &str,
+    delta_frame: &[u8],
+    base_frame: Option<&[u8]>,
+    expected: ErrorClass,
+    note: &str,
+    use_frame_source: bool,
+    limits_override: Option<Json>,
+) -> Result<()> {
+    let mut vector = json!({
+        "name": name,
+        "expect_error": expected.as_str(),
+        "note": note,
+        "base_frame_hex": base_frame.map(hexs),
+        "delta_frame_hex": hexs(delta_frame),
+        "use_frame_source": use_frame_source,
+    });
+    if let Some(limits) = limits_override {
+        vector["limits"] = limits;
+    }
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn write_sparse_delta_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    // --- valid ------------------------------------------------------------
+    // 001: an all-zero delta. run_count = 0 reconstructs the base exactly.
+    let bf16_words: [u16; 6] = [0x3F80, 0xC000, 0x0000, 0x7FC0, 0x8000, 0x0001];
+    let mut bf16_bytes = Vec::with_capacity(12);
+    for word in bf16_words {
+        bf16_bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let bf16_base = modes::encode_tensor(&bf16_bytes, modes::TensorDtype::Bf16, &[2, 3], limits)?;
+    write_sparse_delta_valid(
+        dir,
+        "001_bf16_all_zero_delta",
+        WeightDtype::Bf16,
+        &[2, 3],
+        &bf16_base,
+        &bf16_bytes,
+        limits,
+    )?;
+
+    // 002: exactly one non-zero fp32 word.
+    let fp32_words: [u32; 4] = [0x7FC0_0001, 0x8000_0000, 0x0000_0001, 0x7F80_0000];
+    let mut fp32_base_bytes = Vec::with_capacity(16);
+    for word in fp32_words {
+        fp32_base_bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut fp32_target_bytes = fp32_base_bytes.clone();
+    fp32_target_bytes[8..12].copy_from_slice(&0x3F80_0000u32.to_le_bytes());
+    let fp32_base =
+        modes::encode_tensor(&fp32_base_bytes, modes::TensorDtype::F32, &[2, 2], limits)?;
+    write_sparse_delta_valid(
+        dir,
+        "002_fp32_one_nonzero_word",
+        WeightDtype::Fp32,
+        &[2, 2],
+        &fp32_base,
+        &fp32_target_bytes,
+        limits,
+    )?;
+
+    // 003: several runs, with the last record emitting the final element.
+    let q8_base_bytes: [u8; 8] = [0x80, 0xFF, 0x00, 0x01, 0x7F, 0x2A, 0xF9, 0x64];
+    let mut q8_target_bytes = q8_base_bytes;
+    q8_target_bytes[0] = 0x81; // index 0
+    q8_target_bytes[3] = 0x03; // index 3
+    q8_target_bytes[7] = 0x62; // index 7 = element_count - 1
+    let q8_base = modes::encode_tensor(&q8_base_bytes, modes::TensorDtype::I8, &[2, 4], limits)?;
+    write_sparse_delta_valid(
+        dir,
+        "003_q8_0_several_runs_to_the_end",
+        WeightDtype::Q8_0,
+        &[2, 4],
+        &q8_base,
+        &q8_target_bytes,
+        limits,
+    )?;
+
+    // 004: a fully dense fp16 delta (run_count == element_count).
+    let fp16_words: [u16; 5] = [0x3C00, 0xBC00, 0x0000, 0x8000, 0x7E00];
+    let mut fp16_base_bytes = Vec::with_capacity(10);
+    for word in fp16_words {
+        fp16_base_bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut fp16_target_bytes = fp16_base_bytes.clone();
+    for (index, word) in fp16_words.iter().enumerate() {
+        let next = word.wrapping_add(1 + index as u16);
+        fp16_target_bytes[index * 2..index * 2 + 2].copy_from_slice(&next.to_le_bytes());
+    }
+    let fp16_base = modes::encode_tensor(&fp16_base_bytes, modes::TensorDtype::F16, &[5], limits)?;
+    write_sparse_delta_valid(
+        dir,
+        "004_fp16_dense_every_word",
+        WeightDtype::Fp16,
+        &[5],
+        &fp16_base,
+        &fp16_target_bytes,
+        limits,
+    )?;
+
+    // --- rejects derived from the bf16 case -------------------------------
+    let mut bf16_target = bf16_bytes.clone();
+    bf16_target[4..6].copy_from_slice(&0x3F80u16.to_le_bytes());
+    bf16_target[10..12].copy_from_slice(&0x7F81u16.to_le_bytes());
+    let delta_frame = sparse_delta::encode_sparse_delta(
+        &bf16_target,
+        WeightDtype::Bf16,
+        &[2, 3],
+        &bf16_base,
+        limits,
+    )?;
+    let (meta, payload) = sparse_parts(&delta_frame, limits)?;
+    let parsed = Frame::parse(&delta_frame, limits)?;
+    let content_hash = parsed.header.content_hash;
+    let decoded_len = parsed.header.decoded_len;
+    let base_mode = 6u32;
+
+    let mut unknown_op = meta.clone();
+    unknown_op.op = "xor".to_owned();
+    write_sparse_delta_reject(
+        dir,
+        "101_unknown_op",
+        &sparse_delta_frame(
+            &unknown_op,
+            &payload,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&bf16_base),
+        ErrorClass::Malformed,
+        "op xor has no v1 implementation",
+        false,
+        None,
+    )?;
+
+    let mut unknown_codec = meta.clone();
+    unknown_codec.sparse_codec = "rle-v2".to_owned();
+    write_sparse_delta_reject(
+        dir,
+        "102_unknown_sparse_codec",
+        &sparse_delta_frame(
+            &unknown_codec,
+            &payload,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&bf16_base),
+        ErrorClass::Malformed,
+        "sparse_codec rle-v2 has no v1 implementation",
+        false,
+        None,
+    )?;
+
+    let mut storage_bytes = meta.clone();
+    storage_bytes.storage_bytes = 1;
+    write_sparse_delta_reject(
+        dir,
+        "103_storage_bytes_inconsistent",
+        &sparse_delta_frame(
+            &storage_bytes,
+            &payload,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&bf16_base),
+        ErrorClass::Malformed,
+        "storage_bytes 1 disagrees with bf16 (2 bytes)",
+        false,
+        None,
+    )?;
+
+    let mut delta_root = meta.clone();
+    let mut flipped = delta_root.delta_root.into_bytes();
+    flipped[0] ^= 0x01;
+    delta_root.delta_root = Hash32::from_bytes(flipped);
+    write_sparse_delta_reject(
+        dir,
+        "104_delta_root_mismatch",
+        &sparse_delta_frame(
+            &delta_root,
+            &payload,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&bf16_base),
+        ErrorClass::Corrupt,
+        "declared delta_root does not match the decoded run stream",
+        false,
+        None,
+    )?;
+
+    let fp32_base_frame =
+        modes::encode_tensor(&vec![0u8; 24], modes::TensorDtype::F32, &[2, 3], limits)?;
+    let fp32_parsed = Frame::parse(&fp32_base_frame, limits)?;
+    let mut dtype_mismatch = meta.clone();
+    dtype_mismatch.base = fp32_parsed.header.content_hash;
+    write_sparse_delta_reject(
+        dir,
+        "105_base_dtype_mismatch",
+        &sparse_delta_frame(
+            &dtype_mismatch,
+            &payload,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&fp32_base_frame),
+        ErrorClass::DependencyMismatch,
+        "base frame dtype f32 does not match the declared bf16 dtype",
+        false,
+        None,
+    )?;
+
+    let wrong_shape_base =
+        modes::encode_tensor(&vec![0u8; 12], modes::TensorDtype::Bf16, &[3, 2], limits)?;
+    let wrong_shape_parsed = Frame::parse(&wrong_shape_base, limits)?;
+    let mut shape_mismatch = meta.clone();
+    shape_mismatch.base = wrong_shape_parsed.header.content_hash;
+    write_sparse_delta_reject(
+        dir,
+        "106_base_shape_mismatch",
+        &sparse_delta_frame(
+            &shape_mismatch,
+            &payload,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&wrong_shape_base),
+        ErrorClass::DependencyMismatch,
+        "base frame shape [3,2] does not match the declared shape [2,3]",
+        false,
+        None,
+    )?;
+
+    write_sparse_delta_reject(
+        dir,
+        "107_missing_base",
+        &delta_frame,
+        None,
+        ErrorClass::DependencyMissing,
+        "no resolver entry and no --base frame was supplied",
+        false,
+        None,
+    )?;
+
+    // run_count larger than element_count: no record stream can be consistent.
+    let over_count = sparse_payload(7, &[], 2);
+    write_sparse_delta_reject(
+        dir,
+        "108_run_count_exceeds_element_count",
+        &sparse_delta_frame(
+            &meta,
+            &over_count,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&bf16_base),
+        ErrorClass::Malformed,
+        "run_count 7 exceeds element_count 6",
+        false,
+        None,
+    )?;
+
+    // A run that would place its word past element_count.
+    let past_end = sparse_payload(1, &[(6, [0x01, 0x00, 0x00, 0x00])], 2);
+    write_sparse_delta_reject(
+        dir,
+        "109_run_past_element_count",
+        &sparse_delta_frame(
+            &meta,
+            &past_end,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&bf16_base),
+        ErrorClass::Malformed,
+        "the first run skips 6 of 6 words, so its non-zero word has no slot",
+        false,
+        None,
+    )?;
+
+    // A record whose stored word is truncated (1 of 2 bytes).
+    let truncated = {
+        let mut out = 1u32.to_le_bytes().to_vec();
+        varint::encode(0, &mut out);
+        out.push(0x01);
+        out
+    };
+    write_sparse_delta_reject(
+        dir,
+        "110_run_record_truncated",
+        &sparse_delta_frame(
+            &meta,
+            &truncated,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&bf16_base),
+        ErrorClass::Malformed,
+        "a bf16 word needs 2 bytes; only 1 remains in the payload",
+        false,
+        None,
+    )?;
+
+    // Trailing bytes after the declared records.
+    let mut trailing = payload.clone();
+    trailing.push(0x00);
+    write_sparse_delta_reject(
+        dir,
+        "111_trailing_bytes",
+        &sparse_delta_frame(
+            &meta,
+            &trailing,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&bf16_base),
+        ErrorClass::Corrupt,
+        "one byte follows the declared run records",
+        false,
+        None,
+    )?;
+
+    // A record that stores an all-zero word (zeros are implicit).
+    let zero_word = sparse_payload(1, &[(0, [0x00, 0x00, 0x00, 0x00])], 2);
+    write_sparse_delta_reject(
+        dir,
+        "112_zero_nonzero_word",
+        &sparse_delta_frame(
+            &meta,
+            &zero_word,
+            decoded_len,
+            content_hash,
+            base_mode,
+            limits,
+        )?,
+        Some(&bf16_base),
+        ErrorClass::Corrupt,
+        "a run record stores a zero word, which the canonical encoding never emits",
+        false,
+        None,
+    )?;
+
+    // The run bound is a real limit, not an advisory.
+    write_sparse_delta_reject(
+        dir,
+        "113_run_count_limit",
+        &delta_frame,
+        Some(&bf16_base),
+        ErrorClass::LimitExceeded,
+        "max_sparse_runs lowered below the frame's run count",
+        false,
+        Some(json!({ "max_sparse_runs": 1 })),
+    )?;
+
+    // A self-referential base: the descriptor's base equals the frame's own
+    // content hash, so the DAG resolver re-enters the root frame.
+    let zero_target = vec![0u8; 12];
+    let cycle_hash = hash_domain(DOMAIN_CHUNK, &zero_target);
+    let mut cycle_meta = meta.clone();
+    cycle_meta.base = cycle_hash;
+    cycle_meta.delta_root = hash_domain(tensor::DOMAIN_TENSOR_VALUES, &zero_target);
+    let cycle_frame = sparse_delta_frame(
+        &cycle_meta,
+        &sparse_payload(0, &[], 2),
+        zero_target.len() as u64,
+        cycle_hash,
+        base_mode,
+        limits,
+    )?;
+    write_sparse_delta_reject(
+        dir,
+        "114_dependency_cycle",
+        &cycle_frame,
+        None,
+        ErrorClass::DependencyCycle,
+        "the descriptor base equals the frame's own content hash",
+        true,
+        None,
+    )?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

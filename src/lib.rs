@@ -39,6 +39,7 @@ pub mod modes;
 pub mod selector;
 pub mod semantic;
 pub mod semantic_delta;
+pub mod sparse_delta;
 pub mod stream;
 pub mod tensor;
 pub mod tensor_sharded;
@@ -79,6 +80,11 @@ pub use semantic_delta::{
     base_semantic_root, decode_frame as decode_semantic_delta,
     decode_with_base_frame as decode_semantic_delta_with_base, encode_semantic_delta,
     semantic_delta_metadata, SemanticDeltaMeta, SEMANTIC_DELTA_SCHEMA,
+};
+pub use sparse_delta::{
+    decode_frame as decode_sparse_delta, decode_with_base_frame as decode_sparse_delta_with_base,
+    encode_sparse_delta, sparse_delta_metadata, SparseDeltaMeta, SPARSE_DELTA_CODEC,
+    SPARSE_DELTA_OP, SPARSE_DELTA_SCHEMA,
 };
 pub use tensor::{
     logical_root, shard_root, LayoutDescriptor, LogicalRecord, PhysicalTensor, Region, RegionRead,

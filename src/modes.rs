@@ -223,6 +223,7 @@ pub fn decode_bytes(
         Mode::TensorSharded => crate::tensor_sharded::decode_planes(&frame, limits)?,
         Mode::WeightDelta => crate::weight_delta::decode_frame(&frame, resolver, limits)?,
         Mode::SemanticDelta => crate::semantic_delta::decode_frame(&frame, resolver, limits)?,
+        Mode::SparseDelta => crate::sparse_delta::decode_frame(&frame, resolver, limits)?,
         Mode::KvCache => crate::kv_cache::decode_kv_page(&frame, limits)?.bytes,
         Mode::ActivationStream => {
             crate::activation_stream::decode_activation_chunk(&frame, limits)?.bytes

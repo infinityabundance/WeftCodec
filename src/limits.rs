@@ -47,6 +47,13 @@ pub const DEFAULT_MAX_SELECTOR_OPERANDS: u64 = 4_096;
 pub const DEFAULT_MAX_ARCHIVE_ENTRIES: u64 = 1_000_000;
 /// Default maximum causal closure entries (4,096).
 pub const DEFAULT_MAX_CAUSAL_ENTRIES: u64 = 4_096;
+/// Default maximum SPARSE_DELTA non-zero runs (16,777,216).
+///
+/// A run costs one varint plus one element word, so the bound also caps the
+/// mode-16 payload at roughly `2^24 * (storage_bytes + 1)` bytes. Mode 11 is the
+/// dense representation; a delta with more non-zero words than this is
+/// `LimitExceeded` under mode 16 by design.
+pub const DEFAULT_MAX_SPARSE_RUNS: u64 = 16_777_216;
 /// Default maximum capability grant-list entries (4,096).
 pub const DEFAULT_MAX_CAPABILITY_ENTRIES: u64 = 4_096;
 /// Default maximum `weft://` URI length (64 KiB).
@@ -84,6 +91,8 @@ pub struct Limits {
     pub max_archive_entries: u64,
     /// Causal closure entries (WEFT-CAUSAL §5).
     pub max_causal_entries: u64,
+    /// SPARSE_DELTA non-zero runs (WEFT-AI-CODEC §17).
+    pub max_sparse_runs: u64,
     /// Capability grant-list entries (WEFT-CAPABILITIES §1).
     pub max_capability_entries: u64,
     /// `weft://` URI length (WEFT-CONTEXT-ROOT §3.3).
@@ -113,6 +122,7 @@ impl Default for Limits {
             max_selector_operands: DEFAULT_MAX_SELECTOR_OPERANDS,
             max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
             max_causal_entries: DEFAULT_MAX_CAUSAL_ENTRIES,
+            max_sparse_runs: DEFAULT_MAX_SPARSE_RUNS,
             max_capability_entries: DEFAULT_MAX_CAPABILITY_ENTRIES,
             max_uri_bytes: DEFAULT_MAX_URI_BYTES,
         }
@@ -205,6 +215,10 @@ impl Limits {
         self.max_causal_entries = value;
         self
     }
+    pub fn with_max_sparse_runs(mut self, value: u64) -> Self {
+        self.max_sparse_runs = value;
+        self
+    }
     pub fn with_max_capability_entries(mut self, value: u64) -> Self {
         self.max_capability_entries = value;
         self
@@ -258,6 +272,7 @@ mod tests {
         assert_eq!(l.max_tensor_elements, 4_294_967_296);
         assert_eq!(l.max_tensor_rank, 8);
         assert_eq!(l.max_tokens, 16_777_216);
+        assert_eq!(l.max_sparse_runs, 16_777_216);
     }
 
     #[test]

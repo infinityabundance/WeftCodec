@@ -1,6 +1,6 @@
 # WEFT-AI-CODEC v1.2.0 — AI-native codec modes
 
-**Status: PARTIALLY IMPLEMENTED.** Exactly ten AI-native modes are normative
+**Status: PARTIALLY IMPLEMENTED.** Exactly eleven AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 
 | Value | Name | Status | Frozen vectors |
@@ -15,6 +15,7 @@ and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 | 13 | `ACTIVATION_STREAM` (CLI `activation-stream`) | **implemented** | `conformance/v1/activation-stream/001`–`003` + eight rejects |
 | 14 | `SEMANTIC_DELTA` (CLI `semantic-delta`) | **implemented** | `conformance/v1/semantic-delta/001`–`003` + eight rejects |
 | 15 | `TENSOR_TILED` (CLI `tensor-tiled`) | **implemented** | `conformance/v1/tensor-tiled/001`–`003` + eight rejects |
+| 16 | `SPARSE_DELTA` (CLI `sparse-delta`) | **implemented** | `conformance/v1/sparse-delta/001`–`004` + fourteen rejects |
 
 Every other mode below is `specified, not implemented` and has **no allocated
 wire value**. Nothing in this document is a compression or performance claim.
@@ -1625,4 +1626,158 @@ Rejects: `101_non_dividing_tile_shape`, `102_tile_count_mismatch`,
 `108_logical_root_mismatch`.
 
 The cross-language gate asserts byte-identical frames for mode 15 and
+decode-equivalence in both directions.
+
+---
+
+## 17. Mode 16 — `SPARSE_DELTA` (implemented)
+
+Mode 16 is the **sparse counterpart of mode 11**. It reconstructs a tensor from
+the same exact word-wise difference `WEIGHT_DELTA` defines, but stores the delta
+word array as a zero-run stream instead of two to four `huffman-canonical-v1`
+planes per element. Mode 11 is frozen and unchanged; mode 16 is additive and is
+never produced unless a writer chooses it.
+
+Mode 16 does not replace mode 11. A dense delta is larger under mode 16 (one
+varint plus one element word per non-zero element), so a planner keeps mode 11
+for dense pairs and offers mode 16 for sparse ones (for example PyTorch/NeMo
+`step0 -> step1` pairs that differ in 19 word positions).
+
+### 17.1 Frame shape
+
+```
+domain        = 0 (payload)
+mode          = 16
+flags         = 0
+dep_count     = 1
+chunk_count   = 0
+decoded_len   = element_count * storage_bytes(dtype)
+content_hash  = H("weft/chunk/v1", reconstructed element bytes)
+body          = u32le(meta_len) || WCB(meta) || u32le(run_count) || run records
+```
+
+The single dependency names the base tensor frame. `dtype` and `shape` MUST
+equal the base's. The dependency hash MUST equal the descriptor's
+`base_content_root`, and the dependency `decoded_len` MUST equal the frame's
+`decoded_len`.
+
+### 17.2 Descriptor
+
+Schema `weft.ai.sparse_delta.v1`. Exactly these keys:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `schema` | text | `"weft.ai.sparse_delta.v1"` |
+| `dtype` | text | one of `bf16`, `fp16`, `fp32`, `q8_0`, `q4_0` |
+| `shape` | `[u64]` | logical shape; rank ≥ 1, every extent > 0, rank ≤ `max_tensor_rank` |
+| `element_count` | u64 | must equal `product(shape)` |
+| `storage_bytes` | u64 | bytes per element; must equal the dtype's element width |
+| `op` | text | exactly `"mod-sub"` |
+| `sparse_codec` | text | exactly `"zero-run-v1"` |
+| `base_content_root` | bytes32 | `H("weft/chunk/v1", base element bytes)` |
+| `delta_root` | bytes32 | `H("weft/tensor/values/v1", canonical delta words)` |
+
+Every key is mandatory; an unknown key is `Malformed`. The descriptor carries
+no payload length: the payload must be consumed exactly (§17.3).
+
+### 17.3 Payload — `zero-run-v1`
+
+Delta words are the modular difference on raw element words, exactly as mode 11
+defines it (`d_i = (a_i - b_i) mod 2^word_bits`; no floating-point arithmetic).
+Words are zero-extended little-endian and `q4_0` uses one unpacked nibble per
+element.
+
+The payload is the concatenation of:
+
+1. `u32le(run_count)` — the number of records that follow;
+2. `run_count` records, in element order. A record is
+   `varint(zero_run_len) || storage_bytes(dtype) bytes of the non-zero delta
+   word`.
+
+A record means: skip `zero_run_len` zero words, then emit this non-zero word.
+Records are concatenated until `element_count` words are emitted. Trailing
+zeros are implicit and MUST NOT be stored, so the encoding of a delta word
+array is unique.
+
+* An all-zero delta is `run_count = 0` and a four-byte payload. Reconstruction
+  equals the base. This is a correct sparse representation, not a `REFERENCE`
+  alias: the frame still carries its own descriptor, `delta_root`, and content
+  hash.
+* The last record MAY end exactly at `element_count`.
+* A record MUST store a non-zero word. Storing zero is non-canonical and is
+  `Corrupt`.
+
+Varints are minimal LEB128 (WEFTCODEC-FORMAT §5); a non-minimal varint is
+`NonCanonical`.
+
+### 17.4 Validation order (normative for error classes)
+
+1. Frame header/tables and mode-level rules (`Malformed`, `UnsupportedVersion`,
+   `UnsupportedFeature`, `UnsupportedMode`).
+2. Descriptor WCB canonical decode (`Malformed`, `NonCanonical`).
+3. Schema, `op`, `sparse_codec`, `storage_bytes`, dtype (`Malformed`).
+4. Shape/`element_count` arithmetic and `max_tensor_elements`
+   (`Malformed`, `LimitExceeded`).
+5. `decoded_len` equals `element_count * storage_bytes` (`Corrupt`).
+6. `dep_count == 1`, dependency hash equals `base_content_root`, dependency
+   `decoded_len` equals `decoded_len` (`Malformed`).
+7. `run_count` within `max_sparse_runs` (`LimitExceeded`); `run_count` greater
+   than `element_count` (`Malformed`).
+8. Run records: truncated varint or word (`Malformed`), a run that would place
+   its word past `element_count` (`Malformed`), a stored zero word or an
+   out-of-range `q4_0` nibble (`Corrupt`), trailing bytes after the declared
+   records (`Corrupt`).
+9. `delta_root` recomputation (`Corrupt`) — checked before the base is read.
+10. Base availability (`DependencyMissing`), base content hash, dtype, shape,
+    and decoded length (`DependencyMismatch`), base resolution cycles
+    (`DependencyCycle`).
+11. Reconstructed length and `content_hash` (`Corrupt`).
+
+### 17.5 Limits
+
+`max_tensor_elements`, `max_tensor_rank`, `max_decoded_bytes`, and
+`max_frame_bytes` apply unchanged. Mode 16 adds `max_sparse_runs`, default
+`16,777,216`: a frame whose non-zero word count exceeds it is `LimitExceeded`
+at encode and decode. Because each record costs at least `1 + storage_bytes`
+bytes, the bound also caps the mode-16 payload at roughly
+`2^24 * (storage_bytes + 1)` bytes. Deltas denser than that belong to mode 11.
+Every shape product, element-byte length, zero-run accumulation, and record
+offset is checked.
+
+### 17.6 API and CLI (maintainer tools, not wire formats)
+
+Rust: `sparse_delta::encode_sparse_delta`,
+`encode_sparse_delta_with_resolver`, `sparse_delta_metadata`,
+`decode_frame`, `decode_with_base_frame`, `encode_descriptor_frame`.
+
+Go: `modes.EncodeSparseDelta`, `modes.EncodeSparseDeltaWithResolver`,
+`modes.SparseDeltaMetadata`, `modes.DecodeSparseDeltaFrame`,
+`modes.DecodeSparseDeltaFrameWithBase`,
+`modes.EncodeSparseDeltaDescriptorFrame`.
+
+CLI: `weftcodec encode --mode sparse-delta --input PAYLOAD --base BASE_FRAME
+--dtype D --shape A,B,...`. Decode accepts `--base FRAME` (or `--resolve
+--frame-source DIR`). `inspect` reports the descriptor.
+
+The WeftFS store exposes the strategy as `sparse-delta` and prices it with
+`CostClass::SparseDelta`.
+
+### 17.7 Conformance vectors
+
+`conformance/v1/sparse-delta/` (byte-identical in both codec repositories):
+
+* `001_bf16_all_zero_delta` — `run_count = 0`, reconstruction equals the base.
+* `002_fp32_one_nonzero_word` — exactly one record.
+* `003_q8_0_several_runs_to_the_end` — three runs, the last ending exactly at
+  `element_count`.
+* `004_fp16_dense_every_word` — `run_count == element_count`.
+
+Rejects: `101_unknown_op`, `102_unknown_sparse_codec`,
+`103_storage_bytes_inconsistent`, `104_delta_root_mismatch`,
+`105_base_dtype_mismatch`, `106_base_shape_mismatch`, `107_missing_base`,
+`108_run_count_exceeds_element_count`, `109_run_past_element_count`,
+`110_run_record_truncated`, `111_trailing_bytes`, `112_zero_nonzero_word`,
+`113_run_count_limit` (limits override), `114_dependency_cycle`.
+
+The cross-language gate asserts byte-identical mode-16 frames and
 decode-equivalence in both directions.
