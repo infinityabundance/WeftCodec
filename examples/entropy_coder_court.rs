@@ -1372,9 +1372,11 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // Capture the true build/family high-water mark before any per-row reset
+    // wipes it.
+    let build_peak_rss_kib = peak_rss_kib();
     let mut emitter = RowEmitter::new(&args.out)?;
     let rss_reset_supported = reset_peak_rss();
-    let build_peak_rss_kib = peak_rss_kib();
     let coders: Vec<Box<dyn Coder>> = vec![
         Box::new(Raw),
         Box::new(Zstd::new(3)),
