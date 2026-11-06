@@ -395,7 +395,12 @@ Rules:
   base is `Corrupt` on read. A base chain MUST be acyclic.
 - **Depth.** `depth` MUST equal one for a v3 base and `base.depth + 1` for a v4
   base. Readers MUST reject a chain deeper than 256 manifests with
-  `LimitExceeded`; a writer MUST compact rather than exceed that bound.
+  `LimitExceeded`; a writer MUST compact rather than exceed that bound. A
+  writer MAY enforce a stricter configured bound (the Rust store defaults to 64)
+  and MUST refuse with `LimitExceeded` naming compaction rather than publish a
+  chain that exceeds it. A writer MUST also bound the total logical bytes
+  carried by the chain (default 1 GiB in the Rust store) and refuse past that
+  bound rather than let read amplification grow without a limit.
 - **Extent grid.** Extents in one manifest MUST be sorted by ascending
   `offset`, MUST NOT overlap, and MAY be adjacent (`end == next.offset`).
   `offset` MUST be a multiple of `chunk_size`; `length` MUST be positive and
