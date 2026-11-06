@@ -29,6 +29,8 @@ pub mod conformance;
 pub mod context;
 pub mod dependency;
 pub mod error;
+/// **EXPERIMENTAL — not a wire-format module.** See [`experimental`].
+pub mod experimental;
 pub mod frame;
 pub mod generated;
 pub mod hash;
