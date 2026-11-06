@@ -399,6 +399,10 @@ struct Totals {
     mode16_wins: u64,
     mode11_wins: u64,
     equal: u64,
+    /// Tensors where mode 16 encoded a frame.
+    mode16_frames: u64,
+    /// Tensors where mode 16 refused the delta (for example max_sparse_runs).
+    mode16_refused: u64,
 }
 
 fn pair(args: &[String]) -> Result<(), String> {
@@ -467,40 +471,54 @@ fn pair(args: &[String]) -> Result<(), String> {
         let weight_encode_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         let started = Instant::now();
-        let sparse_frame = encode_sparse_delta(
+        let sparse_encoded = encode_sparse_delta(
             &target_bytes,
             target_tensor.weight_dtype,
             &target_tensor.shape,
             &base_frame,
             &limits,
-        )
-        .map_err(|err| format!("mode 16 encode {}: {err}", target_tensor.name))?;
+        );
         let sparse_encode_ms = started.elapsed().as_secs_f64() * 1000.0;
+        // A dense delta can exceed `max_sparse_runs`. That is a documented,
+        // fail-closed refusal, not a measurement of the representation, so the
+        // row records the error class and the totals exclude it.
+        let (sparse_frame, sparse_error) = match sparse_encoded {
+            Ok(frame) => (Some(frame), None),
+            Err(err) => (
+                None,
+                Some(format!("{}: {}", err.class().as_str(), err.message())),
+            ),
+        };
 
         let (weight_decode_ms, weight_decoded) =
             timed_decode(&weight_frame, &base_frame, &limits, false)?;
-        let (sparse_decode_ms, sparse_decoded) =
-            timed_decode(&sparse_frame, &base_frame, &limits, true)?;
         if weight_decoded != target_bytes {
             return Err(format!(
                 "{}: mode 11 round-trip is not byte-exact",
                 target_tensor.name
             ));
         }
-        if sparse_decoded != target_bytes {
-            return Err(format!(
-                "{}: mode 16 round-trip is not byte-exact",
-                target_tensor.name
-            ));
-        }
-        if sparse_decoded != weight_decoded {
-            return Err(format!(
-                "{}: modes 11 and 16 reconstruct different bytes",
-                target_tensor.name
-            ));
-        }
-        let runs = run_count(&sparse_frame, &limits)
-            .map_err(|err| format!("{}: {err}", target_tensor.name))?;
+        let (sparse_decode_ms, sparse_decoded, runs) = match sparse_frame.as_deref() {
+            Some(frame) => {
+                let (decode_ms, decoded) = timed_decode(frame, &base_frame, &limits, true)?;
+                if decoded != target_bytes {
+                    return Err(format!(
+                        "{}: mode 16 round-trip is not byte-exact",
+                        target_tensor.name
+                    ));
+                }
+                if decoded != weight_decoded {
+                    return Err(format!(
+                        "{}: modes 11 and 16 reconstruct different bytes",
+                        target_tensor.name
+                    ));
+                }
+                let runs = run_count(frame, &limits)
+                    .map_err(|err| format!("{}: {err}", target_tensor.name))?;
+                (Some(decode_ms), Some(decoded), Some(runs))
+            }
+            None => (None, None, None),
+        };
 
         let changed = changed_words(&base_bytes, &target_bytes, target_tensor.weight_dtype);
         let target_row = target_rows.get(&target_tensor.name).ok_or_else(|| {
@@ -514,57 +532,69 @@ fn pair(args: &[String]) -> Result<(), String> {
         total.target_bytes += target_tensor.byte_len();
         total.elements += target_tensor.elements();
         total.changed_words += changed;
-        total.run_count += u64::from(runs);
         total.mode11_bytes += weight_frame.len() as u64;
-        total.mode16_bytes += sparse_frame.len() as u64;
         total.zstd19_bytes += target_row.zstd19_bytes;
         total.mode11_encode_ms += weight_encode_ms;
         total.mode16_encode_ms += sparse_encode_ms;
         total.mode11_decode_ms_sum += weight_decode_ms;
-        total.mode16_decode_ms_sum += sparse_decode_ms;
         total.zstd19_decode_ms_sum += target_row.zstd19_decode_ms;
-        match (sparse_frame.len() as u64).cmp(&(weight_frame.len() as u64)) {
-            std::cmp::Ordering::Less => total.mode16_wins += 1,
-            std::cmp::Ordering::Greater => total.mode11_wins += 1,
-            std::cmp::Ordering::Equal => total.equal += 1,
-        }
-        if sparse_frame.len() as u64 > weight_frame.len() as u64 {
-            losses.push((
-                target_tensor.name.clone(),
-                sparse_frame.len() as i64 - weight_frame.len() as i64,
-                sparse_frame.len() as u64,
-                weight_frame.len() as u64,
-            ));
+        match (&sparse_frame, sparse_decode_ms, runs) {
+            (Some(frame), Some(decode_ms), Some(runs)) => {
+                total.mode16_frames += 1;
+                total.run_count += u64::from(runs);
+                total.mode16_bytes += frame.len() as u64;
+                total.mode16_decode_ms_sum += decode_ms;
+                match (frame.len() as u64).cmp(&(weight_frame.len() as u64)) {
+                    std::cmp::Ordering::Less => total.mode16_wins += 1,
+                    std::cmp::Ordering::Greater => total.mode11_wins += 1,
+                    std::cmp::Ordering::Equal => total.equal += 1,
+                }
+                if frame.len() as u64 > weight_frame.len() as u64 {
+                    losses.push((
+                        target_tensor.name.clone(),
+                        frame.len() as i64 - weight_frame.len() as i64,
+                        frame.len() as u64,
+                        weight_frame.len() as u64,
+                    ));
+                }
+            }
+            _ => total.mode16_refused += 1,
         }
 
+        let mode16_bytes = sparse_frame.as_ref().map(|frame| frame.len());
         rows.push(json!({
-            "name": target_tensor.name,
-            "dtype": target_tensor.dtype,
-            "shape": target_tensor.shape,
-            "elements": target_tensor.elements(),
-            "bytes": target_tensor.byte_len(),
-            "changed_words": changed,
-            "changed_fraction": ratio(changed, target_tensor.elements()),
-            "sparse_run_count": runs,
-            "base_mode6_frame_bytes": base_frame.len(),
-            "mode11_bytes": weight_frame.len(),
-            "mode11_ratio_of_target_raw": ratio(weight_frame.len() as u64, target_tensor.byte_len()),
-            "mode11_encode_ms": weight_encode_ms,
-            "mode11_decode_ms_median": weight_decode_ms,
-            "mode11_roundtrip_exact": true,
-            "mode16_bytes": sparse_frame.len(),
-            "mode16_ratio_of_target_raw": ratio(sparse_frame.len() as u64, target_tensor.byte_len()),
-            "mode16_encode_ms": sparse_encode_ms,
-            "mode16_decode_ms_median": sparse_decode_ms,
-            "mode16_roundtrip_exact": true,
-            "mode16_over_mode11": ratio(sparse_frame.len() as u64, weight_frame.len() as u64),
-            "mode16_over_zstd19": ratio(sparse_frame.len() as u64, target_row.zstd19_bytes),
-            "mode11_over_zstd19": ratio(weight_frame.len() as u64, target_row.zstd19_bytes),
-            "zstd19_bytes": target_row.zstd19_bytes,
-            "zstd19_decode_ms_median": target_row.zstd19_decode_ms,
-            "bytes_read_to_restore_mode16": sparse_frame.len() as u64 + base_frame.len() as u64,
-            "bytes_read_to_restore_mode11": weight_frame.len() as u64 + base_frame.len() as u64,
-        }));
+        			"name": target_tensor.name,
+        			"dtype": target_tensor.dtype,
+        			"shape": target_tensor.shape,
+        			"elements": target_tensor.elements(),
+        			"bytes": target_tensor.byte_len(),
+        			"changed_words": changed,
+        			"changed_fraction": ratio(changed, target_tensor.elements()),
+        			"sparse_run_count": runs,
+        			"base_mode6_frame_bytes": base_frame.len(),
+        			"mode11_bytes": weight_frame.len(),
+        			"mode11_ratio_of_target_raw": ratio(weight_frame.len() as u64, target_tensor.byte_len()),
+        			"mode11_encode_ms": weight_encode_ms,
+        			"mode11_decode_ms_median": weight_decode_ms,
+        			"mode11_roundtrip_exact": true,
+        			"mode16_bytes": mode16_bytes,
+        			"mode16_error": sparse_error,
+        			"mode16_ratio_of_target_raw": mode16_bytes
+        				.map(|bytes| ratio(bytes as u64, target_tensor.byte_len())),
+        			"mode16_encode_ms": sparse_encode_ms,
+        			"mode16_decode_ms_median": sparse_decode_ms,
+        			"mode16_roundtrip_exact": mode16_bytes.map(|_| true),
+        			"mode16_over_mode11": mode16_bytes
+        				.map(|bytes| ratio(bytes as u64, weight_frame.len() as u64)),
+        			"mode16_over_zstd19": mode16_bytes
+        				.map(|bytes| ratio(bytes as u64, target_row.zstd19_bytes)),
+        			"mode11_over_zstd19": ratio(weight_frame.len() as u64, target_row.zstd19_bytes),
+        			"zstd19_bytes": target_row.zstd19_bytes,
+        			"zstd19_decode_ms_median": target_row.zstd19_decode_ms,
+        			"bytes_read_to_restore_mode16": mode16_bytes
+        				.map(|bytes| bytes as u64 + base_frame.len() as u64),
+        			"bytes_read_to_restore_mode11": weight_frame.len() as u64 + base_frame.len() as u64,
+        		}));
 
         drop(weight_frame);
         drop(sparse_frame);
@@ -616,7 +646,11 @@ fn pair(args: &[String]) -> Result<(), String> {
             "sparse_run_count": total.run_count,
             "mode11_bytes": total.mode11_bytes,
             "mode16_bytes": total.mode16_bytes,
+            "mode16_frames": total.mode16_frames,
+            "mode16_refused": total.mode16_refused,
             "mode16_over_mode11": ratio(total.mode16_bytes, total.mode11_bytes),
+            "mode16_over_mode11_scope":
+                "sum of mode-16 frames over the sum of the same tensors' mode-11 frames; refused tensors excluded",
             "zstd19_bytes": total.zstd19_bytes,
             "mode11_over_zstd19": ratio(total.mode11_bytes, total.zstd19_bytes),
             "mode16_over_zstd19": ratio(total.mode16_bytes, total.zstd19_bytes),
