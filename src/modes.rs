@@ -2344,6 +2344,189 @@ fn decode_tile_planes(stored: &[u8], element_size: usize, element_len: usize) ->
     Ok(out)
 }
 
+/// Decode one stored tile and verify its `tile_root`.
+///
+/// `stored` is exactly the tile's recorded stored range (`compressed_len`
+/// bytes). The returned bytes are the tile's canonical row-major element bytes.
+pub fn decode_tiled_tile(
+    dtype: TensorDtype,
+    entry: &TiledTensorEntry,
+    stored: &[u8],
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    if stored.len() as u64 != entry.compressed_len {
+        return Err(Error::corrupt(format!(
+            "tensor tile {} stored range is {} bytes but the descriptor records {}",
+            entry.index,
+            stored.len(),
+            entry.compressed_len
+        )));
+    }
+    let element_size = usize::try_from(dtype.element_size())
+        .map_err(|_| Error::limit_exceeded("tensor tile element size does not fit usize"))?;
+    let element_len = usize::try_from(entry.element_len)
+        .map_err(|_| Error::limit_exceeded("tensor tile length does not fit usize"))?;
+    let tile = decode_tile_planes(stored, element_size, element_len)?;
+    let root = tensor_tile_root(dtype, &entry.dims, &tile, limits)?;
+    if root != entry.tile_root {
+        return Err(Error::corrupt(format!(
+            "tensor tile {} root {root} does not match the descriptor's {}",
+            entry.index, entry.tile_root
+        )));
+    }
+    Ok(tile)
+}
+
+fn tiled_dst_extent(shape: &[u64]) -> Result<Vec<usize>> {
+    shape
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim)
+                .map_err(|_| Error::limit_exceeded("tiled tensor extent does not fit usize"))
+        })
+        .collect()
+}
+
+/// Place a decoded full tile at its canonical grid position in `dst`, which
+/// holds the whole tensor's row-major bytes.
+pub fn place_tiled_tile(
+    dst: &mut [u8],
+    meta: &TiledTensorMeta,
+    entry: &TiledTensorEntry,
+    tile: &[u8],
+) -> Result<()> {
+    let dst_extent = tiled_dst_extent(&meta.shape)?;
+    let coords = tile_start(&meta.tile_counts, entry.index);
+    let mut dst_start = Vec::with_capacity(meta.shape.len());
+    for (axis, coord) in coords.iter().enumerate() {
+        dst_start.push(
+            coord
+                .checked_mul(meta.tile_shape[axis])
+                .ok_or_else(|| Error::limit_exceeded("tensor tile start overflows u64"))?,
+        );
+    }
+    copy_box_into(
+        dst,
+        &dst_extent,
+        &dst_start,
+        tile,
+        &entry.dims,
+        meta.dtype.element_size(),
+    )
+}
+
+/// Place the intersection of `region` and a decoded tile into `out`, which
+/// holds the region's canonical row-major bytes.
+pub fn place_tiled_tile_region(
+    out: &mut [u8],
+    region: &crate::tensor::Region,
+    meta: &TiledTensorMeta,
+    entry: &TiledTensorEntry,
+    tile: &[u8],
+) -> Result<()> {
+    let coords = tile_start(&meta.tile_counts, entry.index);
+    let mut local_start = Vec::with_capacity(meta.shape.len());
+    let mut local_extent = Vec::with_capacity(meta.shape.len());
+    let mut dst_start = Vec::with_capacity(meta.shape.len());
+    for axis in 0..meta.shape.len() {
+        let base = coords[axis]
+            .checked_mul(meta.tile_shape[axis])
+            .ok_or_else(|| Error::limit_exceeded("tensor tile start overflows u64"))?;
+        let lo = region.start[axis].max(base);
+        let hi = region.end[axis].min(base + meta.tile_shape[axis]);
+        local_start.push(lo - base);
+        local_extent.push(hi - lo);
+        dst_start.push(lo - region.start[axis]);
+    }
+    let dst_len = local_extent.iter().try_fold(1u64, |acc, dim| {
+        acc.checked_mul(*dim)
+            .ok_or_else(|| Error::limit_exceeded("region box overflows u64"))
+    })?;
+    let dst_bytes = dst_len
+        .checked_mul(meta.dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("region box byte length overflows u64"))?;
+    let mut boxed = vec![
+        0u8;
+        usize::try_from(dst_bytes)
+            .map_err(|_| Error::limit_exceeded("region box does not fit usize"))?
+    ];
+    copy_box_bytes(
+        &mut boxed,
+        tile,
+        &meta.tile_shape,
+        &local_start,
+        &local_extent,
+        meta.dtype.element_size(),
+    )?;
+    let extent = region.extent();
+    let dst_extent: Vec<usize> = extent
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim)
+                .map_err(|_| Error::limit_exceeded("region extent does not fit usize"))
+        })
+        .collect::<Result<_>>()?;
+    let boxed_shape: Vec<u64> = local_extent;
+    copy_box_into(
+        out,
+        &dst_extent,
+        &dst_start,
+        &boxed,
+        &boxed_shape,
+        meta.dtype.element_size(),
+    )
+}
+
+/// Indices of the tiles whose cells intersect `region`, in canonical row-major
+/// tile order. Empty when the region is empty.
+pub fn tiled_region_indices(
+    meta: &TiledTensorMeta,
+    region: &crate::tensor::Region,
+) -> Result<Vec<usize>> {
+    region.validate(&meta.shape)?;
+    if region.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut first = Vec::with_capacity(meta.shape.len());
+    let mut last = Vec::with_capacity(meta.shape.len());
+    for axis in 0..meta.shape.len() {
+        let tile = meta.tile_shape[axis];
+        first.push(region.start[axis] / tile);
+        last.push((region.end[axis] + tile - 1) / tile);
+    }
+    let mut indices = Vec::new();
+    let mut coords = first.clone();
+    loop {
+        let mut index: u64 = 0;
+        for axis in 0..meta.tile_counts.len() {
+            index = index
+                .checked_mul(meta.tile_counts[axis])
+                .and_then(|value| value.checked_add(coords[axis]))
+                .ok_or_else(|| Error::limit_exceeded("tensor tile index overflows u64"))?;
+        }
+        let index = usize::try_from(index)
+            .map_err(|_| Error::limit_exceeded("tensor tile index does not fit usize"))?;
+        if index >= meta.tiles.len() {
+            return Err(Error::corrupt(
+                "tensor tile index is outside the descriptor",
+            ));
+        }
+        indices.push(index);
+        let mut axis = first.len();
+        loop {
+            if axis == 0 {
+                return Ok(indices);
+            }
+            axis -= 1;
+            coords[axis] += 1;
+            if coords[axis] < last[axis] {
+                break;
+            }
+            coords[axis] = first[axis];
+        }
+    }
+}
+
 /// `H("weft/tensor/tile/v1", WCB({dtype, dims, element_len, values_hash}))`.
 pub fn tensor_tile_root(
     dtype: TensorDtype,
@@ -2804,8 +2987,6 @@ pub fn parse_tiled_descriptor(
 pub fn decode_tiled_tensor(frame: &Frame<'_>, limits: &Limits) -> Result<Vec<u8>> {
     let descriptor = parse_tiled_tensor(frame, limits)?;
     let meta = &descriptor.meta;
-    let element_size = usize::try_from(meta.dtype.element_size())
-        .map_err(|_| Error::limit_exceeded("tiled tensor element size does not fit usize"))?;
     let total = usize::try_from(
         meta.element_count
             .checked_mul(meta.dtype.element_size())
@@ -2813,14 +2994,6 @@ pub fn decode_tiled_tensor(frame: &Frame<'_>, limits: &Limits) -> Result<Vec<u8>
     )
     .map_err(|_| Error::limit_exceeded("tiled tensor decoded bytes do not fit usize"))?;
     let mut out = vec![0u8; total];
-    let dst_extent: Vec<usize> = meta
-        .shape
-        .iter()
-        .map(|dim| {
-            usize::try_from(*dim)
-                .map_err(|_| Error::limit_exceeded("tiled tensor extent does not fit usize"))
-        })
-        .collect::<Result<_>>()?;
     let mut tiles_bytes = 0usize;
     for entry in &meta.tiles {
         let start = usize::try_from(entry.offset)
@@ -2831,41 +3004,15 @@ pub fn decode_tiled_tensor(frame: &Frame<'_>, limits: &Limits) -> Result<Vec<u8>
                     .map_err(|_| Error::limit_exceeded("tensor tile length does not fit usize"))?,
             )
             .ok_or_else(|| Error::limit_exceeded("tensor tile range overflows usize"))?;
-        let tile = decode_tile_planes(
-            &descriptor.payload[start..end],
-            element_size,
-            usize::try_from(entry.element_len)
-                .map_err(|_| Error::limit_exceeded("tensor tile length does not fit usize"))?,
-        )?;
-        let root = tensor_tile_root(meta.dtype, &entry.dims, &tile, limits)?;
-        if root != entry.tile_root {
-            return Err(Error::corrupt(format!(
-                "tensor tile {} root {root} does not match the descriptor's {}",
-                entry.index, entry.tile_root
-            )));
-        }
+        let stored = descriptor
+            .payload
+            .get(start..end)
+            .ok_or_else(|| Error::corrupt("tensor tile range is outside the payload"))?;
+        let tile = decode_tiled_tile(meta.dtype, entry, stored, limits)?;
         tiles_bytes = tiles_bytes
             .checked_add(tile.len())
             .ok_or_else(|| Error::limit_exceeded("tiled tensor decoded length overflows usize"))?;
-        // Place the tile at its canonical grid position. Concatenation is only
-        // correct for a 1-D tile grid; the general case scatters the tile.
-        let coords = tile_start(&meta.tile_counts, entry.index);
-        let mut dst_start = Vec::with_capacity(meta.shape.len());
-        for axis in 0..meta.shape.len() {
-            dst_start.push(
-                coords[axis]
-                    .checked_mul(meta.tile_shape[axis])
-                    .ok_or_else(|| Error::limit_exceeded("tensor tile start overflows u64"))?,
-            );
-        }
-        copy_box_into(
-            &mut out,
-            &dst_extent,
-            &dst_start,
-            &tile,
-            &entry.dims,
-            meta.dtype.element_size(),
-        )?;
+        place_tiled_tile(&mut out, meta, entry, &tile)?;
     }
     if tiles_bytes != total {
         return Err(Error::corrupt(format!(
@@ -2934,8 +3081,6 @@ where
         return Ok((Vec::new(), 0));
     }
     let element_size = meta.dtype.element_size();
-    let element_size_usize = usize::try_from(element_size)
-        .map_err(|_| Error::limit_exceeded("tiled tensor element size does not fit usize"))?;
     let count = extent.iter().try_fold(1u64, |acc, dim| {
         acc.checked_mul(*dim)
             .ok_or_else(|| Error::limit_exceeded("region element count overflows u64"))
@@ -2948,120 +3093,16 @@ where
         .map_err(|_| Error::limit_exceeded("region payload does not fit usize"))?;
     let mut out = vec![0u8; byte_len];
 
-    // Intersecting tile range per axis.
-    let mut first = Vec::with_capacity(meta.shape.len());
-    let mut last = Vec::with_capacity(meta.shape.len());
-    for axis in 0..meta.shape.len() {
-        let tile = meta.tile_shape[axis];
-        first.push(region.start[axis] / tile);
-        last.push((region.end[axis] + tile - 1) / tile);
-    }
+    let indices = tiled_region_indices(meta, region)?;
     let mut tiles_touched = 0u64;
-    let mut coords = first.clone();
-    loop {
-        // Canonical tile index from the tile coordinates.
-        let mut index: u64 = 0;
-        for axis in 0..meta.tile_counts.len() {
-            index = index
-                .checked_mul(meta.tile_counts[axis])
-                .and_then(|value| value.checked_add(coords[axis]))
-                .ok_or_else(|| Error::limit_exceeded("tensor tile index overflows u64"))?;
-        }
-        let entry = meta
-            .tiles
-            .get(usize::try_from(index).unwrap_or(usize::MAX))
-            .ok_or_else(|| Error::corrupt("tensor tile index is outside the descriptor"))?;
+    for index in indices {
+        let entry = &meta.tiles[index];
         let stored = fetch(entry)?;
-        if stored.len() as u64 != entry.compressed_len {
-            return Err(Error::corrupt(format!(
-                "tensor tile {index} stored range is {} bytes but the descriptor records {}",
-                stored.len(),
-                entry.compressed_len
-            )));
-        }
-        let tile = decode_tile_planes(
-            &stored,
-            element_size_usize,
-            usize::try_from(entry.element_len)
-                .map_err(|_| Error::limit_exceeded("tensor tile length does not fit usize"))?,
-        )?;
-        let root = tensor_tile_root(meta.dtype, &entry.dims, &tile, limits)?;
-        if root != entry.tile_root {
-            return Err(Error::corrupt(format!(
-                "tensor tile {index} root {root} does not match the descriptor's {}",
-                entry.tile_root
-            )));
-        }
+        let tile = decode_tiled_tile(meta.dtype, entry, &stored, limits)?;
+        place_tiled_tile_region(&mut out, region, meta, entry, &tile)?;
         tiles_touched += 1;
-
-        // Intersection of this tile with the requested region.
-        let mut local_start = Vec::with_capacity(meta.shape.len());
-        let mut local_extent = Vec::with_capacity(meta.shape.len());
-        let mut dst_start = Vec::with_capacity(meta.shape.len());
-        for axis in 0..meta.shape.len() {
-            let base = coords[axis]
-                .checked_mul(meta.tile_shape[axis])
-                .ok_or_else(|| Error::limit_exceeded("tensor tile start overflows u64"))?;
-            let lo = region.start[axis].max(base);
-            let hi = region.end[axis].min(base + meta.tile_shape[axis]);
-            local_start.push(lo - base);
-            local_extent.push(hi - lo);
-            dst_start.push(lo - region.start[axis]);
-        }
-        let dst_len = local_extent.iter().try_fold(1u64, |acc, dim| {
-            acc.checked_mul(*dim)
-                .ok_or_else(|| Error::limit_exceeded("region box overflows u64"))
-        })?;
-        let dst_bytes = dst_len
-            .checked_mul(element_size)
-            .ok_or_else(|| Error::limit_exceeded("region box byte length overflows u64"))?;
-        let mut boxed = vec![
-            0u8;
-            usize::try_from(dst_bytes).map_err(|_| Error::limit_exceeded(
-                "region box does not fit usize"
-            ))?
-        ];
-        copy_box_bytes(
-            &mut boxed,
-            &tile,
-            &meta.tile_shape,
-            &local_start,
-            &local_extent,
-            element_size,
-        )?;
-        // Scatter the box into the requested region's row-major order.
-        let dst_extent_usize: Vec<usize> = extent
-            .iter()
-            .map(|dim| {
-                usize::try_from(*dim)
-                    .map_err(|_| Error::limit_exceeded("region extent does not fit usize"))
-            })
-            .collect::<Result<_>>()?;
-        let mut coords_in_extent = dst_start.clone();
-        let boxed_shape: Vec<u64> = local_extent.clone();
-        copy_box_into(
-            &mut out,
-            &dst_extent_usize,
-            &mut coords_in_extent,
-            &boxed,
-            &boxed_shape,
-            element_size,
-        )?;
-
-        // Advance the tile odometer.
-        let mut axis = first.len();
-        loop {
-            if axis == 0 {
-                return Ok((out, tiles_touched));
-            }
-            axis -= 1;
-            coords[axis] += 1;
-            if coords[axis] < last[axis] {
-                break;
-            }
-            coords[axis] = first[axis];
-        }
     }
+    Ok((out, tiles_touched))
 }
 
 /// Scatter a row-major box into a larger row-major destination at `dst_start`.
