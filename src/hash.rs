@@ -52,6 +52,8 @@ pub const DOMAIN_FLOAT_TENSOR_PAYLOAD: &str = "weft/float-tensor/payload/v1";
 pub const DOMAIN_TENSOR_SHARDED_PAYLOAD: &str = "weft/tensor-sharded/payload/v1";
 /// Independently decodable tensor-tile identity (WEFT-AI-CODEC §16).
 pub const DOMAIN_TENSOR_TILE: &str = "weft/tensor/tile/v1";
+/// Independently decodable float-tile identity (WEFT-AI-CODEC §18).
+pub const DOMAIN_FLOAT_TILE: &str = "weft/tensor/float_tile/v1";
 
 /// A 32-byte Weft digest.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

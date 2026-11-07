@@ -99,6 +99,9 @@ pub enum Mode {
     /// Zero-run coded exact word-wise delta against a base frame
     /// (WEFT-AI-CODEC §17).
     SparseDelta = 16,
+    /// Independently decodable float tiles: per-tile mode-9 plane split
+    /// (WEFT-AI-CODEC §18).
+    FloatTiled = 17,
 }
 
 impl Mode {
@@ -122,7 +125,8 @@ impl Mode {
             14 => Ok(Mode::SemanticDelta),
             15 => Ok(Mode::TensorTiled),
             16 => Ok(Mode::SparseDelta),
-            17..=127 => Err(Error::unsupported_mode(format!(
+            17 => Ok(Mode::FloatTiled),
+            18..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -156,6 +160,7 @@ impl Mode {
             Mode::SemanticDelta => "semantic_delta",
             Mode::TensorTiled => "tensor_tiled",
             Mode::SparseDelta => "sparse_delta",
+            Mode::FloatTiled => "float_tiled",
         }
     }
 
@@ -179,6 +184,7 @@ impl Mode {
             "semantic_delta" | "semantic-delta" | "semanticdelta" => Ok(Mode::SemanticDelta),
             "tensor_tiled" | "tensor-tiled" | "tiled" => Ok(Mode::TensorTiled),
             "sparse_delta" | "sparse-delta" | "sparsedelta" => Ok(Mode::SparseDelta),
+            "float_tiled" | "float-tiled" | "float_tile" | "ftiled" => Ok(Mode::FloatTiled),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -847,7 +853,8 @@ fn validate_mode_rules(
         | Mode::TensorSharded
         | Mode::KvCache
         | Mode::ActivationStream
-        | Mode::TensorTiled => {
+        | Mode::TensorTiled
+        | Mode::FloatTiled => {
             if header.domain != DOMAIN_PAYLOAD {
                 return Err(Error::malformed(
                     "AI-mode frames must use the payload domain",

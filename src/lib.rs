@@ -72,10 +72,15 @@ pub use kv_cache::{
 };
 pub use limits::Limits;
 pub use modes::{
-    decode_tiled_tensor, decode_tiled_tile, encode_tiled_tensor, parse_tiled_tensor,
-    place_tiled_tile, place_tiled_tile_region, read_region as read_tiled_region, tensor_tile_root,
-    tiled_region_indices, tiled_tensor_metadata, TensorDtype, TiledTensorDescriptor,
-    TiledTensorEntry, TiledTensorMeta, TENSOR_TILED_SCHEMA, TENSOR_TILE_CODEC, TENSOR_TILE_LAYOUT,
+    decode_float_tile, decode_float_tiled, decode_tiled_tensor, decode_tiled_tile,
+    encode_float_tiled, encode_tiled_tensor, float_tile_root, float_tiled_metadata,
+    float_tiled_region_indices, parse_float_tiled, parse_float_tiled_descriptor,
+    parse_tiled_tensor, place_float_tile, place_float_tile_region, place_tiled_tile,
+    place_tiled_tile_region, read_float_region, read_float_region_with,
+    read_region as read_tiled_region, tensor_tile_root, tiled_region_indices,
+    tiled_tensor_metadata, FloatTiledDescriptor, FloatTiledEntry, FloatTiledMeta, TensorDtype,
+    TiledTensorDescriptor, TiledTensorEntry, TiledTensorMeta, FLOAT_TILED_LAYOUT,
+    FLOAT_TILED_SCHEMA, TENSOR_TILED_SCHEMA, TENSOR_TILE_CODEC, TENSOR_TILE_LAYOUT,
 };
 pub use semantic::{
     select_semantic_base, semantic_matches, semantic_record, semantic_root,

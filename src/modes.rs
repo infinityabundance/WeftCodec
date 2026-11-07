@@ -229,6 +229,7 @@ pub fn decode_bytes(
             crate::activation_stream::decode_activation_chunk(&frame, limits)?.bytes
         }
         Mode::TensorTiled => decode_tiled_tensor(&frame, limits)?,
+        Mode::FloatTiled => decode_float_tiled(&frame, limits)?,
     };
 
     if plaintext.len() as u64 != frame.header.decoded_len {
@@ -3114,6 +3115,858 @@ where
         let stored = fetch(entry)?;
         let tile = decode_tiled_tile(meta.dtype, entry, &stored, limits)?;
         place_tiled_tile_region(&mut out, region, meta, entry, &tile)?;
+        tiles_touched += 1;
+    }
+    Ok((out, tiles_touched))
+}
+
+// ---------------------------------------------------------------------------
+// FLOAT_TILED (mode 17, WEFT-AI-CODEC §18)
+// ---------------------------------------------------------------------------
+
+/// Canonical float-tiled schema.
+pub const FLOAT_TILED_SCHEMA: &str = "weft.ai.float_tiled.v1";
+/// The only float-tile layout implemented in v1.
+pub const FLOAT_TILED_LAYOUT: &str = "row_major";
+
+/// The tensor-identity dtype for a float tile dtype, or `None` when the dtype
+/// has no logical-tensor layout in v1 (fp8 has none).
+fn float_tiled_tensor_dtype(dtype: FloatDtype) -> Option<TensorDtype> {
+    match dtype {
+        FloatDtype::Bf16 => Some(TensorDtype::Bf16),
+        FloatDtype::F16 => Some(TensorDtype::F16),
+        FloatDtype::F32 => Some(TensorDtype::F32),
+        FloatDtype::Fp8E4m3 | FloatDtype::Fp8E5m2 => None,
+    }
+}
+
+/// One independently decodable float tile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloatTiledEntry {
+    /// Canonical grid position (row-major over `tile_counts`).
+    pub index: u64,
+    /// Tile extents; every tile is full-size in v1.
+    pub dims: Vec<u64>,
+    /// Byte offset of the stored tile inside the frame payload.
+    pub offset: u64,
+    /// `exponent_plane_len + mantissa_plane_len`.
+    pub compressed_len: u64,
+    /// Huffman-coded exponent plane length for this tile.
+    pub exponent_plane_len: u64,
+    /// Raw sign+mantissa plane length for this tile.
+    pub mantissa_plane_len: u64,
+    /// Decoded tile bytes (`product(dims) * element_size`).
+    pub element_len: u64,
+    /// `H("weft/tensor/float_tile/v1", WCB({dtype, dims, element_len,
+    /// exponent_plane_len, mantissa_plane_len, values_hash}))`.
+    pub tile_root: Hash32,
+}
+
+/// A parsed mode-17 descriptor (without the payload bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloatTiledMeta {
+    pub dtype: FloatDtype,
+    pub shape: Vec<u64>,
+    pub element_count: u64,
+    pub tile_shape: Vec<u64>,
+    pub tile_counts: Vec<u64>,
+    pub tiles: Vec<FloatTiledEntry>,
+    pub payload_len: u64,
+    pub logical_root: Hash32,
+}
+
+/// A parsed mode-17 frame: descriptor plus the stored payload slice.
+#[derive(Clone, Debug)]
+pub struct FloatTiledDescriptor<'a> {
+    pub meta: FloatTiledMeta,
+    pub payload: &'a [u8],
+}
+
+/// `H("weft/tensor/float_tile/v1", WCB({...}))` for one decoded tile.
+pub fn float_tile_root(
+    dtype: FloatDtype,
+    dims: &[u64],
+    tile_bytes: &[u8],
+    exponent_plane_len: u64,
+    mantissa_plane_len: u64,
+    limits: &Limits,
+) -> Result<Hash32> {
+    let value = Value::map([
+        ("dtype", Value::Str(dtype.as_str().to_owned())),
+        (
+            "dims",
+            Value::Array(dims.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        ("element_len", Value::U64(tile_bytes.len() as u64)),
+        ("exponent_plane_len", Value::U64(exponent_plane_len)),
+        ("mantissa_plane_len", Value::U64(mantissa_plane_len)),
+        (
+            "values_hash",
+            Value::Bytes(
+                hash_domain(crate::tensor::DOMAIN_TENSOR_VALUES, tile_bytes)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ),
+    ]);
+    Ok(hash_domain(
+        crate::hash::DOMAIN_FLOAT_TILE,
+        &wcb::encode(&value, limits)?,
+    ))
+}
+
+/// Decode one stored float tile and verify its `tile_root`.
+pub fn decode_float_tile(
+    dtype: FloatDtype,
+    entry: &FloatTiledEntry,
+    stored: &[u8],
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    if stored.len() as u64 != entry.compressed_len {
+        return Err(Error::corrupt(format!(
+            "float tile {} stored range is {} bytes but the descriptor records {}",
+            entry.index,
+            stored.len(),
+            entry.compressed_len
+        )));
+    }
+    let exponent_len = usize::try_from(entry.exponent_plane_len).map_err(|_| {
+        Error::limit_exceeded("float tile exponent plane length does not fit usize")
+    })?;
+    let mantissa_len = usize::try_from(entry.mantissa_plane_len).map_err(|_| {
+        Error::limit_exceeded("float tile mantissa plane length does not fit usize")
+    })?;
+    let element_len = usize::try_from(entry.element_len)
+        .map_err(|_| Error::limit_exceeded("float tile length does not fit usize"))?;
+    let element_size = usize::try_from(dtype.element_size())
+        .map_err(|_| Error::limit_exceeded("float tile element size does not fit usize"))?;
+    if element_size == 0 || element_len % element_size != 0 {
+        return Err(Error::malformed(
+            "float tile element length is not a whole number of elements",
+        ));
+    }
+    let elements = element_len / element_size;
+    let (exponent_stored, mantissa_plane) = stored.split_at(exponent_len);
+    if mantissa_plane.len() != mantissa_len {
+        return Err(Error::corrupt(format!(
+            "float tile {} mantissa range is {} bytes but the descriptor records {}",
+            entry.index,
+            mantissa_plane.len(),
+            mantissa_len
+        )));
+    }
+    let exponent_plane = huffman::decode(exponent_stored, elements)?;
+    let tile = join_float_tensor_payload(
+        &exponent_plane,
+        mantissa_plane,
+        dtype,
+        elements as u64,
+        limits,
+    )?;
+    let root = float_tile_root(
+        dtype,
+        &entry.dims,
+        &tile,
+        entry.exponent_plane_len,
+        entry.mantissa_plane_len,
+        limits,
+    )?;
+    if root != entry.tile_root {
+        return Err(Error::corrupt(format!(
+            "float tile {} root {root} does not match the descriptor's {}",
+            entry.index, entry.tile_root
+        )));
+    }
+    Ok(tile)
+}
+
+fn float_tiled_meta_value(meta: &FloatTiledMeta) -> Value {
+    let tiles: Vec<Value> = meta
+        .tiles
+        .iter()
+        .map(|entry| {
+            Value::map([
+                ("index", Value::U64(entry.index)),
+                (
+                    "dims",
+                    Value::Array(entry.dims.iter().map(|dim| Value::U64(*dim)).collect()),
+                ),
+                ("offset", Value::U64(entry.offset)),
+                ("compressed_len", Value::U64(entry.compressed_len)),
+                ("exponent_plane_len", Value::U64(entry.exponent_plane_len)),
+                ("mantissa_plane_len", Value::U64(entry.mantissa_plane_len)),
+                ("element_len", Value::U64(entry.element_len)),
+                (
+                    "tile_root",
+                    Value::Bytes(entry.tile_root.as_bytes().to_vec()),
+                ),
+            ])
+        })
+        .collect();
+    Value::map([
+        ("schema", Value::Str(FLOAT_TILED_SCHEMA.to_owned())),
+        ("dtype", Value::Str(meta.dtype.as_str().to_owned())),
+        (
+            "shape",
+            Value::Array(meta.shape.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        ("element_count", Value::U64(meta.element_count)),
+        ("layout", Value::Str(FLOAT_TILED_LAYOUT.to_owned())),
+        (
+            "tile_shape",
+            Value::Array(meta.tile_shape.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        (
+            "tile_counts",
+            Value::Array(
+                meta.tile_counts
+                    .iter()
+                    .map(|dim| Value::U64(*dim))
+                    .collect(),
+            ),
+        ),
+        (
+            "exponent_coder",
+            Value::Str(FLOAT_TENSOR_EXPONENT_CODER.to_owned()),
+        ),
+        ("tiles", Value::Array(tiles)),
+        ("payload_len", Value::U64(meta.payload_len)),
+        (
+            "logical_root",
+            Value::Bytes(meta.logical_root.as_bytes().to_vec()),
+        ),
+    ])
+}
+
+/// Encode a mode-17 `FLOAT_TILED` frame.
+///
+/// Each tile is independently split with the exact mode-9 plane split (a
+/// `huffman-canonical-v1` exponent plane plus a raw sign+mantissa plane), and
+/// the stored tiles are concatenated with explicit offsets. A decode of any
+/// single tile verifies that tile's root; a full decode additionally verifies
+/// the whole-tensor logical root.
+pub fn encode_float_tiled(
+    payload: &[u8],
+    dtype: FloatDtype,
+    shape: &[u64],
+    tile_shape: &[u64],
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    check_len(
+        payload.len() as u64,
+        limits.max_decoded_bytes,
+        "float tiled payload",
+    )?;
+    let tensor_dtype = float_tiled_tensor_dtype(dtype).ok_or_else(|| {
+        Error::unsupported_feature(format!(
+            "float-tiled v1 requires a tensor identity layout; dtype `{}` has none",
+            dtype.as_str()
+        ))
+    })?;
+    let element_count = float_tensor_product(shape, limits)?;
+    let element_size = dtype.element_size();
+    let decoded_bytes = element_count
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::limit_exceeded("float tiled decoded bytes overflow u64"))?;
+    if decoded_bytes != payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "float tiled payload is {} bytes but shape {:?} x {} requires {decoded_bytes}",
+            payload.len(),
+            shape,
+            dtype.as_str()
+        )));
+    }
+    let counts = tile_counts(shape, tile_shape)?;
+    let tile_elements = tiled_product(tile_shape, limits, "float tile")?;
+    let tile_element_len = tile_elements
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::limit_exceeded("float tile byte length overflows u64"))?;
+    let tile_count = counts.iter().try_fold(1u64, |acc, count| {
+        acc.checked_mul(*count)
+            .ok_or_else(|| Error::limit_exceeded("float tile count overflows u64"))
+    })?;
+    if tile_count > limits.max_structured_items {
+        return Err(Error::limit_exceeded(format!(
+            "float tile count {tile_count} exceeds limit {}",
+            limits.max_structured_items
+        )));
+    }
+    let tile_len_usize = usize::try_from(tile_element_len)
+        .map_err(|_| Error::limit_exceeded("float tile byte length does not fit usize"))?;
+    let mut stored = Vec::with_capacity(payload.len());
+    let mut tiles = Vec::with_capacity(usize::try_from(tile_count).unwrap_or(0));
+    for index in 0..tile_count {
+        let start = tile_start(&counts, index);
+        let mut start_bytes = start.clone();
+        for axis in 0..start_bytes.len() {
+            start_bytes[axis] = start_bytes[axis]
+                .checked_mul(tile_shape[axis])
+                .ok_or_else(|| Error::limit_exceeded("float tile start overflows u64"))?;
+        }
+        let mut tile = vec![0u8; tile_len_usize];
+        copy_box_bytes(
+            &mut tile,
+            payload,
+            shape,
+            &start_bytes,
+            tile_shape,
+            element_size,
+        )?;
+        let (exponent_plane, mantissa_plane) =
+            split_float_tensor_payload(&tile, dtype, tile_elements)?;
+        let root = float_tile_root(
+            dtype,
+            tile_shape,
+            &tile,
+            exponent_plane.len() as u64,
+            mantissa_plane.len() as u64,
+            limits,
+        )?;
+        let compressed_len = (exponent_plane.len() + mantissa_plane.len()) as u64;
+        tiles.push(FloatTiledEntry {
+            index,
+            dims: tile_shape.to_vec(),
+            offset: stored.len() as u64,
+            compressed_len,
+            exponent_plane_len: exponent_plane.len() as u64,
+            mantissa_plane_len: mantissa_plane.len() as u64,
+            element_len: tile_element_len,
+            tile_root: root,
+        });
+        stored.extend_from_slice(&exponent_plane);
+        stored.extend_from_slice(&mantissa_plane);
+    }
+
+    let logical_root = crate::tensor::logical_root(tensor_dtype, shape, payload, limits)?;
+    let meta = FloatTiledMeta {
+        dtype,
+        shape: shape.to_vec(),
+        element_count,
+        tile_shape: tile_shape.to_vec(),
+        tile_counts: counts,
+        tiles,
+        payload_len: stored.len() as u64,
+        logical_root,
+    };
+    let body = build_ai_body(&float_tiled_meta_value(&meta), &stored, limits)?;
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::FloatTiled,
+        flags: 0,
+        level: 0,
+        decoded_len: decoded_bytes,
+        content_hash: hash_domain(DOMAIN_CHUNK, payload),
+        dependencies: &[],
+        chunks: &[],
+        body: &body,
+    };
+    encode_frame(&parts, limits)
+}
+
+fn meta_u64_array(map: &BTreeMap<String, Value>, key: &str) -> Result<Vec<u64>> {
+    match map.get(key) {
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::U64(dim) => out.push(*dim),
+                    _ => {
+                        return Err(Error::malformed(format!(
+                            "float tiled `{key}` elements must be u64"
+                        )))
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(Error::malformed(format!(
+            "float tiled `{key}` must be an array"
+        ))),
+    }
+}
+
+/// Parse a mode-17 descriptor from its canonical WCB bytes.
+pub fn parse_float_tiled_descriptor(
+    descriptor_bytes: &[u8],
+    decoded_len: u64,
+    payload_len: u64,
+    limits: &Limits,
+) -> Result<FloatTiledMeta> {
+    let value = wcb::decode(descriptor_bytes, limits)?;
+    let map = ai_map(&value, "float tiled")?;
+    check_exact_keys(
+        map,
+        &[
+            "schema",
+            "dtype",
+            "shape",
+            "element_count",
+            "layout",
+            "tile_shape",
+            "tile_counts",
+            "exponent_coder",
+            "tiles",
+            "payload_len",
+            "logical_root",
+        ],
+        "float tiled",
+    )?;
+    let schema = meta_text(map, "schema")?;
+    if schema != FLOAT_TILED_SCHEMA {
+        return Err(Error::malformed(format!(
+            "unsupported float tiled schema `{schema}`"
+        )));
+    }
+    let dtype = FloatDtype::from_name(meta_text(map, "dtype")?)?;
+    let layout = meta_text(map, "layout")?;
+    if layout != FLOAT_TILED_LAYOUT {
+        return Err(Error::malformed(format!(
+            "float tiled layout `{layout}` is specified but not implemented in v1 (only {FLOAT_TILED_LAYOUT})"
+        )));
+    }
+    let coder = meta_text(map, "exponent_coder")?;
+    if coder != FLOAT_TENSOR_EXPONENT_CODER {
+        return Err(Error::malformed(format!(
+            "unsupported float tile exponent coder `{coder}` (v1 allows `{FLOAT_TENSOR_EXPONENT_CODER}`)"
+        )));
+    }
+    let tensor_dtype = float_tiled_tensor_dtype(dtype);
+    if tensor_dtype.is_none() {
+        return Err(Error::unsupported_feature(format!(
+            "float-tiled v1 requires a tensor identity layout; dtype `{}` has none",
+            dtype.as_str()
+        )));
+    }
+    let shape = meta_shape(map)?;
+    let element_count = float_tensor_product(&shape, limits)?;
+    let declared_count = meta_u64(map, "element_count")?;
+    if declared_count != element_count {
+        return Err(Error::malformed(format!(
+            "float tiled element_count {declared_count} does not match shape product {element_count}"
+        )));
+    }
+    let element_size = dtype.element_size();
+    let decoded_bytes = element_count
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::limit_exceeded("float tiled decoded bytes overflow u64"))?;
+    check_len(
+        decoded_bytes,
+        limits.max_decoded_bytes,
+        "float tiled decoded bytes",
+    )?;
+    if decoded_len != decoded_bytes {
+        return Err(Error::corrupt(format!(
+            "float tiled decoded_len is {decoded_len} but the descriptor requires {decoded_bytes}"
+        )));
+    }
+    let tile_shape = meta_u64_array(map, "tile_shape")?;
+    let counts = tile_counts(&shape, &tile_shape)?;
+    if meta_u64_array(map, "tile_counts")? != counts {
+        return Err(Error::malformed(format!(
+            "float tiled tile_counts {:?} do not match shape/tile_shape {:?}",
+            meta_u64_array(map, "tile_counts")?,
+            counts
+        )));
+    }
+    let tile_elements = tiled_product(&tile_shape, limits, "float tile")?;
+    let tile_element_len = tile_elements
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::limit_exceeded("float tile byte length overflows u64"))?;
+    let tile_count = counts.iter().try_fold(1u64, |acc, count| {
+        acc.checked_mul(*count)
+            .ok_or_else(|| Error::limit_exceeded("float tile count overflows u64"))
+    })?;
+    if tile_count > limits.max_structured_items {
+        return Err(Error::limit_exceeded(format!(
+            "float tile count {tile_count} exceeds limit {}",
+            limits.max_structured_items
+        )));
+    }
+    let expected_mantissa = tile_elements
+        .checked_mul(dtype.sign_bits() + dtype.mantissa_bits())
+        .ok_or_else(|| Error::limit_exceeded("float tile mantissa bits overflow u64"))?;
+    let expected_mantissa = expected_mantissa
+        .checked_add(7)
+        .ok_or_else(|| Error::limit_exceeded("float tile mantissa length overflows u64"))?
+        / 8;
+    let declared_payload_len = meta_u64(map, "payload_len")?;
+    if declared_payload_len != payload_len {
+        return Err(Error::malformed(format!(
+            "float tiled payload is {payload_len} bytes but metadata declares {declared_payload_len}"
+        )));
+    }
+    let entries = match map.get("tiles") {
+        Some(Value::Array(items)) => items,
+        _ => return Err(Error::malformed("float tiled `tiles` must be an array")),
+    };
+    if entries.len() as u64 != tile_count {
+        return Err(Error::malformed(format!(
+            "float tiled has {} tile entries but the grid requires {tile_count}",
+            entries.len()
+        )));
+    }
+    let mut tiles = Vec::with_capacity(entries.len());
+    let mut expected_offset: u64 = 0;
+    for (position, item) in entries.iter().enumerate() {
+        let entry = ai_map(item, "float tile")?;
+        check_exact_keys(
+            entry,
+            &[
+                "index",
+                "dims",
+                "offset",
+                "compressed_len",
+                "exponent_plane_len",
+                "mantissa_plane_len",
+                "element_len",
+                "tile_root",
+            ],
+            "float tile",
+        )?;
+        let index = meta_u64(entry, "index")?;
+        if index != position as u64 {
+            return Err(Error::malformed(format!(
+                "float tiled entry {position} declares index {index}; entries must be in canonical order"
+            )));
+        }
+        let dims = meta_u64_array(entry, "dims")?;
+        if dims != tile_shape {
+            return Err(Error::malformed(format!(
+                "float tile {position} dims {:?} do not equal tile_shape {:?}; partial tiles are not defined in v1",
+                dims, tile_shape
+            )));
+        }
+        let declared_element_len = meta_u64(entry, "element_len")?;
+        if declared_element_len != tile_element_len {
+            return Err(Error::malformed(format!(
+                "float tile {position} element_len {declared_element_len} does not match {tile_element_len}"
+            )));
+        }
+        let offset = meta_u64(entry, "offset")?;
+        if offset != expected_offset {
+            return Err(Error::malformed(format!(
+                "float tile {position} offset {offset} is not the contiguous offset {expected_offset}"
+            )));
+        }
+        let compressed_len = meta_u64(entry, "compressed_len")?;
+        let exponent_plane_len = meta_u64(entry, "exponent_plane_len")?;
+        let mantissa_plane_len = meta_u64(entry, "mantissa_plane_len")?;
+        if exponent_plane_len < huffman::TABLE_BYTES as u64 {
+            return Err(Error::malformed(format!(
+                "float tile {position} exponent plane is shorter than its code-length table"
+            )));
+        }
+        if mantissa_plane_len != expected_mantissa {
+            return Err(Error::malformed(format!(
+                "float tile {position} mantissa_plane_len {mantissa_plane_len} does not match {expected_mantissa}"
+            )));
+        }
+        if compressed_len
+            != exponent_plane_len
+                .checked_add(mantissa_plane_len)
+                .ok_or_else(|| Error::limit_exceeded("float tile length overflows u64"))?
+        {
+            return Err(Error::malformed(format!(
+                "float tile {position} compressed_len {compressed_len} does not equal its plane lengths"
+            )));
+        }
+        expected_offset = expected_offset
+            .checked_add(compressed_len)
+            .ok_or_else(|| Error::limit_exceeded("float tile offset overflows u64"))?;
+        let tile_root = Hash32::from_slice(meta_bytes(entry, "tile_root")?)
+            .map_err(|_| Error::malformed("float tile_root must be 32 bytes"))?;
+        tiles.push(FloatTiledEntry {
+            index,
+            dims,
+            offset,
+            compressed_len,
+            exponent_plane_len,
+            mantissa_plane_len,
+            element_len: declared_element_len,
+            tile_root,
+        });
+    }
+    if expected_offset != declared_payload_len {
+        return Err(Error::malformed(format!(
+            "float tile ranges cover {expected_offset} bytes but payload_len is {declared_payload_len}"
+        )));
+    }
+    let logical_root = Hash32::from_slice(meta_bytes(map, "logical_root")?)
+        .map_err(|_| Error::malformed("float tiled logical_root must be 32 bytes"))?;
+    Ok(FloatTiledMeta {
+        dtype,
+        shape,
+        element_count,
+        tile_shape,
+        tile_counts: counts,
+        tiles,
+        payload_len: declared_payload_len,
+        logical_root,
+    })
+}
+
+/// Parse a mode-17 frame and return its descriptor with the stored slice.
+pub fn parse_float_tiled<'a>(
+    frame: &'a Frame<'_>,
+    limits: &Limits,
+) -> Result<FloatTiledDescriptor<'a>> {
+    let (descriptor_bytes, payload) = split_ai_body_prefix(frame.body)?;
+    let meta = parse_float_tiled_descriptor(
+        descriptor_bytes,
+        frame.header.decoded_len,
+        payload.len() as u64,
+        limits,
+    )?;
+    Ok(FloatTiledDescriptor { meta, payload })
+}
+
+/// Validate and decode a mode-17 frame into exact row-major element bytes.
+pub fn decode_float_tiled(frame: &Frame<'_>, limits: &Limits) -> Result<Vec<u8>> {
+    let descriptor = parse_float_tiled(frame, limits)?;
+    let meta = &descriptor.meta;
+    let total = usize::try_from(
+        meta.element_count
+            .checked_mul(meta.dtype.element_size())
+            .ok_or_else(|| Error::limit_exceeded("float tiled decoded bytes overflow u64"))?,
+    )
+    .map_err(|_| Error::limit_exceeded("float tiled decoded bytes do not fit usize"))?;
+    let mut out = vec![0u8; total];
+    let mut tiles_bytes = 0usize;
+    for entry in &meta.tiles {
+        let start = usize::try_from(entry.offset)
+            .map_err(|_| Error::limit_exceeded("float tile offset does not fit usize"))?;
+        let end = start
+            .checked_add(
+                usize::try_from(entry.compressed_len)
+                    .map_err(|_| Error::limit_exceeded("float tile length does not fit usize"))?,
+            )
+            .ok_or_else(|| Error::limit_exceeded("float tile range overflows usize"))?;
+        let stored = descriptor
+            .payload
+            .get(start..end)
+            .ok_or_else(|| Error::corrupt("float tile range is outside the payload"))?;
+        let tile = decode_float_tile(meta.dtype, entry, stored, limits)?;
+        tiles_bytes = tiles_bytes
+            .checked_add(tile.len())
+            .ok_or_else(|| Error::limit_exceeded("float tiled decoded length overflows usize"))?;
+        place_float_tile(&mut out, meta, entry, &tile)?;
+    }
+    if tiles_bytes != total {
+        return Err(Error::corrupt(format!(
+            "float tiled decoded to {tiles_bytes} bytes but the descriptor requires {total}"
+        )));
+    }
+    let tensor_dtype = float_tiled_tensor_dtype(meta.dtype)
+        .ok_or_else(|| Error::unsupported_feature("float tiled dtype has no tensor identity"))?;
+    let logical = crate::tensor::logical_root(tensor_dtype, &meta.shape, &out, limits)?;
+    if logical != meta.logical_root {
+        return Err(Error::corrupt(format!(
+            "float tiled logical root {logical} does not match the descriptor's {}",
+            meta.logical_root
+        )));
+    }
+    Ok(out)
+}
+
+/// Parse a mode-17 frame and return only its descriptor.
+pub fn float_tiled_metadata(frame: &Frame<'_>, limits: &Limits) -> Result<FloatTiledMeta> {
+    Ok(parse_float_tiled(frame, limits)?.meta)
+}
+
+fn float_tile_start_bytes(meta: &FloatTiledMeta, entry: &FloatTiledEntry) -> Result<Vec<u64>> {
+    let coords = tile_start(&meta.tile_counts, entry.index);
+    let mut start = Vec::with_capacity(coords.len());
+    for (axis, coord) in coords.iter().enumerate() {
+        start.push(
+            coord
+                .checked_mul(meta.tile_shape[axis])
+                .ok_or_else(|| Error::limit_exceeded("float tile start overflows u64"))?,
+        );
+    }
+    Ok(start)
+}
+
+/// Place one decoded full tile at its canonical grid position.
+pub fn place_float_tile(
+    dst: &mut [u8],
+    meta: &FloatTiledMeta,
+    entry: &FloatTiledEntry,
+    tile: &[u8],
+) -> Result<()> {
+    let dst_extent = tiled_dst_extent(&meta.shape)?;
+    let dst_start = float_tile_start_bytes(meta, entry)?;
+    copy_box_into(
+        dst,
+        &dst_extent,
+        &dst_start,
+        tile,
+        &entry.dims,
+        meta.dtype.element_size(),
+    )
+}
+
+/// Place the intersection of `region` and a decoded tile into `out`.
+pub fn place_float_tile_region(
+    out: &mut [u8],
+    region: &crate::tensor::Region,
+    meta: &FloatTiledMeta,
+    entry: &FloatTiledEntry,
+    tile: &[u8],
+) -> Result<()> {
+    let base = float_tile_start_bytes(meta, entry)?;
+    let mut local_start = Vec::with_capacity(meta.shape.len());
+    let mut local_extent = Vec::with_capacity(meta.shape.len());
+    let mut dst_start = Vec::with_capacity(meta.shape.len());
+    for axis in 0..meta.shape.len() {
+        let lo = region.start[axis].max(base[axis]);
+        let hi = region.end[axis].min(base[axis] + meta.tile_shape[axis]);
+        local_start.push(lo - base[axis]);
+        local_extent.push(hi - lo);
+        dst_start.push(lo - region.start[axis]);
+    }
+    let dst_len = local_extent.iter().try_fold(1u64, |acc, dim| {
+        acc.checked_mul(*dim)
+            .ok_or_else(|| Error::limit_exceeded("region box overflows u64"))
+    })?;
+    let dst_bytes = dst_len
+        .checked_mul(meta.dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("region box byte length overflows u64"))?;
+    let mut boxed = vec![
+        0u8;
+        usize::try_from(dst_bytes)
+            .map_err(|_| Error::limit_exceeded("region box does not fit usize"))?
+    ];
+    copy_box_bytes(
+        &mut boxed,
+        tile,
+        &meta.tile_shape,
+        &local_start,
+        &local_extent,
+        meta.dtype.element_size(),
+    )?;
+    let extent = region.extent();
+    let dst_extent: Vec<usize> = extent
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim)
+                .map_err(|_| Error::limit_exceeded("region extent does not fit usize"))
+        })
+        .collect::<Result<_>>()?;
+    copy_box_into(
+        out,
+        &dst_extent,
+        &dst_start,
+        &boxed,
+        &local_extent,
+        meta.dtype.element_size(),
+    )
+}
+
+/// Indices of the tiles whose cells intersect `region`.
+pub fn float_tiled_region_indices(
+    meta: &FloatTiledMeta,
+    region: &crate::tensor::Region,
+) -> Result<Vec<usize>> {
+    region.validate(&meta.shape)?;
+    if region.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut first = Vec::with_capacity(meta.shape.len());
+    let mut last = Vec::with_capacity(meta.shape.len());
+    for axis in 0..meta.shape.len() {
+        let tile = meta.tile_shape[axis];
+        first.push(region.start[axis] / tile);
+        last.push((region.end[axis] + tile - 1) / tile);
+    }
+    let mut indices = Vec::new();
+    let mut coords = first.clone();
+    loop {
+        let mut index: u64 = 0;
+        for axis in 0..meta.tile_counts.len() {
+            index = index
+                .checked_mul(meta.tile_counts[axis])
+                .and_then(|value| value.checked_add(coords[axis]))
+                .ok_or_else(|| Error::limit_exceeded("float tile index overflows u64"))?;
+        }
+        let index = usize::try_from(index)
+            .map_err(|_| Error::limit_exceeded("float tile index does not fit usize"))?;
+        if index >= meta.tiles.len() {
+            return Err(Error::corrupt("float tile index is outside the descriptor"));
+        }
+        indices.push(index);
+        let mut axis = first.len();
+        loop {
+            if axis == 0 {
+                return Ok(indices);
+            }
+            axis -= 1;
+            coords[axis] += 1;
+            if coords[axis] < last[axis] {
+                break;
+            }
+            coords[axis] = first[axis];
+        }
+    }
+}
+
+/// Read one logical region, decoding only the float tiles it intersects.
+pub fn read_float_region(
+    descriptor: &FloatTiledDescriptor<'_>,
+    region: &crate::tensor::Region,
+    limits: &Limits,
+) -> Result<(Vec<u8>, u64)> {
+    read_float_region_with(&descriptor.meta, region, limits, |entry| {
+        let start = usize::try_from(entry.offset)
+            .map_err(|_| Error::limit_exceeded("float tile offset does not fit usize"))?;
+        let end = start
+            .checked_add(
+                usize::try_from(entry.compressed_len)
+                    .map_err(|_| Error::limit_exceeded("float tile length does not fit usize"))?,
+            )
+            .ok_or_else(|| Error::limit_exceeded("float tile range overflows usize"))?;
+        descriptor
+            .payload
+            .get(start..end)
+            .map(|bytes| bytes.to_vec())
+            .ok_or_else(|| Error::corrupt("float tile range is outside the payload"))
+    })
+}
+
+/// Read one logical region with a caller-supplied stored-tile fetch.
+pub fn read_float_region_with<F>(
+    meta: &FloatTiledMeta,
+    region: &crate::tensor::Region,
+    limits: &Limits,
+    mut fetch: F,
+) -> Result<(Vec<u8>, u64)>
+where
+    F: FnMut(&FloatTiledEntry) -> Result<Vec<u8>>,
+{
+    region.validate(&meta.shape)?;
+    let extent = region.extent();
+    if region.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let count = extent.iter().try_fold(1u64, |acc, dim| {
+        acc.checked_mul(*dim)
+            .ok_or_else(|| Error::limit_exceeded("region element count overflows u64"))
+    })?;
+    let byte_len = count
+        .checked_mul(meta.dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("region payload length overflows u64"))?;
+    check_len(byte_len, limits.max_decoded_bytes, "region payload")?;
+    let byte_len = usize::try_from(byte_len)
+        .map_err(|_| Error::limit_exceeded("region payload does not fit usize"))?;
+    let mut out = vec![0u8; byte_len];
+    let indices = float_tiled_region_indices(meta, region)?;
+    let mut tiles_touched = 0u64;
+    for index in indices {
+        let entry = &meta.tiles[index];
+        let stored = fetch(entry)?;
+        let tile = decode_float_tile(meta.dtype, entry, &stored, limits)?;
+        place_float_tile_region(&mut out, region, meta, entry, &tile)?;
         tiles_touched += 1;
     }
     Ok((out, tiles_touched))

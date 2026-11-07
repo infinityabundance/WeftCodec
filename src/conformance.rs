@@ -691,9 +691,24 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     let mut unknown_mode = good.clone();
     unknown_mode[7] = 17;
     refix_header_and_trailer(&mut unknown_mode);
-    push_error(
+    push_error_superseded(
         &mut vectors,
         "017_unknown_mode_reserved17",
+        "raw",
+        &unknown_mode,
+        &[],
+        ErrorClass::UnsupportedMode,
+        None,
+        "017_unknown_mode_reserved18",
+        "Historical: this vector asserted that mode value 17 was reserved. WEFT-AI-CODEC allocates 17 to FLOAT_TILED, so the authoritative unknown-mode vector is 017_unknown_mode_reserved18. The frozen bytes and original expectation are retained unchanged.",
+    );
+
+    let mut unknown_mode = good.clone();
+    unknown_mode[7] = 18;
+    refix_header_and_trailer(&mut unknown_mode);
+    push_error(
+        &mut vectors,
+        "017_unknown_mode_reserved18",
         "raw",
         &unknown_mode,
         &[],
@@ -5452,6 +5467,292 @@ pub fn generate_tiled_v1(dir: &Path, limits: &Limits) -> Result<()> {
     fs::create_dir_all(&tiled_dir)
         .map_err(|e| Error::io(format!("cannot create {}: {e}", tiled_dir.display())))?;
     write_tiled_vectors(&tiled_dir, limits)
+}
+
+/// Write the mode-17 `FLOAT_TILED` conformance vectors into `<dir>/float-tiled`.
+pub fn generate_float_tiled_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let tiled_dir = dir.join("float-tiled");
+    fs::create_dir_all(&tiled_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", tiled_dir.display())))?;
+    write_float_tiled_vectors(&tiled_dir, limits)
+}
+
+fn float_tiled_rebuild(
+    meta: &Value,
+    stored: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let body = ai_body(meta, stored, limits)?;
+    build_frame(
+        Mode::FloatTiled,
+        DOMAIN_PAYLOAD,
+        0,
+        decoded_len,
+        content_hash,
+        &[],
+        &body,
+        limits,
+    )
+}
+
+fn write_float_tiled_valid(
+    dir: &Path,
+    name: &str,
+    dtype: modes::FloatDtype,
+    shape: &[u64],
+    tile_shape: &[u64],
+    plaintext: &[u8],
+    region: Option<(&[u64], &[u64])>,
+    limits: &Limits,
+) -> Result<()> {
+    let frame = modes::encode_float_tiled(plaintext, dtype, shape, tile_shape, limits)?;
+    let parsed = Frame::parse(&frame, limits)?;
+    let descriptor = modes::parse_float_tiled(&parsed, limits)?;
+    let decoded = modes::decode_float_tiled(&parsed, limits)?;
+    if decoded != plaintext {
+        return Err(Error::corrupt(format!(
+            "{name}: float-tiled round trip is not exact"
+        )));
+    }
+    let mut value = json!({
+        "name": name,
+        "mode": "float_tiled",
+        "mode_value": 17,
+        "dtype": dtype.as_str(),
+        "shape": shape,
+        "tile_shape": tile_shape,
+        "tile_counts": descriptor.meta.tile_counts,
+        "tile_count": descriptor.meta.tiles.len(),
+        "logical_root": descriptor.meta.logical_root.to_hex(),
+        "payload_len": descriptor.meta.payload_len,
+        "decoded_len": plaintext.len(),
+        "content_hash": parsed.header.content_hash.to_hex(),
+        "plaintext_hex": hexs(plaintext),
+        "frame_hex": hexs(&frame),
+        "tiles": descriptor.meta.tiles.iter().map(|entry| json!({
+            "index": entry.index,
+            "offset": entry.offset,
+            "compressed_len": entry.compressed_len,
+            "exponent_plane_len": entry.exponent_plane_len,
+            "mantissa_plane_len": entry.mantissa_plane_len,
+            "element_len": entry.element_len,
+            "tile_root": entry.tile_root.to_hex(),
+        })).collect::<Vec<_>>(),
+        "expect": { "ok": true },
+    });
+    if let Some((start, end)) = region {
+        let region = tensor::Region::new(start.to_vec(), end.to_vec());
+        let (bytes, tiles_touched) = modes::read_float_region(&descriptor, &region, limits)?;
+        value["region"] = json!({
+            "start": start,
+            "end": end,
+            "bytes_hex": hexs(&bytes),
+            "tiles_touched": tiles_touched,
+        });
+    }
+    write_json(&dir.join(format!("{name}.json")), &value)
+}
+
+fn write_float_tiled_reject(dir: &Path, name: &str, class: ErrorClass, frame: &[u8]) -> Result<()> {
+    let parsed = Frame::parse(frame, &Limits::default())?;
+    let value = json!({
+        "name": name,
+        "mode": "float_tiled",
+        "mode_value": 17,
+        "frame_hex": hexs(frame),
+        "decoded_len": parsed.header.decoded_len,
+        "content_hash": parsed.header.content_hash.to_hex(),
+        "dependencies": [],
+        "expect": { "error": class.as_str() },
+    });
+    write_json(&dir.join(format!("{name}.json")), &value)
+}
+
+fn write_float_tiled_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    let bf16_bytes = tiled_pattern(16 * 2, 0x51);
+    write_float_tiled_valid(
+        dir,
+        "001_float_tiled_bf16_4x4",
+        modes::FloatDtype::Bf16,
+        &[4, 4],
+        &[2, 2],
+        &bf16_bytes,
+        Some((&[0, 0], &[3, 3])),
+        limits,
+    )?;
+    let fp32_bytes = tiled_pattern(8 * 4, 0x77);
+    write_float_tiled_valid(
+        dir,
+        "002_float_tiled_fp32_2x2x2",
+        modes::FloatDtype::F32,
+        &[2, 2, 2],
+        &[1, 2, 2],
+        &fp32_bytes,
+        Some((&[0, 0, 0], &[2, 1, 2])),
+        limits,
+    )?;
+    let f16_bytes = tiled_pattern(6 * 2, 0x33);
+    write_float_tiled_valid(
+        dir,
+        "003_float_tiled_f16_single_tile",
+        modes::FloatDtype::F16,
+        &[2, 3],
+        &[2, 3],
+        &f16_bytes,
+        None,
+        limits,
+    )?;
+
+    let base = modes::encode_float_tiled(
+        &bf16_bytes,
+        modes::FloatDtype::Bf16,
+        &[4, 4],
+        &[2, 2],
+        limits,
+    )?;
+    let (meta, stored, decoded_len, content_hash) = tiled_body_parts(&base, limits)?;
+
+    // 101: a tile extent that does not divide the shape extent.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert(
+        "tile_shape".to_owned(),
+        Value::Array(vec![Value::U64(3), Value::U64(2)]),
+    );
+    let frame = float_tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_reject(
+        dir,
+        "101_non_dividing_tile_shape",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 102: tile rank differs from the shape rank.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert("tile_shape".to_owned(), Value::Array(vec![Value::U64(2)]));
+    let frame = float_tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_reject(dir, "102_tile_rank_mismatch", ErrorClass::Malformed, &frame)?;
+
+    // 103: a tile root that does not match its decoded tile.
+    let mut map = tiled_meta_map(&meta)?;
+    let mut first = tiled_tile_map(&map, 0)?;
+    first.insert("tile_root".to_owned(), Value::Bytes(vec![0u8; 32]));
+    let mut tiles = match map.get("tiles") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => {
+            return Err(Error::malformed(
+                "float tiled descriptor has no tiles array",
+            ))
+        }
+    };
+    tiles[0] = Value::Map(first);
+    map.insert("tiles".to_owned(), Value::Array(tiles));
+    let frame = float_tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_reject(dir, "103_tile_root_mismatch", ErrorClass::Corrupt, &frame)?;
+
+    // 104: truncated stored payload. The last tile loses its final byte and
+    // its descriptor lengths shrink by one, so the frame is structurally
+    // consistent but the tile no longer decodes to its recorded root.
+    let mut map = tiled_meta_map(&meta)?;
+    let last_position = match map.get("tiles") {
+        Some(Value::Array(items)) => items.len() - 1,
+        _ => {
+            return Err(Error::malformed(
+                "float tiled descriptor has no tiles array",
+            ))
+        }
+    };
+    let mut last = tiled_tile_map(&map, last_position)?;
+    let shrink = |value: &mut BTreeMap<String, Value>, key: &str| -> Result<()> {
+        match value.get(key) {
+            Some(Value::U64(current)) if *current > 1 => {
+                value.insert(key.to_owned(), Value::U64(*current - 1));
+                Ok(())
+            }
+            _ => Err(Error::malformed(format!("float tile has no {key}"))),
+        }
+    };
+    shrink(&mut last, "compressed_len")?;
+    shrink(&mut last, "exponent_plane_len")?;
+    let mut tiles = match map.get("tiles") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => {
+            return Err(Error::malformed(
+                "float tiled descriptor has no tiles array",
+            ))
+        }
+    };
+    tiles[last_position] = Value::Map(last);
+    map.insert("tiles".to_owned(), Value::Array(tiles));
+    shrink(&mut map, "payload_len")?;
+    let mut truncated_stored = stored.clone();
+    truncated_stored.pop();
+    let frame = float_tiled_rebuild(
+        &Value::Map(map),
+        &truncated_stored,
+        decoded_len,
+        content_hash,
+        limits,
+    )?;
+    write_float_tiled_reject(dir, "104_truncated_payload", ErrorClass::Corrupt, &frame)?;
+
+    // 105: a tile index outside canonical order.
+    let mut map = tiled_meta_map(&meta)?;
+    let mut second = tiled_tile_map(&map, 1)?;
+    second.insert("index".to_owned(), Value::U64(99));
+    let mut tiles = match map.get("tiles") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => {
+            return Err(Error::malformed(
+                "float tiled descriptor has no tiles array",
+            ))
+        }
+    };
+    tiles[1] = Value::Map(second);
+    map.insert("tiles".to_owned(), Value::Array(tiles));
+    let frame = float_tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_reject(
+        dir,
+        "105_out_of_range_tile_index",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 106: unknown exponent coder.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert(
+        "exponent_coder".to_owned(),
+        Value::Str("zstd-native-v1".to_owned()),
+    );
+    let frame = float_tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_reject(
+        dir,
+        "106_unknown_exponent_coder",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 107: zero shape dimension.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert(
+        "shape".to_owned(),
+        Value::Array(vec![Value::U64(4), Value::U64(0)]),
+    );
+    let frame = float_tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_reject(dir, "107_zero_dimension", ErrorClass::Malformed, &frame)?;
+
+    // 108: a logical root that does not match the assembled tensor.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert("logical_root".to_owned(), Value::Bytes(vec![0u8; 32]));
+    let frame = float_tiled_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_reject(
+        dir,
+        "108_logical_root_mismatch",
+        ErrorClass::Corrupt,
+        &frame,
+    )?;
+    Ok(())
 }
 
 fn tiled_pattern(len: usize, mut state: u64) -> Vec<u8> {
