@@ -102,6 +102,10 @@ pub enum Mode {
     /// Independently decodable float tiles: per-tile mode-9 plane split
     /// (WEFT-AI-CODEC §18).
     FloatTiled = 17,
+    /// Independently decodable float tiles whose per-tile Huffman exponent
+    /// plane is split into bounded interleaved streams
+    /// (WEFT-AI-CODEC §19).
+    FloatTiledStreams = 18,
 }
 
 impl Mode {
@@ -126,7 +130,8 @@ impl Mode {
             15 => Ok(Mode::TensorTiled),
             16 => Ok(Mode::SparseDelta),
             17 => Ok(Mode::FloatTiled),
-            18..=127 => Err(Error::unsupported_mode(format!(
+            18 => Ok(Mode::FloatTiledStreams),
+            19..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -161,6 +166,7 @@ impl Mode {
             Mode::TensorTiled => "tensor_tiled",
             Mode::SparseDelta => "sparse_delta",
             Mode::FloatTiled => "float_tiled",
+            Mode::FloatTiledStreams => "float_tiled_streams",
         }
     }
 
@@ -185,6 +191,11 @@ impl Mode {
             "tensor_tiled" | "tensor-tiled" | "tiled" => Ok(Mode::TensorTiled),
             "sparse_delta" | "sparse-delta" | "sparsedelta" => Ok(Mode::SparseDelta),
             "float_tiled" | "float-tiled" | "float_tile" | "ftiled" => Ok(Mode::FloatTiled),
+            "float_tiled_streams"
+            | "float-tiled-streams"
+            | "float_tile_streams"
+            | "ftiled_streams"
+            | "tiled_streams" => Ok(Mode::FloatTiledStreams),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -854,7 +865,8 @@ fn validate_mode_rules(
         | Mode::KvCache
         | Mode::ActivationStream
         | Mode::TensorTiled
-        | Mode::FloatTiled => {
+        | Mode::FloatTiled
+        | Mode::FloatTiledStreams => {
             if header.domain != DOMAIN_PAYLOAD {
                 return Err(Error::malformed(
                     "AI-mode frames must use the payload domain",

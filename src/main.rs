@@ -98,7 +98,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "tensor_tiled", "tensor-tiled", "float_tiled", "float-tiled", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "sparse_delta", "sparse-delta", "kv_cache", "kv-cache", "activation_stream", "activation-stream", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "tensor_tiled", "tensor-tiled", "float_tiled", "float-tiled", "float_tiled_streams", "float-tiled-streams", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "sparse_delta", "sparse-delta", "kv_cache", "kv-cache", "activation_stream", "activation-stream", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -151,6 +151,9 @@ struct EncodeArgs {
     /// `block_quantize:B:L`.
     #[arg(long = "semantic-policy")]
     semantic_policy: Option<String>,
+    /// FLOAT_TILED_STREAMS per-tile interleaved stream count (1..=16, default 4).
+    #[arg(long = "n-streams")]
+    n_streams: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -608,6 +611,10 @@ struct ConformanceArgs {
     /// Write only the FLOAT_TILED (mode 17) vectors into `<dir>/float-tiled`.
     #[arg(long)]
     float_tiled_only: bool,
+    /// Write only the FLOAT_TILED_STREAMS (mode 18) vectors into
+    /// `<dir>/float-tiled-streams`.
+    #[arg(long)]
+    float_tiled_streams_only: bool,
     /// Write only the authenticated capability-envelope vectors into
     /// `<dir>/capability`.
     #[arg(long)]
@@ -725,6 +732,15 @@ fn run(cli: Cli) -> Result<()> {
             } else if args.float_tiled_only {
                 weftcodec::conformance::generate_float_tiled_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote float-tiled vectors to {}/float-tiled", args.dir);
+            } else if args.float_tiled_streams_only {
+                weftcodec::conformance::generate_float_tiled_streams_v1(
+                    Path::new(&args.dir),
+                    &limits,
+                )?;
+                eprintln!(
+                    "wrote float-tiled-streams vectors to {}/float-tiled-streams",
+                    args.dir
+                );
             } else if args.capability_only {
                 weftcodec::conformance::generate_capability_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote capability vectors to {}/capability", args.dir);
@@ -777,6 +793,11 @@ fn encode(args: EncodeArgs) -> Result<()> {
         let (dtype, shape) = float_tensor_metadata_args(&args)?;
         let tile_shape = tile_shape_arg(&args)?;
         modes::encode_float_tiled(&data, dtype, &shape, &tile_shape, &limits)?
+    } else if args.mode == "float_tiled_streams" || args.mode == "float-tiled-streams" {
+        let (dtype, shape) = float_tensor_metadata_args(&args)?;
+        let tile_shape = tile_shape_arg(&args)?;
+        let n_streams = args.n_streams.unwrap_or(modes::FLOAT_TILED_STREAMS_DEFAULT);
+        modes::encode_float_tiled_streams(&data, dtype, &shape, &tile_shape, n_streams, &limits)?
     } else if args.mode == "weight_delta" || args.mode == "weight-delta" {
         let (dtype, shape) = weight_delta_metadata_args(&args)?;
         let base_frame = base
@@ -898,6 +919,9 @@ fn encode_mode(
         )),
         Mode::FloatTiled => Err(Error::malformed(
             "FLOAT_TILED encoding requires the dedicated CLI path with --dtype/--shape/--tile-shape",
+        )),
+        Mode::FloatTiledStreams => Err(Error::malformed(
+            "FLOAT_TILED_STREAMS encoding requires the dedicated CLI path with --dtype/--shape/--tile-shape/--n-streams",
         )),
     }
 }

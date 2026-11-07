@@ -72,15 +72,22 @@ pub use kv_cache::{
 };
 pub use limits::Limits;
 pub use modes::{
-    decode_float_tile, decode_float_tiled, decode_tiled_tensor, decode_tiled_tile,
-    encode_float_tiled, encode_tiled_tensor, float_tile_root, float_tiled_metadata,
-    float_tiled_region_indices, parse_float_tiled, parse_float_tiled_descriptor,
-    parse_tiled_tensor, place_float_tile, place_float_tile_region, place_tiled_tile,
-    place_tiled_tile_region, read_float_region, read_float_region_with,
+    decode_float_tile, decode_float_tile_streams, decode_float_tiled, decode_float_tiled_streams,
+    decode_float_tiled_with_threads, decode_tiled_tensor, decode_tiled_tile, encode_float_tiled,
+    encode_float_tiled_streams, encode_tiled_tensor, float_tile_root, float_tile_streams_root,
+    float_tiled_metadata, float_tiled_region_indices, float_tiled_streams_metadata,
+    float_tiled_streams_region_indices, interleaved_stream_len, parse_float_tiled,
+    parse_float_tiled_descriptor, parse_float_tiled_streams, parse_float_tiled_streams_descriptor,
+    parse_tiled_tensor, place_float_tile, place_float_tile_region, place_float_tiled_streams_tile,
+    place_float_tiled_streams_tile_region, place_tiled_tile, place_tiled_tile_region,
+    read_float_region, read_float_region_with, read_float_tiled_streams_region,
     read_region as read_tiled_region, tensor_tile_root, tiled_region_indices,
-    tiled_tensor_metadata, FloatTiledDescriptor, FloatTiledEntry, FloatTiledMeta, TensorDtype,
+    tiled_tensor_metadata, FloatTiledDescriptor, FloatTiledEntry, FloatTiledMeta,
+    FloatTiledStreamsDescriptor, FloatTiledStreamsEntry, FloatTiledStreamsMeta, TensorDtype,
     TiledTensorDescriptor, TiledTensorEntry, TiledTensorMeta, FLOAT_TILED_LAYOUT,
-    FLOAT_TILED_SCHEMA, TENSOR_TILED_SCHEMA, TENSOR_TILE_CODEC, TENSOR_TILE_LAYOUT,
+    FLOAT_TILED_SCHEMA, FLOAT_TILED_STREAMS_DEFAULT, FLOAT_TILED_STREAMS_MAX,
+    FLOAT_TILED_STREAMS_MIN, FLOAT_TILED_STREAMS_SCHEMA, TENSOR_TILED_SCHEMA, TENSOR_TILE_CODEC,
+    TENSOR_TILE_LAYOUT,
 };
 pub use semantic::{
     select_semantic_base, semantic_matches, semantic_record, semantic_root,

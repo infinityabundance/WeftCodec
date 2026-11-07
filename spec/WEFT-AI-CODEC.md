@@ -1,4 +1,4 @@
-# WEFT-AI-CODEC v1.2.0 — AI-native codec modes
+# WEFT-AI-CODEC v1.3.0 — AI-native codec modes
 
 ## 0. Mode index
 
@@ -23,17 +23,18 @@ and `decoded_len`; the domains below are the additional, mode-specific roots.
 | 15 | `TENSOR_TILED` (`tensor-tiled`) | `weft.ai.tensor_tiled.v1` | `weft/tensor/tile/v1` (`tile_root`), `weft/tensor/values/v1` (`values_hash`), `weft/tensor/logical/v1` | v1 | normative | `conformance/v1/tensor-tiled/001–003` + rejects |
 | 16 | `SPARSE_DELTA` (`sparse-delta`) | `weft.ai.sparse_delta.v1` | `weft/tensor/values/v1` (`delta_root`) | v1 | normative | `conformance/v1/sparse-delta/001–004` + rejects |
 | 17 | `FLOAT_TILED` (`float-tiled`) | `weft.ai.float_tiled.v1` | `weft/tensor/float_tile/v1` (`tile_root`), `weft/tensor/values/v1` | v1 | normative | `conformance/v1/float-tiled/001–003` + rejects |
-| 18 | — | — | — | — | **reserved** | `conformance/v1/codec/017_unknown_mode_reserved18.json` (reject only) |
+| 18 | `FLOAT_TILED_STREAMS` (`float-tiled-streams`) | `weft.ai.tensor_tiled_streams.v1` | `weft/tensor/float_tile_streams/v1` (`tile_root`), `weft/tensor/values/v1` | v1 | normative | `conformance/v1/float-tiled-streams/001–004` + twelve rejects |
+| 19 | — | — | — | — | **reserved** | `conformance/v1/codec/017_unknown_mode_reserved19.json` (reject only) |
 
 Modes 0–5 (RAW, ZSTD, REFERENCE, DELTA, DICTIONARY, STRUCTURED) are defined in
-`WEFTCODEC-FORMAT.md`; this document covers 6–17 and the reserved 18. A value
-above 18 is `UnsupportedMode` by the frame parser. Vector paths in the last
+`WEFTCODEC-FORMAT.md`; this document covers 6–18; 19 is reserved. A value
+above 19 is `UnsupportedMode` by the frame parser. Vector paths in the last
 column are relative to the program home; the authoritative list, with sizes and
 digests, is `conformance/manifest.json`, and `scripts/check-conformance-coverage.sh`
-enforces that every mode 0–17 has valid **and** reject vectors.
+enforces that every mode 0–18 has valid **and** reject vectors.
 
 
-**Status: PARTIALLY IMPLEMENTED.** Exactly eleven AI-native modes are normative
+**Status: PARTIALLY IMPLEMENTED.** Exactly thirteen AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 
 | Value | Name | Status | Frozen vectors |
@@ -49,6 +50,8 @@ and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 | 14 | `SEMANTIC_DELTA` (CLI `semantic-delta`) | **implemented** | `conformance/v1/semantic-delta/001`–`003` + eight rejects |
 | 15 | `TENSOR_TILED` (CLI `tensor-tiled`) | **implemented** | `conformance/v1/tensor-tiled/001`–`003` + eight rejects |
 | 16 | `SPARSE_DELTA` (CLI `sparse-delta`) | **implemented** | `conformance/v1/sparse-delta/001`–`004` + fourteen rejects |
+| 17 | `FLOAT_TILED` (CLI `float-tiled`) | **implemented** | `conformance/v1/float-tiled/001`–`003` + eight rejects |
+| 18 | `FLOAT_TILED_STREAMS` (CLI `float-tiled-streams`) | **implemented** | `conformance/v1/float-tiled-streams/001`–`004` + twelve rejects |
 
 Every other mode below is `specified, not implemented` and has **no allocated
 wire value**. Nothing in this document is a compression or performance claim.
@@ -1941,3 +1944,173 @@ Rejects: `101_non_dividing_tile_shape`, `102_tile_rank_mismatch`,
 The cross-language gate asserts `YES byte-identical float_tiled_bf16` and
 `float_tiled_fp32`, decode equivalence in both directions, and that the
 reserved-mode reject moved to 18 (`017_unknown_mode_reserved17` is superseded).
+
+---
+
+## 19. Mode 18 — `FLOAT_TILED_STREAMS` (implemented)
+
+Mode 18 is the multi-stream form of mode 17. The tile grid, exponent/mantissa
+split, canonical tile order, contiguous offsets, full-tiles-only rule and
+per-tile root discipline are exactly §18's. The only wire difference is inside
+a tile: the Huffman exponent plane is split round-robin into `n_streams`
+independently coded `huffman-canonical-v1` streams, and the raw mantissa plane
+is split round-robin into `n_streams` raw streams.
+
+**Design note (normative).** The frozen mode-17 mantissa plane is raw. Mode 18
+therefore keeps the mantissa raw; only the exponent plane is Huffman-coded.
+This is what makes `n_streams = 1` byte-identical to mode 17's stored tile
+payload, the correctness anchor for the whole mode. Huffman-coding the
+mantissa as well would break that anchor and is not defined in v1.
+
+### 19.1 Frame shape
+
+```
+domain        = 0 (payload)
+mode          = 18
+flags         = 0
+dep_count     = 0
+chunk_count   = 0
+decoded_len   = product(shape) * element_size
+content_hash  = H("weft/chunk/v1", canonical row-major element bytes)
+body          = u32le(meta_len) || WCB(meta) || stored_payload
+```
+
+Defined for `bf16`, `fp16`, `fp32`. `fp8-e4m3`/`fp8-e5m2` are
+`UnsupportedFeature`.
+
+### 19.2 Descriptor
+
+Schema `weft.ai.tensor_tiled_streams.v1`. Exactly these keys:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `schema` | text | `"weft.ai.tensor_tiled_streams.v1"` |
+| `dtype` | text | `bf16`, `fp16`, or `fp32` |
+| `shape` | array of u64 | full logical extent, rank >= 1 |
+| `element_count` | u64 | `product(shape)` |
+| `layout` | text | `"row_major"` (the only v1 layout) |
+| `tile_shape` | array of u64 | divides every extent exactly |
+| `tile_counts` | array of u64 | `shape[i] / tile_shape[i]` |
+| `exponent_coder` | text | `"huffman-canonical-v1"` |
+| `n_streams` | u64 | declared stream count, `1 <= n_streams <= 16` |
+| `tiles` | array | exactly `product(tile_counts)` entries |
+| `payload_len` | u64 | stored payload bytes |
+| `logical_root` | bytes32 | `WEFT-TENSOR` logical root of the whole tensor |
+
+Each tile entry has exactly: `index`, `dims`, `offset`, `compressed_len`,
+`exponent_plane_len`, `mantissa_plane_len`, `element_len`, `stream_offsets`,
+`tile_root`. `stream_offsets` is the fixed-width (u64) stream table.
+
+### 19.3 Interleave and stream table
+
+For a plane of `P` bytes split over `N = n_streams`, stream `k` holds the bytes
+at indices `k, k+N, k+2N, ...`. Its decoded length is
+
+```
+stream_len(P, k, N) = 0                         if P <= k
+                      ceil((P - k) / N)         otherwise
+```
+
+`stream_offsets` has exactly `2N` u64 entries, relative to the tile start:
+the first `N` are the exponent streams and the next `N` the mantissa streams.
+It must satisfy `stream_offsets[0] == 0`, be non-decreasing, have every entry
+`<= compressed_len`, and `stream_offsets[N] == exponent_plane_len`. Each
+exponent stream is one `huffman-canonical-v1` stream with its own 256-byte
+code-length table; each mantissa stream is raw.
+
+`exponent_plane_len` is the total encoded exponent bytes (all `N` streams);
+`mantissa_plane_len = ceil(tile_elements * (sign_bits + mantissa_bits) / 8)`;
+`compressed_len = exponent_plane_len + mantissa_plane_len`.
+
+Tile `t` is stored as
+`exp_0 || ... || exp_{N-1} || mant_0 || ... || mant_{N-1}`.
+
+With `N = 1`, `stream_offsets = [0, exponent_plane_len]` and the stored tile
+bytes are **exactly** `huffman(exponent_plane) || mantissa_plane`, i.e. the
+mode-17 tile payload byte for byte.
+
+### 19.4 Tile identity
+
+```
+tile_root = H("weft/tensor/float_tile_streams/v1",
+              WCB({dtype, dims, element_len,
+                   exponent_plane_len, mantissa_plane_len,
+                   n_streams, stream_offsets,
+                   values_hash}))
+values_hash = H("weft/tensor/values/v1", decoded tile bytes)
+```
+
+The root covers `n_streams` and the complete offset table, so a stream-count
+or offset change is a different root. `element_len = product(dims) *
+element_size`. A full decode recomputes
+`logical_root = LogicalTensorRoot(dtype, shape, assembled_bytes)`.
+
+### 19.5 Decode paths
+
+* Full decode: every tile, every stream, every tile root, then the logical root.
+  Tiles may run on a bounded pool; a single tile's streams may run on a bounded
+  pool. The wide-word `huffman-canonical-v1` multi-stream kernel is tried first
+  and falls back to the canonical per-stream decoder on any tail or long code.
+* Region decode: only intersecting tiles are fetched and decoded; it reports
+  `tiles_touched` and `streams_touched = tiles_touched * 2 * n_streams`.
+  A prefix range read verifies each decoded tile's root but not the whole-frame
+  trailer; the store's region path checks dtype, shape and `logical_root`
+  against the representation manifest first.
+
+### 19.6 Validation order (normative for error classes)
+
+1. Descriptor WCB decode and exact key sets — `Malformed`.
+2. `schema`, `layout`, `exponent_coder`, dtype support — `Malformed` /
+   `UnsupportedFeature`.
+3. `n_streams` outside `1..=16` — `Malformed`.
+4. Shape product, `element_count`, `decoded_len` — `Malformed` / `Corrupt`.
+5. Tile grid, tile count, `payload_len`, entry count, canonical `index`,
+   `dims`, `element_len`, contiguous `offset`, `mantissa_plane_len`,
+   `compressed_len` arithmetic — `Malformed`.
+6. `stream_offsets`: length `2N`, first zero, monotonic, not past
+   `compressed_len`, `stream_offsets[N] == exponent_plane_len`, exponent stream
+   lengths `>= 256`, mantissa stream lengths equal to the interleave — `Malformed`.
+7. Per-stream Huffman decode (truncated stream, decoded length disagreement) —
+   `Corrupt`.
+8. Mantissa padding and element-width checks — `Corrupt`.
+9. Per-tile `tile_root` — `Corrupt`.
+10. `tiles_bytes == decoded_len` and `logical_root` — `Corrupt`.
+
+### 19.7 Limits
+
+`max_tensor_elements`, `max_tensor_rank`, `max_decoded_bytes`,
+`max_structured_items` (tile count), Huffman stream limits, and the new
+`n_streams <= 16` bound apply. No other limit was added.
+
+### 19.8 API and CLI
+
+Rust: `encode_float_tiled_streams`, `parse_float_tiled_streams`,
+`parse_float_tiled_streams_descriptor`, `decode_float_tiled_streams`,
+`decode_float_tile_streams`, `float_tiled_streams_metadata`,
+`float_tile_streams_root`, `read_float_tiled_streams_region`,
+`float_tiled_streams_region_indices`, `place_float_tiled_streams_tile`,
+`place_float_tiled_streams_tile_region`, `interleaved_stream_len`. CLI:
+`weftcodec encode --mode float-tiled-streams --dtype bf16 --shape 4,4
+--tile-shape 2,2 --n-streams 4`. Go has the same surface (`EncodeFloatTiledStreams`,
+`ParseFloatTiledStreams`, `DecodeFloatTiledStreams`,
+`ReadFloatTiledStreamsRegion`).
+
+### 19.9 Conformance vectors
+
+`conformance/v1/float-tiled-streams/` (byte-identical in both codec
+repositories):
+
+* `001_streams_bf16_4x4_n1` — `n_streams = 1`, the mode-17 identity anchor.
+* `002_streams_fp32_2x2x2_n2` — rank 3, two streams, region read.
+* `003_streams_bf16_16x16_n4` — four streams over tiles with real bitstreams.
+* `004_streams_f16_2x3_n16` — more streams than plane bytes (empty streams).
+
+Rejects: `101_n_streams_zero`, `102_n_streams_above_bound`,
+`103_stream_offsets_not_monotonic`, `104_stream_offset_past_payload`,
+`105_plane_boundary_mismatch`, `106_exponent_stream_shorter_than_table`,
+`107_tile_root_mismatch`, `108_truncated_stream`,
+`109_stream_decoded_length_disagrees`, `110_stream_count_without_retable`,
+`111_unknown_exponent_coder`, `112_logical_root_mismatch`.
+
+The reserved-mode reject moved to 19; `017_unknown_mode_reserved18` is
+retained and superseded.

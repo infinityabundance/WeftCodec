@@ -230,6 +230,7 @@ pub fn decode_bytes(
         }
         Mode::TensorTiled => decode_tiled_tensor(&frame, limits)?,
         Mode::FloatTiled => decode_float_tiled(&frame, limits)?,
+        Mode::FloatTiledStreams => decode_float_tiled_streams(&frame, limits, 1)?,
     };
 
     if plaintext.len() as u64 != frame.header.decoded_len {
@@ -1471,6 +1472,18 @@ pub fn split_float_tensor_payload(
     dtype: FloatDtype,
     element_count: u64,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (exponent_plane, mantissa_plane) =
+        split_float_tensor_planes(payload, dtype, element_count)?;
+    Ok((huffman::encode(&exponent_plane), mantissa_plane))
+}
+
+/// Split float element bytes into the raw exponent byte plane and the packed
+/// sign+mantissa plane, without coding either plane.
+fn split_float_tensor_planes(
+    payload: &[u8],
+    dtype: FloatDtype,
+    element_count: u64,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let expected_bytes = element_count
         .checked_mul(dtype.element_size())
         .ok_or_else(|| Error::limit_exceeded("float tensor decoded byte count overflows u64"))?;
@@ -1505,7 +1518,7 @@ pub fn split_float_tensor_payload(
         push_bits(&mut mantissa_plane, &mut bit_len, sign, sign_bits);
         push_bits(&mut mantissa_plane, &mut bit_len, mantissa, mantissa_bits);
     }
-    Ok((huffman::encode(&exponent_plane), mantissa_plane))
+    Ok((exponent_plane, mantissa_plane))
 }
 
 /// Reconstruct the exact little-endian element bytes from the two planes.
@@ -3775,6 +3788,96 @@ pub fn float_tiled_metadata(frame: &Frame<'_>, limits: &Limits) -> Result<FloatT
     Ok(parse_float_tiled(frame, limits)?.meta)
 }
 
+/// Decode a mode-17 frame with `threads` tile workers.
+///
+/// `threads <= 1` is exactly [`decode_float_tiled`]. Larger values decode
+/// independent tiles on a bounded pool; every tile root, the logical root and
+/// the returned bytes are identical to the sequential call.
+pub fn decode_float_tiled_with_threads(
+    frame: &Frame<'_>,
+    limits: &Limits,
+    threads: usize,
+) -> Result<Vec<u8>> {
+    if threads <= 1 {
+        return decode_float_tiled(frame, limits);
+    }
+    let descriptor = parse_float_tiled(frame, limits)?;
+    let meta = &descriptor.meta;
+    let total = usize::try_from(
+        meta.element_count
+            .checked_mul(meta.dtype.element_size())
+            .ok_or_else(|| Error::limit_exceeded("float tiled decoded bytes overflow u64"))?,
+    )
+    .map_err(|_| Error::limit_exceeded("float tiled decoded bytes do not fit usize"))?;
+    let mut out = vec![0u8; total];
+    let decode_tile = |entry: &FloatTiledEntry| -> Result<Vec<u8>> {
+        let start = usize::try_from(entry.offset)
+            .map_err(|_| Error::limit_exceeded("float tile offset does not fit usize"))?;
+        let end = start
+            .checked_add(
+                usize::try_from(entry.compressed_len)
+                    .map_err(|_| Error::limit_exceeded("float tile length does not fit usize"))?,
+            )
+            .ok_or_else(|| Error::limit_exceeded("float tile range overflows usize"))?;
+        let stored = descriptor
+            .payload
+            .get(start..end)
+            .ok_or_else(|| Error::corrupt("float tile range is outside the payload"))?;
+        decode_float_tile(meta.dtype, entry, stored, limits)
+    };
+    let mut tiles: Vec<Vec<u8>> = Vec::with_capacity(meta.tiles.len());
+    let workers = threads.min(meta.tiles.len()).min(64).max(1);
+    let chunk = meta.tiles.len().div_ceil(workers);
+    let mut chunk_results: Vec<Result<Vec<Vec<u8>>>> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for start in (0..meta.tiles.len()).step_by(chunk) {
+            let end = (start + chunk).min(meta.tiles.len());
+            let entries = &meta.tiles[start..end];
+            let decode_tile = &decode_tile;
+            handles.push(scope.spawn(move || {
+                let mut decoded = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    decoded.push(decode_tile(entry)?);
+                }
+                Ok(decoded)
+            }));
+        }
+        for handle in handles {
+            chunk_results.push(
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::corrupt("float tile worker panicked"))),
+            );
+        }
+    });
+    for result in chunk_results {
+        tiles.extend(result?);
+    }
+    let mut tiles_bytes = 0usize;
+    for (entry, tile) in meta.tiles.iter().zip(tiles.iter()) {
+        tiles_bytes = tiles_bytes
+            .checked_add(tile.len())
+            .ok_or_else(|| Error::limit_exceeded("float tiled decoded length overflows usize"))?;
+        place_float_tile(&mut out, meta, entry, tile)?;
+    }
+    if tiles_bytes != total {
+        return Err(Error::corrupt(format!(
+            "float tiled decoded to {tiles_bytes} bytes but the descriptor requires {total}"
+        )));
+    }
+    let tensor_dtype = float_tiled_tensor_dtype(meta.dtype)
+        .ok_or_else(|| Error::unsupported_feature("float tiled dtype has no tensor identity"))?;
+    let logical = crate::tensor::logical_root(tensor_dtype, &meta.shape, &out, limits)?;
+    if logical != meta.logical_root {
+        return Err(Error::corrupt(format!(
+            "float tiled logical root {logical} does not match the descriptor's {}",
+            meta.logical_root
+        )));
+    }
+    Ok(out)
+}
+
 fn float_tile_start_bytes(meta: &FloatTiledMeta, entry: &FloatTiledEntry) -> Result<Vec<u64>> {
     let coords = tile_start(&meta.tile_counts, entry.index);
     let mut start = Vec::with_capacity(coords.len());
@@ -4047,4 +4150,1155 @@ fn copy_box_into(
             coords[axis] = 0;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// FLOAT_TILED_STREAMS (mode 18, WEFT-AI-CODEC §19)
+// ---------------------------------------------------------------------------
+
+/// Canonical multi-stream float-tiled schema.
+pub const FLOAT_TILED_STREAMS_SCHEMA: &str = "weft.ai.tensor_tiled_streams.v1";
+/// Smallest declared stream count.
+pub const FLOAT_TILED_STREAMS_MIN: u64 = 1;
+/// Largest declared stream count.
+pub const FLOAT_TILED_STREAMS_MAX: u64 = 16;
+/// Default stream count offered by the store planner.
+pub const FLOAT_TILED_STREAMS_DEFAULT: u64 = 4;
+
+/// One independently decodable multi-stream float tile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloatTiledStreamsEntry {
+    pub index: u64,
+    pub dims: Vec<u64>,
+    pub offset: u64,
+    pub compressed_len: u64,
+    /// Total encoded exponent bytes (all `n_streams` Huffman streams).
+    pub exponent_plane_len: u64,
+    /// Raw sign+mantissa plane length (all `n_streams` raw streams).
+    pub mantissa_plane_len: u64,
+    pub element_len: u64,
+    /// Starts of the `2 * n_streams` streams, relative to the tile start.
+    /// Every exponent stream is one `huffman-canonical-v1` stream with its own
+    /// 256-byte table; every mantissa stream is raw. The first `n_streams`
+    /// entries are the exponent streams and the next `n_streams` the mantissa
+    /// streams.
+    pub stream_offsets: Vec<u64>,
+    pub tile_root: Hash32,
+}
+
+/// A parsed mode-18 descriptor (without the payload bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloatTiledStreamsMeta {
+    pub dtype: FloatDtype,
+    pub shape: Vec<u64>,
+    pub element_count: u64,
+    pub tile_shape: Vec<u64>,
+    pub tile_counts: Vec<u64>,
+    pub n_streams: u64,
+    pub tiles: Vec<FloatTiledStreamsEntry>,
+    pub payload_len: u64,
+    pub logical_root: Hash32,
+}
+
+/// A parsed mode-18 frame: descriptor plus the stored payload slice.
+#[derive(Clone, Debug)]
+pub struct FloatTiledStreamsDescriptor<'a> {
+    pub meta: FloatTiledStreamsMeta,
+    pub payload: &'a [u8],
+}
+
+/// `H("weft/tensor/float_tile_streams/v1", WCB({...}))` for one decoded tile.
+///
+/// The record covers `n_streams` and the complete offset table, so changing
+/// either the stream count or one offset changes the tile root.
+#[allow(clippy::too_many_arguments)]
+pub fn float_tile_streams_root(
+    dtype: FloatDtype,
+    dims: &[u64],
+    tile_bytes: &[u8],
+    exponent_plane_len: u64,
+    mantissa_plane_len: u64,
+    n_streams: u64,
+    stream_offsets: &[u64],
+    limits: &Limits,
+) -> Result<Hash32> {
+    let value = Value::map([
+        ("dtype", Value::Str(dtype.as_str().to_owned())),
+        (
+            "dims",
+            Value::Array(dims.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        ("element_len", Value::U64(tile_bytes.len() as u64)),
+        ("exponent_plane_len", Value::U64(exponent_plane_len)),
+        ("mantissa_plane_len", Value::U64(mantissa_plane_len)),
+        ("n_streams", Value::U64(n_streams)),
+        (
+            "stream_offsets",
+            Value::Array(
+                stream_offsets
+                    .iter()
+                    .map(|offset| Value::U64(*offset))
+                    .collect(),
+            ),
+        ),
+        (
+            "values_hash",
+            Value::Bytes(
+                hash_domain(crate::tensor::DOMAIN_TENSOR_VALUES, tile_bytes)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ),
+    ]);
+    Ok(hash_domain(
+        crate::hash::DOMAIN_FLOAT_TILE_STREAMS,
+        &wcb::encode(&value, limits)?,
+    ))
+}
+
+/// Number of bytes the interleaved stream `stream` holds for a plane of
+/// `total` bytes split round-robin over `n_streams`.
+pub fn interleaved_stream_len(total: u64, stream: u64, n_streams: u64) -> u64 {
+    if n_streams == 0 || total <= stream {
+        0
+    } else {
+        (total - stream).div_ceil(n_streams)
+    }
+}
+
+fn interleave_plane(plane: &[u8], n_streams: usize) -> Vec<Vec<u8>> {
+    let mut streams: Vec<Vec<u8>> = (0..n_streams)
+        .map(|_| Vec::with_capacity(plane.len() / n_streams + 1))
+        .collect();
+    for (index, &byte) in plane.iter().enumerate() {
+        streams[index % n_streams].push(byte);
+    }
+    streams
+}
+
+/// Scatter each stream back into its round-robin positions.
+///
+/// The loop is per stream (stride `n_streams`), which is cache-friendlier and
+/// avoids the per-element division the naive form performs. A one-stream plane
+/// is a plain copy.
+fn deinterleave_slices(streams: &[&[u8]], total: usize, what: &str) -> Result<Vec<u8>> {
+    let n_streams = streams.len();
+    if n_streams == 0 {
+        return Err(Error::malformed(format!("{what} declares zero streams")));
+    }
+    if n_streams == 1 {
+        if streams[0].len() != total {
+            return Err(Error::corrupt(format!(
+                "{what} single stream is {} bytes but the plane requires {total}",
+                streams[0].len()
+            )));
+        }
+        return Ok(streams[0].to_vec());
+    }
+    let mut out = vec![0u8; total];
+    for (stream_index, stream) in streams.iter().enumerate() {
+        for (position, &byte) in stream.iter().enumerate() {
+            let index = position
+                .checked_mul(n_streams)
+                .and_then(|value| value.checked_add(stream_index))
+                .ok_or_else(|| Error::limit_exceeded("interleaved index overflows usize"))?;
+            let slot = out.get_mut(index).ok_or_else(|| {
+                Error::corrupt(format!(
+                    "{what} stream {stream_index} is longer than its interleaved plane"
+                ))
+            })?;
+            *slot = byte;
+        }
+    }
+    Ok(out)
+}
+
+/// Decode `n_streams` independent byte planes with the multi-stream kernel (
+/// `threads <= 1`) or a bounded thread pool (`threads > 1`).
+///
+/// Stream errors are returned in global stream order, so the reported class is
+/// the first failing stream's class in both paths.
+fn decode_stream_planes(
+    encoded: &[&[u8]],
+    expected: &[usize],
+    threads: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if threads <= 1 || encoded.len() <= 1 {
+        return huffman::decode_streams(encoded, expected);
+    }
+    let workers = threads.min(encoded.len()).min(64).max(1);
+    let chunk = encoded.len().div_ceil(workers);
+    let mut chunk_results: Vec<Result<Vec<Vec<u8>>>> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for start in (0..encoded.len()).step_by(chunk) {
+            let end = (start + chunk).min(encoded.len());
+            let enc = &encoded[start..end];
+            let exp = &expected[start..end];
+            handles.push(scope.spawn(move || huffman::decode_streams(enc, exp)));
+        }
+        for handle in handles {
+            chunk_results.push(
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::corrupt("multi-stream decode worker panicked"))),
+            );
+        }
+    });
+    let mut out = Vec::with_capacity(encoded.len());
+    for result in chunk_results {
+        out.extend(result?);
+    }
+    Ok(out)
+}
+
+/// Decode one stored multi-stream float tile and verify its `tile_root`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_float_tile_streams(
+    dtype: FloatDtype,
+    entry: &FloatTiledStreamsEntry,
+    n_streams: u64,
+    stored: &[u8],
+    limits: &Limits,
+    threads: usize,
+) -> Result<Vec<u8>> {
+    if !(FLOAT_TILED_STREAMS_MIN..=FLOAT_TILED_STREAMS_MAX).contains(&n_streams) {
+        return Err(Error::malformed(format!(
+            "float tile {} declares n_streams {n_streams} outside {}..={}",
+            entry.index, FLOAT_TILED_STREAMS_MIN, FLOAT_TILED_STREAMS_MAX
+        )));
+    }
+    if entry.stream_offsets.len() as u64 != 2 * n_streams {
+        return Err(Error::malformed(format!(
+            "float tile {} has {} stream offsets but n_streams {n_streams} requires {}",
+            entry.index,
+            entry.stream_offsets.len(),
+            2 * n_streams
+        )));
+    }
+    if stored.len() as u64 != entry.compressed_len {
+        return Err(Error::corrupt(format!(
+            "float tile {} stored range is {} bytes but the descriptor records {}",
+            entry.index,
+            stored.len(),
+            entry.compressed_len
+        )));
+    }
+    let exponent_len = usize::try_from(entry.exponent_plane_len).map_err(|_| {
+        Error::limit_exceeded("float tile exponent plane length does not fit usize")
+    })?;
+    let element_len = usize::try_from(entry.element_len)
+        .map_err(|_| Error::limit_exceeded("float tile length does not fit usize"))?;
+    let element_size = usize::try_from(dtype.element_size())
+        .map_err(|_| Error::limit_exceeded("float tile element size does not fit usize"))?;
+    if element_size == 0 || element_len % element_size != 0 {
+        return Err(Error::malformed(
+            "float tile element length is not a whole number of elements",
+        ));
+    }
+    let elements = element_len / element_size;
+    let (exponent_stored, mantissa_stored) = stored.split_at(exponent_len);
+    let n =
+        usize::try_from(n_streams).map_err(|_| Error::malformed("n_streams does not fit usize"))?;
+
+    // Exponent streams: each one a `huffman-canonical-v1` stream with its own
+    // 256-byte table.
+    let mut exponent_streams: Vec<&[u8]> = Vec::with_capacity(n);
+    let mut exponent_expected: Vec<usize> = Vec::with_capacity(n);
+    let exponent_elements = u64::try_from(elements)
+        .map_err(|_| Error::limit_exceeded("float tile element count does not fit u64"))?;
+    for stream in 0..n {
+        let start = usize::try_from(entry.stream_offsets[stream])
+            .map_err(|_| Error::limit_exceeded("stream offset does not fit usize"))?;
+        let end = if stream + 1 < n {
+            usize::try_from(entry.stream_offsets[stream + 1])
+                .map_err(|_| Error::limit_exceeded("stream offset does not fit usize"))?
+        } else {
+            exponent_len
+        };
+        let bytes = exponent_stored
+            .get(start..end)
+            .ok_or_else(|| Error::corrupt("float tile exponent stream is outside the tile"))?;
+        exponent_streams.push(bytes);
+        exponent_expected.push(
+            usize::try_from(interleaved_stream_len(
+                exponent_elements,
+                stream as u64,
+                n_streams,
+            ))
+            .map_err(|_| Error::limit_exceeded("stream output length does not fit usize"))?,
+        );
+    }
+    let exponent_parts = decode_stream_planes(&exponent_streams, &exponent_expected, threads)?;
+    let exponent_plane = if n == 1 {
+        exponent_parts
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::corrupt("float tile has no exponent stream"))?
+    } else {
+        let refs: Vec<&[u8]> = exponent_parts.iter().map(Vec::as_slice).collect();
+        deinterleave_slices(&refs, elements, "exponent plane")?
+    };
+
+    // Mantissa streams: raw interleaved segments.
+    let mantissa_total = mantissa_stored.len();
+    let mantissa_total_u64 = mantissa_total as u64;
+    let mut mantissa_parts: Vec<&[u8]> = Vec::with_capacity(n);
+    for stream in 0..n {
+        let start = usize::try_from(entry.stream_offsets[n + stream] - entry.exponent_plane_len)
+            .map_err(|_| Error::corrupt("mantissa stream offset precedes the exponent plane"))?;
+        let end = if stream + 1 < n {
+            usize::try_from(entry.stream_offsets[n + stream + 1] - entry.exponent_plane_len)
+                .map_err(|_| Error::corrupt("mantissa stream offset precedes the exponent plane"))?
+        } else {
+            mantissa_total
+        };
+        let bytes = mantissa_stored
+            .get(start..end)
+            .ok_or_else(|| Error::corrupt("float tile mantissa stream is outside the tile"))?;
+        let expected = interleaved_stream_len(mantissa_total_u64, stream as u64, n_streams);
+        if bytes.len() as u64 != expected {
+            return Err(Error::corrupt(format!(
+                "float tile {} mantissa stream {stream} is {} bytes but the interleave requires {expected}",
+                entry.index,
+                bytes.len()
+            )));
+        }
+        mantissa_parts.push(bytes);
+    }
+
+    let tile = if n == 1 {
+        // Byte-identical to mode 17: one Huffman exponent stream and the raw
+        // mantissa plane, with no deinterleave copy.
+        join_float_tensor_payload(
+            &exponent_plane,
+            mantissa_stored,
+            dtype,
+            exponent_elements,
+            limits,
+        )?
+    } else {
+        let mantissa_plane =
+            deinterleave_slices(&mantissa_parts, mantissa_total, "mantissa plane")?;
+        join_float_tensor_payload(
+            &exponent_plane,
+            &mantissa_plane,
+            dtype,
+            exponent_elements,
+            limits,
+        )?
+    };
+    let root = float_tile_streams_root(
+        dtype,
+        &entry.dims,
+        &tile,
+        entry.exponent_plane_len,
+        entry.mantissa_plane_len,
+        n_streams,
+        &entry.stream_offsets,
+        limits,
+    )?;
+    if root != entry.tile_root {
+        return Err(Error::corrupt(format!(
+            "float tile {} stream root {root} does not match the descriptor's {}",
+            entry.index, entry.tile_root
+        )));
+    }
+    Ok(tile)
+}
+
+fn float_tiled_streams_meta_value(meta: &FloatTiledStreamsMeta) -> Value {
+    let tiles: Vec<Value> = meta
+        .tiles
+        .iter()
+        .map(|entry| {
+            Value::map([
+                ("index", Value::U64(entry.index)),
+                (
+                    "dims",
+                    Value::Array(entry.dims.iter().map(|dim| Value::U64(*dim)).collect()),
+                ),
+                ("offset", Value::U64(entry.offset)),
+                ("compressed_len", Value::U64(entry.compressed_len)),
+                ("exponent_plane_len", Value::U64(entry.exponent_plane_len)),
+                ("mantissa_plane_len", Value::U64(entry.mantissa_plane_len)),
+                ("element_len", Value::U64(entry.element_len)),
+                (
+                    "stream_offsets",
+                    Value::Array(
+                        entry
+                            .stream_offsets
+                            .iter()
+                            .map(|offset| Value::U64(*offset))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "tile_root",
+                    Value::Bytes(entry.tile_root.as_bytes().to_vec()),
+                ),
+            ])
+        })
+        .collect();
+    Value::map([
+        ("schema", Value::Str(FLOAT_TILED_STREAMS_SCHEMA.to_owned())),
+        ("dtype", Value::Str(meta.dtype.as_str().to_owned())),
+        (
+            "shape",
+            Value::Array(meta.shape.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        ("element_count", Value::U64(meta.element_count)),
+        ("layout", Value::Str(FLOAT_TILED_LAYOUT.to_owned())),
+        (
+            "tile_shape",
+            Value::Array(meta.tile_shape.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        (
+            "tile_counts",
+            Value::Array(
+                meta.tile_counts
+                    .iter()
+                    .map(|dim| Value::U64(*dim))
+                    .collect(),
+            ),
+        ),
+        (
+            "exponent_coder",
+            Value::Str(FLOAT_TENSOR_EXPONENT_CODER.to_owned()),
+        ),
+        ("n_streams", Value::U64(meta.n_streams)),
+        ("tiles", Value::Array(tiles)),
+        ("payload_len", Value::U64(meta.payload_len)),
+        (
+            "logical_root",
+            Value::Bytes(meta.logical_root.as_bytes().to_vec()),
+        ),
+    ])
+}
+
+/// Encode a mode-18 `FLOAT_TILED_STREAMS` frame.
+///
+/// The tile grid, plane split, offsets and roots are exactly mode 17's
+/// discipline. Within one tile the exponent plane is split round-robin into
+/// `n_streams` independently coded `huffman-canonical-v1` streams, and the
+/// raw mantissa plane is split round-robin into `n_streams` raw streams.
+/// With `n_streams == 1` the stored tile bytes are byte-identical to mode 17.
+pub fn encode_float_tiled_streams(
+    payload: &[u8],
+    dtype: FloatDtype,
+    shape: &[u64],
+    tile_shape: &[u64],
+    n_streams: u64,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    if !(FLOAT_TILED_STREAMS_MIN..=FLOAT_TILED_STREAMS_MAX).contains(&n_streams) {
+        return Err(Error::malformed(format!(
+            "n_streams {n_streams} is outside {}..={}",
+            FLOAT_TILED_STREAMS_MIN, FLOAT_TILED_STREAMS_MAX
+        )));
+    }
+    check_len(
+        payload.len() as u64,
+        limits.max_decoded_bytes,
+        "float tiled payload",
+    )?;
+    let tensor_dtype = float_tiled_tensor_dtype(dtype).ok_or_else(|| {
+        Error::unsupported_feature(format!(
+            "float-tiled v1 requires a tensor identity layout; dtype `{}` has none",
+            dtype.as_str()
+        ))
+    })?;
+    let element_count = float_tensor_product(shape, limits)?;
+    let element_size = dtype.element_size();
+    let decoded_bytes = element_count
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::limit_exceeded("float tiled decoded bytes overflow u64"))?;
+    if decoded_bytes != payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "float tiled payload is {} bytes but shape {:?} x {} requires {decoded_bytes}",
+            payload.len(),
+            shape,
+            dtype.as_str()
+        )));
+    }
+    let counts = tile_counts(shape, tile_shape)?;
+    let tile_elements = tiled_product(tile_shape, limits, "float tile")?;
+    let tile_element_len = tile_elements
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::limit_exceeded("float tile byte length overflows u64"))?;
+    let tile_count = counts.iter().try_fold(1u64, |acc, count| {
+        acc.checked_mul(*count)
+            .ok_or_else(|| Error::limit_exceeded("float tile count overflows u64"))
+    })?;
+    if tile_count > limits.max_structured_items {
+        return Err(Error::limit_exceeded(format!(
+            "float tile count {tile_count} exceeds limit {}",
+            limits.max_structured_items
+        )));
+    }
+    let n =
+        usize::try_from(n_streams).map_err(|_| Error::malformed("n_streams does not fit usize"))?;
+    let tile_len_usize = usize::try_from(tile_element_len)
+        .map_err(|_| Error::limit_exceeded("float tile byte length does not fit usize"))?;
+    let mut stored = Vec::with_capacity(payload.len());
+    let mut tiles = Vec::with_capacity(usize::try_from(tile_count).unwrap_or(0));
+    for index in 0..tile_count {
+        let start = tile_start(&counts, index);
+        let mut start_bytes = start.clone();
+        for axis in 0..start_bytes.len() {
+            start_bytes[axis] = start_bytes[axis]
+                .checked_mul(tile_shape[axis])
+                .ok_or_else(|| Error::limit_exceeded("float tile start overflows u64"))?;
+        }
+        let mut tile = vec![0u8; tile_len_usize];
+        copy_box_bytes(
+            &mut tile,
+            payload,
+            shape,
+            &start_bytes,
+            tile_shape,
+            element_size,
+        )?;
+        let (exponent_plane, mantissa_plane) =
+            split_float_tensor_planes(&tile, dtype, tile_elements)?;
+
+        let mut tile_stored = Vec::with_capacity(tile.len());
+        let mut stream_offsets = Vec::with_capacity(2 * n);
+        let exponent_streams = interleave_plane(&exponent_plane, n);
+        for stream in &exponent_streams {
+            stream_offsets.push(tile_stored.len() as u64);
+            tile_stored.extend_from_slice(&huffman::encode(stream));
+        }
+        let exponent_plane_len = tile_stored.len() as u64;
+        let mantissa_streams = interleave_plane(&mantissa_plane, n);
+        for stream in &mantissa_streams {
+            stream_offsets.push(tile_stored.len() as u64);
+            tile_stored.extend_from_slice(stream);
+        }
+        let compressed_len = tile_stored.len() as u64;
+
+        let root = float_tile_streams_root(
+            dtype,
+            tile_shape,
+            &tile,
+            exponent_plane_len,
+            mantissa_plane.len() as u64,
+            n_streams,
+            &stream_offsets,
+            limits,
+        )?;
+        tiles.push(FloatTiledStreamsEntry {
+            index,
+            dims: tile_shape.to_vec(),
+            offset: stored.len() as u64,
+            compressed_len,
+            exponent_plane_len,
+            mantissa_plane_len: mantissa_plane.len() as u64,
+            element_len: tile_element_len,
+            stream_offsets,
+            tile_root: root,
+        });
+        stored.extend_from_slice(&tile_stored);
+    }
+
+    let logical_root = crate::tensor::logical_root(tensor_dtype, shape, payload, limits)?;
+    let meta = FloatTiledStreamsMeta {
+        dtype,
+        shape: shape.to_vec(),
+        element_count,
+        tile_shape: tile_shape.to_vec(),
+        tile_counts: counts,
+        n_streams,
+        tiles,
+        payload_len: stored.len() as u64,
+        logical_root,
+    };
+    let body = build_ai_body(&float_tiled_streams_meta_value(&meta), &stored, limits)?;
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::FloatTiledStreams,
+        flags: 0,
+        level: 0,
+        decoded_len: decoded_bytes,
+        content_hash: hash_domain(DOMAIN_CHUNK, payload),
+        dependencies: &[],
+        chunks: &[],
+        body: &body,
+    };
+    encode_frame(&parts, limits)
+}
+
+fn meta_u64_array_strict(map: &BTreeMap<String, Value>, key: &str, what: &str) -> Result<Vec<u64>> {
+    match map.get(key) {
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::U64(dim) => out.push(*dim),
+                    _ => {
+                        return Err(Error::malformed(format!(
+                            "{what} `{key}` elements must be u64"
+                        )))
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(Error::malformed(format!("{what} `{key}` must be an array"))),
+    }
+}
+
+/// Parse a mode-18 descriptor from its canonical WCB bytes.
+pub fn parse_float_tiled_streams_descriptor(
+    descriptor_bytes: &[u8],
+    decoded_len: u64,
+    payload_len: u64,
+    limits: &Limits,
+) -> Result<FloatTiledStreamsMeta> {
+    let value = wcb::decode(descriptor_bytes, limits)?;
+    let map = ai_map(&value, "float tiled streams")?;
+    check_exact_keys(
+        map,
+        &[
+            "schema",
+            "dtype",
+            "shape",
+            "element_count",
+            "layout",
+            "tile_shape",
+            "tile_counts",
+            "exponent_coder",
+            "n_streams",
+            "tiles",
+            "payload_len",
+            "logical_root",
+        ],
+        "float tiled streams",
+    )?;
+    let schema = meta_text(map, "schema")?;
+    if schema != FLOAT_TILED_STREAMS_SCHEMA {
+        return Err(Error::malformed(format!(
+            "unsupported float tiled streams schema `{schema}`"
+        )));
+    }
+    let dtype = FloatDtype::from_name(meta_text(map, "dtype")?)?;
+    let layout = meta_text(map, "layout")?;
+    if layout != FLOAT_TILED_LAYOUT {
+        return Err(Error::malformed(format!(
+            "float tiled streams layout `{layout}` is specified but not implemented in v1 (only {FLOAT_TILED_LAYOUT})"
+        )));
+    }
+    let coder = meta_text(map, "exponent_coder")?;
+    if coder != FLOAT_TENSOR_EXPONENT_CODER {
+        return Err(Error::malformed(format!(
+            "unsupported float tile exponent coder `{coder}` (v1 allows `{FLOAT_TENSOR_EXPONENT_CODER}`)"
+        )));
+    }
+    if float_tiled_tensor_dtype(dtype).is_none() {
+        return Err(Error::unsupported_feature(format!(
+            "float-tiled v1 requires a tensor identity layout; dtype `{}` has none",
+            dtype.as_str()
+        )));
+    }
+    let n_streams = meta_u64(map, "n_streams")?;
+    if !(FLOAT_TILED_STREAMS_MIN..=FLOAT_TILED_STREAMS_MAX).contains(&n_streams) {
+        return Err(Error::malformed(format!(
+            "n_streams {n_streams} is outside {}..={}",
+            FLOAT_TILED_STREAMS_MIN, FLOAT_TILED_STREAMS_MAX
+        )));
+    }
+    let n =
+        usize::try_from(n_streams).map_err(|_| Error::malformed("n_streams does not fit usize"))?;
+    let shape = meta_shape(map)?;
+    let element_count = float_tensor_product(&shape, limits)?;
+    let declared_count = meta_u64(map, "element_count")?;
+    if declared_count != element_count {
+        return Err(Error::malformed(format!(
+            "float tiled element_count {declared_count} does not match shape product {element_count}"
+        )));
+    }
+    let element_size = dtype.element_size();
+    let decoded_bytes = element_count
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::limit_exceeded("float tiled decoded bytes overflow u64"))?;
+    check_len(
+        decoded_bytes,
+        limits.max_decoded_bytes,
+        "float tiled decoded bytes",
+    )?;
+    if decoded_len != decoded_bytes {
+        return Err(Error::corrupt(format!(
+            "float tiled decoded_len is {decoded_len} but the descriptor requires {decoded_bytes}"
+        )));
+    }
+    let tile_shape = meta_u64_array(map, "tile_shape")?;
+    let counts = tile_counts(&shape, &tile_shape)?;
+    if meta_u64_array(map, "tile_counts")? != counts {
+        return Err(Error::malformed(format!(
+            "float tiled tile_counts {:?} do not match shape/tile_shape {:?}",
+            meta_u64_array(map, "tile_counts")?,
+            counts
+        )));
+    }
+    let tile_elements = tiled_product(&tile_shape, limits, "float tile")?;
+    let tile_element_len = tile_elements
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::limit_exceeded("float tile byte length overflows u64"))?;
+    let tile_count = counts.iter().try_fold(1u64, |acc, count| {
+        acc.checked_mul(*count)
+            .ok_or_else(|| Error::limit_exceeded("float tile count overflows u64"))
+    })?;
+    if tile_count > limits.max_structured_items {
+        return Err(Error::limit_exceeded(format!(
+            "float tile count {tile_count} exceeds limit {}",
+            limits.max_structured_items
+        )));
+    }
+    let expected_mantissa = tile_elements
+        .checked_mul(dtype.sign_bits() + dtype.mantissa_bits())
+        .ok_or_else(|| Error::limit_exceeded("float tile mantissa bits overflow u64"))?;
+    let expected_mantissa = expected_mantissa
+        .checked_add(7)
+        .ok_or_else(|| Error::limit_exceeded("float tile mantissa length overflows u64"))?
+        / 8;
+    let declared_payload_len = meta_u64(map, "payload_len")?;
+    if declared_payload_len != payload_len {
+        return Err(Error::malformed(format!(
+            "float tiled payload is {payload_len} bytes but metadata declares {declared_payload_len}"
+        )));
+    }
+    let entries = match map.get("tiles") {
+        Some(Value::Array(items)) => items,
+        _ => {
+            return Err(Error::malformed(
+                "float tiled streams `tiles` must be an array",
+            ))
+        }
+    };
+    if entries.len() as u64 != tile_count {
+        return Err(Error::malformed(format!(
+            "float tiled streams has {} tile entries but the grid requires {tile_count}",
+            entries.len()
+        )));
+    }
+    let mut tiles = Vec::with_capacity(entries.len());
+    let mut expected_offset: u64 = 0;
+    for (position, item) in entries.iter().enumerate() {
+        let entry = ai_map(item, "float tile streams tile")?;
+        check_exact_keys(
+            entry,
+            &[
+                "index",
+                "dims",
+                "offset",
+                "compressed_len",
+                "exponent_plane_len",
+                "mantissa_plane_len",
+                "element_len",
+                "stream_offsets",
+                "tile_root",
+            ],
+            "float tile streams tile",
+        )?;
+        let index = meta_u64(entry, "index")?;
+        if index != position as u64 {
+            return Err(Error::malformed(format!(
+                "float tiled streams entry {position} declares index {index}; entries must be in canonical order"
+            )));
+        }
+        let dims = meta_u64_array(entry, "dims")?;
+        if dims != tile_shape {
+            return Err(Error::malformed(format!(
+                "float tile {position} dims {:?} do not equal tile_shape {:?}; partial tiles are not defined in v1",
+                dims, tile_shape
+            )));
+        }
+        let declared_element_len = meta_u64(entry, "element_len")?;
+        if declared_element_len != tile_element_len {
+            return Err(Error::malformed(format!(
+                "float tile {position} element_len {declared_element_len} does not match {tile_element_len}"
+            )));
+        }
+        let offset = meta_u64(entry, "offset")?;
+        if offset != expected_offset {
+            return Err(Error::malformed(format!(
+                "float tile {position} offset {offset} is not the contiguous offset {expected_offset}"
+            )));
+        }
+        let compressed_len = meta_u64(entry, "compressed_len")?;
+        let exponent_plane_len = meta_u64(entry, "exponent_plane_len")?;
+        let mantissa_plane_len = meta_u64(entry, "mantissa_plane_len")?;
+        if mantissa_plane_len != expected_mantissa {
+            return Err(Error::malformed(format!(
+                "float tile {position} mantissa_plane_len {mantissa_plane_len} does not match {expected_mantissa}"
+            )));
+        }
+        if exponent_plane_len
+            != compressed_len
+                .checked_sub(mantissa_plane_len)
+                .ok_or_else(|| {
+                    Error::malformed("float tile length is shorter than its mantissa plane")
+                })?
+        {
+            return Err(Error::malformed(format!(
+                "float tile {position} exponent_plane_len {exponent_plane_len} does not equal compressed_len - mantissa_plane_len"
+            )));
+        }
+        if compressed_len
+            != exponent_plane_len
+                .checked_add(mantissa_plane_len)
+                .ok_or_else(|| Error::limit_exceeded("float tile length overflows u64"))?
+        {
+            return Err(Error::malformed(format!(
+                "float tile {position} compressed_len {compressed_len} does not equal its plane lengths"
+            )));
+        }
+        expected_offset = expected_offset
+            .checked_add(compressed_len)
+            .ok_or_else(|| Error::limit_exceeded("float tile offset overflows u64"))?;
+
+        let stream_offsets = meta_u64_array_strict(entry, "stream_offsets", "float tile")?;
+        if stream_offsets.len() != 2 * n {
+            return Err(Error::malformed(format!(
+                "float tile {position} has {} stream offsets but n_streams {n_streams} requires {}",
+                stream_offsets.len(),
+                2 * n_streams
+            )));
+        }
+        if stream_offsets[0] != 0 {
+            return Err(Error::malformed(format!(
+                "float tile {position} stream_offsets[0] is {} not 0",
+                stream_offsets[0]
+            )));
+        }
+        for window in stream_offsets.windows(2) {
+            if window[1] < window[0] {
+                return Err(Error::malformed(format!(
+                    "float tile {position} stream_offsets are not monotonic: {} then {}",
+                    window[0], window[1]
+                )));
+            }
+        }
+        if stream_offsets[2 * n - 1] > compressed_len {
+            return Err(Error::malformed(format!(
+                "float tile {position} stream offset {} is past the {compressed_len}-byte tile payload",
+                stream_offsets[2 * n - 1]
+            )));
+        }
+        if stream_offsets[n] != exponent_plane_len {
+            return Err(Error::malformed(format!(
+                "float tile {position} stream_offsets[{n}] is {} but exponent_plane_len is {exponent_plane_len}",
+                stream_offsets[n]
+            )));
+        }
+        for stream in 0..n {
+            let end = if stream + 1 < n {
+                stream_offsets[stream + 1]
+            } else {
+                exponent_plane_len
+            };
+            let len = end - stream_offsets[stream];
+            if len < huffman::TABLE_BYTES as u64 {
+                return Err(Error::malformed(format!(
+                    "float tile {position} exponent stream {stream} is {len} bytes, shorter than its {}-byte code-length table",
+                    huffman::TABLE_BYTES
+                )));
+            }
+        }
+        let mantissa_total = mantissa_plane_len;
+        for stream in 0..n {
+            let start = stream_offsets[n + stream] - exponent_plane_len;
+            let end = if stream + 1 < n {
+                stream_offsets[n + stream + 1] - exponent_plane_len
+            } else {
+                mantissa_total
+            };
+            if end < start {
+                return Err(Error::malformed(format!(
+                    "float tile {position} mantissa stream {stream} offsets are inverted"
+                )));
+            }
+            let expected = interleaved_stream_len(mantissa_total, stream as u64, n_streams);
+            if end - start != expected {
+                return Err(Error::malformed(format!(
+                    "float tile {position} mantissa stream {stream} is {} bytes but the interleave requires {expected}",
+                    end - start
+                )));
+            }
+        }
+
+        let tile_root = Hash32::from_slice(meta_bytes(entry, "tile_root")?)
+            .map_err(|_| Error::malformed("float tile_root must be 32 bytes"))?;
+        tiles.push(FloatTiledStreamsEntry {
+            index,
+            dims,
+            offset,
+            compressed_len,
+            exponent_plane_len,
+            mantissa_plane_len,
+            element_len: declared_element_len,
+            stream_offsets,
+            tile_root,
+        });
+    }
+    if expected_offset != declared_payload_len {
+        return Err(Error::malformed(format!(
+            "float tile ranges cover {expected_offset} bytes but payload_len is {declared_payload_len}"
+        )));
+    }
+    let logical_root = Hash32::from_slice(meta_bytes(map, "logical_root")?)
+        .map_err(|_| Error::malformed("float tiled logical_root must be 32 bytes"))?;
+    Ok(FloatTiledStreamsMeta {
+        dtype,
+        shape,
+        element_count,
+        tile_shape,
+        tile_counts: counts,
+        n_streams,
+        tiles,
+        payload_len: declared_payload_len,
+        logical_root,
+    })
+}
+
+/// Parse a mode-18 frame and return its descriptor with the stored slice.
+pub fn parse_float_tiled_streams<'a>(
+    frame: &'a Frame<'_>,
+    limits: &Limits,
+) -> Result<FloatTiledStreamsDescriptor<'a>> {
+    let (descriptor_bytes, payload) = split_ai_body_prefix(frame.body)?;
+    let meta = parse_float_tiled_streams_descriptor(
+        descriptor_bytes,
+        frame.header.decoded_len,
+        payload.len() as u64,
+        limits,
+    )?;
+    Ok(FloatTiledStreamsDescriptor { meta, payload })
+}
+
+/// Parse a mode-18 frame and return only its descriptor.
+pub fn float_tiled_streams_metadata(
+    frame: &Frame<'_>,
+    limits: &Limits,
+) -> Result<FloatTiledStreamsMeta> {
+    Ok(parse_float_tiled_streams(frame, limits)?.meta)
+}
+
+/// Validate and decode a mode-18 frame into exact row-major element bytes.
+///
+/// `threads > 1` decodes tiles on a bounded thread pool; each tile's exponent
+/// streams use the wide-word multi-stream kernel. A single-tile region read can
+/// instead use [`read_float_tiled_streams_region`], which runs the tile's
+/// streams in parallel.
+pub fn decode_float_tiled_streams(
+    frame: &Frame<'_>,
+    limits: &Limits,
+    threads: usize,
+) -> Result<Vec<u8>> {
+    let descriptor = parse_float_tiled_streams(frame, limits)?;
+    let meta = &descriptor.meta;
+    let total = usize::try_from(
+        meta.element_count
+            .checked_mul(meta.dtype.element_size())
+            .ok_or_else(|| Error::limit_exceeded("float tiled decoded bytes overflow u64"))?,
+    )
+    .map_err(|_| Error::limit_exceeded("float tiled decoded bytes do not fit usize"))?;
+    let mut out = vec![0u8; total];
+    let compat = float_tiled_compat_meta(meta);
+    let decode_tile = |entry: &FloatTiledStreamsEntry| -> Result<Vec<u8>> {
+        let start = usize::try_from(entry.offset)
+            .map_err(|_| Error::limit_exceeded("float tile offset does not fit usize"))?;
+        let end = start
+            .checked_add(
+                usize::try_from(entry.compressed_len)
+                    .map_err(|_| Error::limit_exceeded("float tile length does not fit usize"))?,
+            )
+            .ok_or_else(|| Error::limit_exceeded("float tile range overflows usize"))?;
+        let stored = descriptor
+            .payload
+            .get(start..end)
+            .ok_or_else(|| Error::corrupt("float tile range is outside the payload"))?;
+        decode_float_tile_streams(meta.dtype, entry, meta.n_streams, stored, limits, 1)
+    };
+    let mut tiles: Vec<Vec<u8>> = Vec::with_capacity(meta.tiles.len());
+    if threads > 1 && meta.tiles.len() > 1 {
+        let workers = threads.min(meta.tiles.len()).min(64).max(1);
+        let chunk = meta.tiles.len().div_ceil(workers);
+        let mut chunk_results: Vec<Result<Vec<Vec<u8>>>> = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for start in (0..meta.tiles.len()).step_by(chunk) {
+                let end = (start + chunk).min(meta.tiles.len());
+                let entries = &meta.tiles[start..end];
+                let decode_tile = &decode_tile;
+                handles.push(scope.spawn(move || {
+                    let mut decoded = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        decoded.push(decode_tile(entry)?);
+                    }
+                    Ok(decoded)
+                }));
+            }
+            for handle in handles {
+                chunk_results.push(
+                    handle.join().unwrap_or_else(|_| {
+                        Err(Error::corrupt("multi-stream tile worker panicked"))
+                    }),
+                );
+            }
+        });
+        for result in chunk_results {
+            tiles.extend(result?);
+        }
+    } else {
+        for entry in &meta.tiles {
+            tiles.push(decode_tile(entry)?);
+        }
+    }
+    let mut tiles_bytes = 0usize;
+    for (position, tile) in tiles.iter().enumerate() {
+        tiles_bytes = tiles_bytes
+            .checked_add(tile.len())
+            .ok_or_else(|| Error::limit_exceeded("float tiled decoded length overflows usize"))?;
+        place_float_tile(&mut out, &compat, &compat.tiles[position], tile)?;
+    }
+    if tiles_bytes != total {
+        return Err(Error::corrupt(format!(
+            "float tiled decoded to {tiles_bytes} bytes but the descriptor requires {total}"
+        )));
+    }
+    let tensor_dtype = float_tiled_tensor_dtype(meta.dtype)
+        .ok_or_else(|| Error::unsupported_feature("float tiled dtype has no tensor identity"))?;
+    let logical = crate::tensor::logical_root(tensor_dtype, &meta.shape, &out, limits)?;
+    if logical != meta.logical_root {
+        return Err(Error::corrupt(format!(
+            "float tiled logical root {logical} does not match the descriptor's {}",
+            meta.logical_root
+        )));
+    }
+    Ok(out)
+}
+
+/// A mode-17-shaped view for the shared placement helpers.
+fn float_tiled_compat_meta(meta: &FloatTiledStreamsMeta) -> FloatTiledMeta {
+    FloatTiledMeta {
+        dtype: meta.dtype,
+        shape: meta.shape.clone(),
+        element_count: meta.element_count,
+        tile_shape: meta.tile_shape.clone(),
+        tile_counts: meta.tile_counts.clone(),
+        tiles: meta
+            .tiles
+            .iter()
+            .map(|entry| FloatTiledEntry {
+                index: entry.index,
+                dims: entry.dims.clone(),
+                offset: entry.offset,
+                compressed_len: entry.compressed_len,
+                exponent_plane_len: entry.exponent_plane_len,
+                mantissa_plane_len: entry.mantissa_plane_len,
+                element_len: entry.element_len,
+                tile_root: entry.tile_root,
+            })
+            .collect(),
+        payload_len: meta.payload_len,
+        logical_root: meta.logical_root,
+    }
+}
+
+/// Indices of the tiles whose cells intersect `region`.
+pub fn float_tiled_streams_region_indices(
+    meta: &FloatTiledStreamsMeta,
+    region: &crate::tensor::Region,
+) -> Result<Vec<usize>> {
+    let compat = float_tiled_compat_meta(meta);
+    float_tiled_region_indices(&compat, region)
+}
+
+/// Read one logical region, decoding only the multi-stream tiles it
+/// intersects. Returns `(bytes, tiles_touched, streams_touched)`.
+///
+/// Every touched tile fetches all `2 * n_streams` of its streams, so
+/// `streams_touched == tiles_touched * 2 * n_streams`.
+pub fn read_float_tiled_streams_region(
+    descriptor: &FloatTiledStreamsDescriptor<'_>,
+    region: &crate::tensor::Region,
+    limits: &Limits,
+    threads: usize,
+) -> Result<(Vec<u8>, u64, u64)> {
+    let meta = &descriptor.meta;
+    region.validate(&meta.shape)?;
+    let extent = region.extent();
+    if region.is_empty() {
+        return Ok((Vec::new(), 0, 0));
+    }
+    let count = extent.iter().try_fold(1u64, |acc, dim| {
+        acc.checked_mul(*dim)
+            .ok_or_else(|| Error::limit_exceeded("region element count overflows u64"))
+    })?;
+    let byte_len = count
+        .checked_mul(meta.dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("region payload length overflows u64"))?;
+    check_len(byte_len, limits.max_decoded_bytes, "region payload")?;
+    let byte_len = usize::try_from(byte_len)
+        .map_err(|_| Error::limit_exceeded("region payload does not fit usize"))?;
+    let mut out = vec![0u8; byte_len];
+    let indices = float_tiled_streams_region_indices(meta, region)?;
+    let compat = float_tiled_compat_meta(meta);
+    let mut tiles_touched = 0u64;
+    for index in indices {
+        let entry = &meta.tiles[index];
+        let start = usize::try_from(entry.offset)
+            .map_err(|_| Error::limit_exceeded("float tile offset does not fit usize"))?;
+        let end = start
+            .checked_add(
+                usize::try_from(entry.compressed_len)
+                    .map_err(|_| Error::limit_exceeded("float tile length does not fit usize"))?,
+            )
+            .ok_or_else(|| Error::limit_exceeded("float tile range overflows usize"))?;
+        let stored = descriptor
+            .payload
+            .get(start..end)
+            .ok_or_else(|| Error::corrupt("float tile range is outside the payload"))?;
+        let tile =
+            decode_float_tile_streams(meta.dtype, entry, meta.n_streams, stored, limits, threads)?;
+        place_float_tile_region(&mut out, region, &compat, &compat.tiles[index], &tile)?;
+        tiles_touched += 1;
+    }
+    let streams_touched = tiles_touched
+        .checked_mul(2)
+        .and_then(|value| value.checked_mul(meta.n_streams))
+        .ok_or_else(|| Error::limit_exceeded("streams_touched overflows u64"))?;
+    Ok((out, tiles_touched, streams_touched))
+}
+
+/// Place one decoded mode-18 tile at its canonical grid position.
+pub fn place_float_tiled_streams_tile(
+    dst: &mut [u8],
+    meta: &FloatTiledStreamsMeta,
+    entry: &FloatTiledStreamsEntry,
+    tile: &[u8],
+) -> Result<()> {
+    let compat = float_tiled_compat_meta(meta);
+    place_float_tile(dst, &compat, &compat.tiles[entry.index as usize], tile)
+}
+
+/// Place the intersection of `region` and a decoded mode-18 tile into `out`.
+pub fn place_float_tiled_streams_tile_region(
+    out: &mut [u8],
+    region: &crate::tensor::Region,
+    meta: &FloatTiledStreamsMeta,
+    entry: &FloatTiledStreamsEntry,
+    tile: &[u8],
+) -> Result<()> {
+    let compat = float_tiled_compat_meta(meta);
+    place_float_tile_region(
+        out,
+        region,
+        &compat,
+        &compat.tiles[entry.index as usize],
+        tile,
+    )
 }

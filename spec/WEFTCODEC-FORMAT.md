@@ -151,7 +151,8 @@ A reader MUST reject:
 | 15 | `TENSOR_TILED` | body is `u32le(meta_len) || WCB(meta) || tile payload`; WEFT-AI-CODEC §16 |
 | 16 | `SPARSE_DELTA` | body is `u32le(meta_len) || WCB(meta) || u32le(run_count) || zero-run records`; one dependency; WEFT-AI-CODEC §17 |
 | 17 | `FLOAT_TILED` | body is `u32le(meta_len) || WCB(meta) || tile payload`; WEFT-AI-CODEC §18 |
-| 17..127 | — | reserved; `UnsupportedMode` |
+| 18 | `FLOAT_TILED_STREAMS` | body is `u32le(meta_len) || WCB(meta) || per-tile interleaved stream payload`; WEFT-AI-CODEC §19 |
+| 19..127 | — | reserved; `UnsupportedMode` |
 | 128..255 | — | experimental; MUST be rejected for persistence |
 
 Global mode rules:
@@ -430,11 +431,12 @@ compressed or descriptor bytes.
 - Allocating a previously reserved mode value is an additive extension that
   old readers must reject as `UnsupportedMode` (fail closed). `TENSOR` (6),
   `TOKEN_SEQUENCE` (7), `QUANTIZED_TENSOR` (8), `FLOAT_TENSOR` (9),
-  `TENSOR_TILED` (15), and `SPARSE_DELTA` (16) were allocated this way;
+  `TENSOR_TILED` (15), `SPARSE_DELTA` (16), `FLOAT_TILED` (17), and
+  `FLOAT_TILED_STREAMS` (18) were allocated this way;
   `WEFT-AI-CODEC.md` is normative for their bodies. Historical vector
   `017_unknown_mode` asserted that value 6 was unknown; it is retained
   byte-for-byte and marked `superseded_by` the current reserved-value vector
-  `017_unknown_mode_reserved17`.
+  `017_unknown_mode_reserved19`.
 - Unknown critical flags/features/modes fail closed.
 - Frozen v1 vectors are append-only; they are never regenerated to hide a
   change.

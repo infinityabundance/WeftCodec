@@ -202,6 +202,238 @@ unsafe fn unpack_avx2(
     }
 }
 
+/// One stream's packed primary table for the multi-stream kernel.
+pub struct StreamTable<'a> {
+    pub table: &'a [u16],
+    pub primary_bits: u32,
+}
+
+/// Decode several independently coded streams with a wide-word kernel.
+///
+/// Returns `None` whenever the fast path cannot prove every stream to its
+/// exact end (a long code, a tail shorter than the primary table, a
+/// single-symbol table, trailing bytes, or non-zero padding). The caller then
+/// falls back to the canonical [`crate::huffman::decode`] per stream, so the
+/// fast path can never change an error class or a decoded byte.
+///
+/// The AVX2 build walks four streams in lockstep with 32-bit accumulators and
+/// one `_mm256_i32gather_epi32` per four symbols. The scalar build uses the
+/// existing byte-refill kernel per stream.
+pub fn unpack_multi(
+    tables: &[StreamTable<'_>],
+    streams: &[&[u8]],
+    expected: &[usize],
+) -> Option<Vec<Vec<u8>>> {
+    if tables.len() != streams.len() || tables.len() != expected.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(streams.len());
+    let mut index = 0usize;
+    if avx2_available() {
+        while index + 4 <= streams.len() {
+            // SAFETY: `avx2_available()` proved AVX2 is present.
+            let group = unsafe {
+                unpack_multi_group4_avx2(
+                    [
+                        &tables[index],
+                        &tables[index + 1],
+                        &tables[index + 2],
+                        &tables[index + 3],
+                    ],
+                    [
+                        streams[index],
+                        streams[index + 1],
+                        streams[index + 2],
+                        streams[index + 3],
+                    ],
+                    [
+                        expected[index],
+                        expected[index + 1],
+                        expected[index + 2],
+                        expected[index + 3],
+                    ],
+                )
+            };
+            let group = group?;
+            out.extend(group);
+            index += 4;
+        }
+    }
+    while index < streams.len() {
+        out.push(unpack_multi_one(
+            &tables[index],
+            streams[index],
+            expected[index],
+        )?);
+        index += 1;
+    }
+    Some(out)
+}
+
+/// Strict single-stream primary-table decode used for the remainder of a
+/// multi-stream group and as the scalar fallback.
+fn unpack_multi_one(
+    table: &StreamTable<'_>,
+    stream: &[u8],
+    expected_len: usize,
+) -> Option<Vec<u8>> {
+    if table.primary_bits == 0 || table.primary_bits > 16 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(expected_len.min(1 << 20));
+    let mut state = UnpackState::default();
+    unpack_scalar(
+        table.table,
+        table.primary_bits,
+        stream,
+        expected_len,
+        &mut out,
+        &mut state,
+    );
+    if out.len() != expected_len || !stream_consumed_exactly(stream, &state) {
+        return None;
+    }
+    Some(out)
+}
+
+/// True when `state` consumed the whole stream and the padding is zero.
+fn stream_consumed_exactly(stream: &[u8], state: &UnpackState) -> bool {
+    let consumed_bytes = state.bits_consumed.div_ceil(8);
+    if consumed_bytes != stream.len() {
+        return false;
+    }
+    let used_bits_in_last = state.bits_consumed % 8;
+    if used_bits_in_last == 0 {
+        return true;
+    }
+    let last = stream[consumed_bytes - 1];
+    let mask = (1u8 << (8 - used_bits_in_last)) - 1;
+    last & mask == 0
+}
+
+/// AVX2 4-stream lockstep primary-table walk.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_multi_group4_avx2(
+    tables: [&StreamTable<'_>; 4],
+    streams: [&[u8]; 4],
+    expected: [usize; 4],
+) -> Option<[Vec<u8>; 4]> {
+    use std::arch::x86_64::{
+        __m256i, _mm256_i32gather_epi32, _mm256_setr_epi32, _mm256_storeu_si256,
+    };
+
+    // One concatenated i32 table so a single gather base covers all four
+    // streams; each lane's index is biased by its own table offset.
+    let mut combined: Vec<i32> = Vec::new();
+    let mut offsets = [0i32; 4];
+    let mut bits = [0u32; 4];
+    for lane in 0..4 {
+        bits[lane] = tables[lane].primary_bits;
+        if bits[lane] == 0 || bits[lane] > 12 {
+            return None;
+        }
+        offsets[lane] = i32::try_from(combined.len()).ok()?;
+        combined.extend(tables[lane].table.iter().map(|&entry| i32::from(entry)));
+    }
+
+    let mut acc = [0u32; 4];
+    let mut acc_bits = [0u32; 4];
+    let mut next_byte = [0usize; 4];
+    let mut bits_consumed = [0usize; 4];
+    let mut done = [false; 4];
+    let mut out: [Vec<u8>; 4] = [
+        Vec::with_capacity(expected[0].min(1 << 20)),
+        Vec::with_capacity(expected[1].min(1 << 20)),
+        Vec::with_capacity(expected[2].min(1 << 20)),
+        Vec::with_capacity(expected[3].min(1 << 20)),
+    ];
+    for lane in 0..4 {
+        if expected[lane] == 0 {
+            return None;
+        }
+        refill32(
+            &mut acc[lane],
+            &mut acc_bits[lane],
+            &mut next_byte[lane],
+            streams[lane],
+        );
+    }
+
+    let base = combined.as_ptr();
+    loop {
+        if done.iter().all(|flag| *flag) {
+            break;
+        }
+        let mut index = [0i32; 4];
+        for lane in 0..4 {
+            if done[lane] {
+                index[lane] = offsets[lane];
+                continue;
+            }
+            if acc_bits[lane] < bits[lane] {
+                return None;
+            }
+            let shift = 32 - bits[lane];
+            let mask = (1u32 << bits[lane]) - 1;
+            index[lane] = offsets[lane] + ((acc[lane] >> shift) & mask) as i32;
+        }
+        let index_vec = _mm256_setr_epi32(index[0], index[1], index[2], index[3], 0, 0, 0, 0);
+        let gathered: __m256i = _mm256_i32gather_epi32::<4>(base, index_vec);
+        let mut entries = [0i32; 8];
+        _mm256_storeu_si256(entries.as_mut_ptr() as *mut __m256i, gathered);
+        for lane in 0..4 {
+            if done[lane] {
+                continue;
+            }
+            let entry = entries[lane] as u32;
+            let length = entry >> 8;
+            if length == 0 || length > acc_bits[lane] {
+                return None;
+            }
+            out[lane].push((entry & 0xff) as u8);
+            acc[lane] <<= length;
+            acc_bits[lane] -= length;
+            bits_consumed[lane] += length as usize;
+            if out[lane].len() == expected[lane] {
+                done[lane] = true;
+            }
+        }
+        for lane in 0..4 {
+            if !done[lane] {
+                refill32(
+                    &mut acc[lane],
+                    &mut acc_bits[lane],
+                    &mut next_byte[lane],
+                    streams[lane],
+                );
+            }
+        }
+    }
+    for lane in 0..4 {
+        let state = UnpackState {
+            acc: u64::from(acc[lane]),
+            acc_bits: acc_bits[lane],
+            next_byte: next_byte[lane],
+            bits_consumed: bits_consumed[lane],
+        };
+        if !stream_consumed_exactly(streams[lane], &state) {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// Refill a 32-bit MSB accumulator one byte at a time while eight bits fit.
+#[inline]
+fn refill32(acc: &mut u32, acc_bits: &mut u32, next_byte: &mut usize, stream: &[u8]) {
+    while *acc_bits <= 24 && *next_byte < stream.len() {
+        *acc |= u32::from(stream[*next_byte]) << (24 - *acc_bits);
+        *next_byte += 1;
+        *acc_bits += 8;
+    }
+}
+
 /// Join BF16 planes (`exponent_plane.len() == mantissa_plane.len() == out/2`).
 ///
 /// The **selected** kernel is the byte-wise scalar form. LLVM auto-vectorises

@@ -563,6 +563,113 @@ fn decode_prefix_impl(
     Ok((out, TABLE_BYTES + consumed_stream))
 }
 
+/// Decode several independent `huffman-canonical-v1` streams.
+///
+/// This is the multi-stream entry point used by mode 18. It first tries the
+/// wide-word kernel in [`crate::simd::unpack_multi`], which only succeeds when
+/// every stream is fully proved by the primary table and consumes exactly its
+/// whole byte range with zero padding. Otherwise it decodes each stream with
+/// [`decode`], in index order, so the decoded bytes and the error class are
+/// identical to N independent calls.
+pub fn decode_streams(encoded: &[&[u8]], expected: &[usize]) -> Result<Vec<Vec<u8>>> {
+    if encoded.len() != expected.len() {
+        return Err(Error::malformed(
+            "multi-stream decode length tables disagree",
+        ));
+    }
+    if encoded.len() > 1 {
+        if let Some(out) = decode_streams_fast(encoded, expected) {
+            return Ok(out);
+        }
+    }
+    decode_streams_scalar(encoded, expected)
+}
+
+/// Force the per-stream canonical decoder (the scalar fallback).
+#[doc(hidden)]
+pub fn decode_streams_scalar(encoded: &[&[u8]], expected: &[usize]) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::with_capacity(encoded.len());
+    for (bytes, len) in encoded.iter().zip(expected) {
+        out.push(decode(bytes, *len)?);
+    }
+    Ok(out)
+}
+
+/// Try the primary-table fast path for all streams at once.
+///
+/// Returns `None` on anything the frozen canonical decoder must decide.
+fn decode_streams_fast(encoded: &[&[u8]], expected: &[usize]) -> Option<Vec<Vec<u8>>> {
+    let mut owned: Vec<(Vec<u16>, u32)> = Vec::with_capacity(encoded.len());
+    for bytes in encoded {
+        if bytes.len() < TABLE_BYTES {
+            return None;
+        }
+        let lengths = &bytes[..TABLE_BYTES];
+        let mut counts = [0u32; MAX_CODE_BITS + 1];
+        let mut used = 0usize;
+        let mut max_len = 0usize;
+        for (symbol, &length) in lengths.iter().enumerate() {
+            let length = length as usize;
+            if length > MAX_CODE_BITS {
+                let _ = symbol;
+                return None;
+            }
+            if length > 0 {
+                used += 1;
+                counts[length] += 1;
+                max_len = max_len.max(length);
+            }
+        }
+        if used < 2 {
+            return None;
+        }
+        let space = 1u64 << MAX_CODE_BITS;
+        let mut used_space = 0u64;
+        for length in 1..=MAX_CODE_BITS {
+            used_space += u64::from(counts[length]) << (MAX_CODE_BITS - length);
+            if used_space > space {
+                return None;
+            }
+        }
+        if used_space != space {
+            return None;
+        }
+        let primary_bits = max_len.min(PRIMARY_BITS_MAX);
+        let mut table = vec![0u16; 1usize << primary_bits];
+        let mut order: Vec<(u8, u8)> = (0..256)
+            .filter(|&symbol| lengths[symbol] > 0)
+            .map(|symbol| (lengths[symbol], symbol as u8))
+            .collect();
+        order.sort_unstable();
+        let mut code = 0u32;
+        let mut previous = 0u8;
+        for (length, symbol) in order {
+            code <<= u32::from(length - previous);
+            let slot = length as usize;
+            if slot <= primary_bits {
+                let shift = primary_bits - slot;
+                let start = (code as usize) << shift;
+                let width = 1usize << shift;
+                let packed = u16::from(symbol) | (u16::from(length) << 8);
+                for entry in &mut table[start..start + width] {
+                    *entry = packed;
+                }
+            }
+            code += 1;
+            previous = length;
+        }
+        owned.push((table, primary_bits as u32));
+    }
+    let tables: Vec<crate::simd::StreamTable<'_>> = owned
+        .iter()
+        .map(|(table, primary_bits)| crate::simd::StreamTable {
+            table,
+            primary_bits: *primary_bits,
+        })
+        .collect();
+    crate::simd::unpack_multi(&tables, encoded, expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,5 +1298,52 @@ mod tests {
             offset += fast_consumed;
         }
         assert_eq!(offset, packed.len());
+    }
+
+    /// 10,000 randomised multi-stream sets: the wide-word multi-stream kernel
+    /// must agree with N independent canonical decodes, in bytes and in error
+    /// class.
+    #[test]
+    fn multi_stream_kernel_matches_independent_decoders() {
+        let mut state = 0x18_18_18_18_dead_beefu64;
+        for case in 0..10_000usize {
+            let n = 2 + random_below(&mut state, 7); // 2..=8
+            let mut planes: Vec<Vec<u8>> = Vec::with_capacity(n);
+            let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(n);
+            for stream in 0..n {
+                let len = random_below(&mut state, 600);
+                let plane = match (case + stream) % 3 {
+                    0 => skewed_plane(&mut state, 4 + stream, len),
+                    1 => skewed_plane(&mut state, 32, len),
+                    _ => skewed_plane(&mut state, 200, len),
+                };
+                encoded.push(encode(&plane));
+                planes.push(plane);
+            }
+            let expected: Vec<usize> = planes.iter().map(Vec::len).collect();
+            let refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+            let fast = decode_streams(&refs, &expected).expect("multi-stream");
+            let slow = decode_streams_scalar(&refs, &expected).expect("scalar");
+            assert_eq!(fast, slow, "case {case}");
+            assert_eq!(fast, planes, "case {case}");
+
+            // Corrupt one stream in three of the cases: both paths must
+            // return the same error class.
+            if case % 3 == 0 {
+                let victim = random_below(&mut state, n);
+                let mut mutated = encoded.clone();
+                if mutated[victim].len() > TABLE_BYTES + 1 {
+                    mutated[victim].pop();
+                } else {
+                    mutated[victim].push(0xff);
+                }
+                let refs: Vec<&[u8]> = mutated.iter().map(Vec::as_slice).collect();
+                let fast = decode_streams(&refs, &expected).err().map(|e| e.class());
+                let slow = decode_streams_scalar(&refs, &expected)
+                    .err()
+                    .map(|e| e.class());
+                assert_eq!(fast, slow, "corrupt case {case}");
+            }
+        }
     }
 }

@@ -56,6 +56,8 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let capability_dir = dir.join("capability");
     let tensor_tiled_dir = dir.join("tensor-tiled");
     let sparse_delta_dir = dir.join("sparse-delta");
+    let float_tiled_dir = dir.join("float-tiled");
+    let float_tiled_streams_dir = dir.join("float-tiled-streams");
     for sub in [
         &codec_dir,
         &structured_dir,
@@ -72,6 +74,8 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
         &capability_dir,
         &tensor_tiled_dir,
         &sparse_delta_dir,
+        &float_tiled_dir,
+        &float_tiled_streams_dir,
     ] {
         fs::create_dir_all(sub)
             .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
@@ -92,6 +96,8 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_capability_vectors(&capability_dir, limits)?;
     write_tiled_vectors(&tensor_tiled_dir, limits)?;
     write_sparse_delta_vectors(&sparse_delta_dir, limits)?;
+    write_float_tiled_vectors(&float_tiled_dir, limits)?;
+    write_float_tiled_streams_vectors(&float_tiled_streams_dir, limits)?;
     Ok(())
 }
 
@@ -706,9 +712,24 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     let mut unknown_mode = good.clone();
     unknown_mode[7] = 18;
     refix_header_and_trailer(&mut unknown_mode);
-    push_error(
+    push_error_superseded(
         &mut vectors,
         "017_unknown_mode_reserved18",
+        "raw",
+        &unknown_mode,
+        &[],
+        ErrorClass::UnsupportedMode,
+        None,
+        "017_unknown_mode_reserved19",
+        "Historical: this vector asserted that mode value 18 was reserved. WEFT-AI-CODEC allocates 18 to FLOAT_TILED_STREAMS, so the authoritative unknown-mode vector is 017_unknown_mode_reserved19. The frozen bytes and original expectation are retained unchanged.",
+    );
+
+    let mut unknown_mode = good.clone();
+    unknown_mode[7] = 19;
+    refix_header_and_trailer(&mut unknown_mode);
+    push_error(
+        &mut vectors,
+        "017_unknown_mode_reserved19",
         "raw",
         &unknown_mode,
         &[],
@@ -6058,5 +6079,505 @@ fn write_tiled_vectors(dir: &Path, limits: &Limits) -> Result<()> {
         ErrorClass::Corrupt,
         &frame,
     )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FLOAT_TILED_STREAMS (mode 18, WEFT-AI-CODEC §19)
+// ---------------------------------------------------------------------------
+
+/// Generate only the mode-18 multi-stream float-tiled vectors into
+/// `<dir>/float-tiled-streams`.
+pub fn generate_float_tiled_streams_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let tiled_dir = dir.join("float-tiled-streams");
+    fs::create_dir_all(&tiled_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", tiled_dir.display())))?;
+    write_float_tiled_streams_vectors(&tiled_dir, limits)
+}
+
+fn float_tiled_streams_rebuild(
+    meta: &Value,
+    stored: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let body = ai_body(meta, stored, limits)?;
+    build_frame(
+        Mode::FloatTiledStreams,
+        DOMAIN_PAYLOAD,
+        0,
+        decoded_len,
+        content_hash,
+        &[],
+        &body,
+        limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_float_tiled_streams_valid(
+    dir: &Path,
+    name: &str,
+    dtype: modes::FloatDtype,
+    shape: &[u64],
+    tile_shape: &[u64],
+    n_streams: u64,
+    plaintext: &[u8],
+    region: Option<(&[u64], &[u64])>,
+    limits: &Limits,
+) -> Result<()> {
+    let frame =
+        modes::encode_float_tiled_streams(plaintext, dtype, shape, tile_shape, n_streams, limits)?;
+    let parsed = Frame::parse(&frame, limits)?;
+    let descriptor = modes::parse_float_tiled_streams(&parsed, limits)?;
+    let decoded = modes::decode_float_tiled_streams(&parsed, limits, 1)?;
+    if decoded != plaintext {
+        return Err(Error::corrupt(format!(
+            "{name}: float-tiled-streams round trip is not exact"
+        )));
+    }
+    // Every declared stream count must also decode through the thread pool.
+    if descriptor.meta.n_streams > 1 {
+        let threaded = modes::decode_float_tiled_streams(&parsed, limits, 4)?;
+        if threaded != plaintext {
+            return Err(Error::corrupt(format!(
+                "{name}: thread-pool round trip is not exact"
+            )));
+        }
+    }
+    let mut value = json!({
+        "name": name,
+        "mode": "float_tiled_streams",
+        "mode_value": 18,
+        "dtype": dtype.as_str(),
+        "shape": shape,
+        "tile_shape": tile_shape,
+        "tile_counts": descriptor.meta.tile_counts,
+        "tile_count": descriptor.meta.tiles.len(),
+        "n_streams": descriptor.meta.n_streams,
+        "logical_root": descriptor.meta.logical_root.to_hex(),
+        "payload_len": descriptor.meta.payload_len,
+        "decoded_len": plaintext.len(),
+        "content_hash": parsed.header.content_hash.to_hex(),
+        "plaintext_hex": hexs(plaintext),
+        "frame_hex": hexs(&frame),
+        "tiles": descriptor.meta.tiles.iter().map(|entry| json!({
+            "index": entry.index,
+            "offset": entry.offset,
+            "compressed_len": entry.compressed_len,
+            "exponent_plane_len": entry.exponent_plane_len,
+            "mantissa_plane_len": entry.mantissa_plane_len,
+            "element_len": entry.element_len,
+            "stream_offsets": entry.stream_offsets,
+            "tile_root": entry.tile_root.to_hex(),
+        })).collect::<Vec<_>>(),
+        "expect": { "ok": true },
+    });
+    if let Some((start, end)) = region {
+        let region = tensor::Region::new(start.to_vec(), end.to_vec());
+        let (bytes, tiles_touched, streams_touched) =
+            modes::read_float_tiled_streams_region(&descriptor, &region, limits, 1)?;
+        value["region"] = json!({
+            "start": start,
+            "end": end,
+            "bytes_hex": hexs(&bytes),
+            "tiles_touched": tiles_touched,
+            "streams_touched": streams_touched,
+        });
+    }
+    write_json(&dir.join(format!("{name}.json")), &value)
+}
+
+fn write_float_tiled_streams_reject(
+    dir: &Path,
+    name: &str,
+    class: ErrorClass,
+    frame: &[u8],
+) -> Result<()> {
+    // The generator refuses to commit a vector whose real class differs.
+    let resolver = crate::dependency::MapResolver::new();
+    let outcome = modes::decode_bytes(frame, &resolver, &Limits::default());
+    match outcome {
+        Ok(_) => {
+            return Err(Error::corrupt(format!(
+                "{name}: reject vector decoded successfully"
+            )))
+        }
+        Err(err) if err.class() == class => {}
+        Err(err) => {
+            return Err(Error::corrupt(format!(
+                "{name}: expected {class:?}, got {:?}: {err}",
+                err.class()
+            )))
+        }
+    }
+    let parsed = Frame::parse(frame, &Limits::default())?;
+    let value = json!({
+        "name": name,
+        "mode": "float_tiled_streams",
+        "mode_value": 18,
+        "frame_hex": hexs(frame),
+        "decoded_len": parsed.header.decoded_len,
+        "content_hash": parsed.header.content_hash.to_hex(),
+        "dependencies": [],
+        "expect": { "error": class.as_str() },
+    });
+    write_json(&dir.join(format!("{name}.json")), &value)
+}
+
+fn streams_tile_mut(
+    meta: &BTreeMap<String, Value>,
+    position: usize,
+) -> Result<BTreeMap<String, Value>> {
+    let tiles = match meta.get("tiles") {
+        Some(Value::Array(items)) => items,
+        _ => return Err(Error::malformed("streams descriptor has no tiles array")),
+    };
+    let entry = tiles
+        .get(position)
+        .ok_or_else(|| Error::malformed("streams descriptor is missing a tile entry"))?;
+    match entry {
+        Value::Map(map) => Ok(map.clone()),
+        _ => Err(Error::malformed("streams tile entry is not a WCB map")),
+    }
+}
+
+fn set_streams_tile(
+    meta: &mut BTreeMap<String, Value>,
+    position: usize,
+    tile: BTreeMap<String, Value>,
+) -> Result<()> {
+    let tiles = match meta.get_mut("tiles") {
+        Some(Value::Array(items)) => items,
+        _ => return Err(Error::malformed("streams descriptor has no tiles array")),
+    };
+    if position >= tiles.len() {
+        return Err(Error::malformed("streams tile position out of range"));
+    }
+    tiles[position] = Value::Map(tile);
+    Ok(())
+}
+
+fn streams_u64(map: &BTreeMap<String, Value>, key: &str) -> Result<u64> {
+    match map.get(key) {
+        Some(Value::U64(value)) => Ok(*value),
+        _ => Err(Error::malformed(format!(
+            "streams metadata `{key}` must be u64"
+        ))),
+    }
+}
+
+fn streams_u64_array(map: &BTreeMap<String, Value>, key: &str) -> Result<Vec<u64>> {
+    match map.get(key) {
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::U64(value) => out.push(*value),
+                    _ => {
+                        return Err(Error::malformed(format!(
+                            "streams metadata `{key}` elements must be u64"
+                        )))
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(Error::malformed(format!(
+            "streams metadata `{key}` must be an array"
+        ))),
+    }
+}
+
+fn write_float_tiled_streams_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    let bf16_bytes = tiled_pattern(16 * 2, 0x51);
+    write_float_tiled_streams_valid(
+        dir,
+        "001_streams_bf16_4x4_n1",
+        modes::FloatDtype::Bf16,
+        &[4, 4],
+        &[2, 2],
+        1,
+        &bf16_bytes,
+        Some((&[0, 0], &[3, 3])),
+        limits,
+    )?;
+    let fp32_bytes = tiled_pattern(8 * 4, 0x77);
+    write_float_tiled_streams_valid(
+        dir,
+        "002_streams_fp32_2x2x2_n2",
+        modes::FloatDtype::F32,
+        &[2, 2, 2],
+        &[1, 2, 2],
+        2,
+        &fp32_bytes,
+        Some((&[0, 0, 0], &[2, 1, 2])),
+        limits,
+    )?;
+    // A tile larger than one Huffman table so the four streams carry real data.
+    let mut wide = tiled_pattern(16 * 16 * 2, 0x2b);
+    for (index, byte) in wide.iter_mut().enumerate() {
+        // Bias the exponent distribution so the streams are skewed like real
+        // weights and the interleave is exercised across several symbols.
+        if index % 2 == 1 {
+            *byte &= 0x7f;
+        }
+    }
+    write_float_tiled_streams_valid(
+        dir,
+        "003_streams_bf16_16x16_n4",
+        modes::FloatDtype::Bf16,
+        &[16, 16],
+        &[8, 8],
+        4,
+        &wide,
+        Some((&[0, 0], &[9, 5])),
+        limits,
+    )?;
+    // More streams than the smallest plane has bytes: empty streams are
+    // legitimate, each exponent stream still carries its 256-byte table.
+    let f16_bytes = tiled_pattern(6 * 2, 0x33);
+    write_float_tiled_streams_valid(
+        dir,
+        "004_streams_f16_2x3_n16",
+        modes::FloatDtype::F16,
+        &[2, 3],
+        &[2, 3],
+        16,
+        &f16_bytes,
+        None,
+        limits,
+    )?;
+
+    let base = modes::encode_float_tiled_streams(
+        &wide,
+        modes::FloatDtype::Bf16,
+        &[16, 16],
+        &[8, 8],
+        4,
+        limits,
+    )?;
+    let (meta_value, stored, decoded_len, content_hash) = tiled_body_parts(&base, limits)?;
+
+    // 101: n_streams below the bound.
+    let mut map = tiled_meta_map(&meta_value)?;
+    map.insert("n_streams".to_owned(), Value::U64(0));
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(dir, "101_n_streams_zero", ErrorClass::Malformed, &frame)?;
+
+    // 102: n_streams above the bound.
+    let mut map = tiled_meta_map(&meta_value)?;
+    map.insert("n_streams".to_owned(), Value::U64(17));
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(
+        dir,
+        "102_n_streams_above_bound",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 103: non-monotonic offset table.
+    let mut map = tiled_meta_map(&meta_value)?;
+    let mut tile = streams_tile_mut(&map, 0)?;
+    let mut offsets = streams_u64_array(&tile, "stream_offsets")?;
+    offsets.swap(0, 1);
+    tile.insert(
+        "stream_offsets".to_owned(),
+        Value::Array(offsets.into_iter().map(Value::U64).collect()),
+    );
+    set_streams_tile(&mut map, 0, tile)?;
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(
+        dir,
+        "103_stream_offsets_not_monotonic",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 104: an offset past the tile payload.
+    let mut map = tiled_meta_map(&meta_value)?;
+    let mut tile = streams_tile_mut(&map, 0)?;
+    let mut offsets = streams_u64_array(&tile, "stream_offsets")?;
+    let last = offsets.len() - 1;
+    offsets[last] = streams_u64(&tile, "compressed_len")? + 1;
+    tile.insert(
+        "stream_offsets".to_owned(),
+        Value::Array(offsets.into_iter().map(Value::U64).collect()),
+    );
+    set_streams_tile(&mut map, 0, tile)?;
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(
+        dir,
+        "104_stream_offset_past_payload",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 105: the exponent/mantissa boundary is not exponent_plane_len.
+    let mut map = tiled_meta_map(&meta_value)?;
+    let mut tile = streams_tile_mut(&map, 0)?;
+    let mut offsets = streams_u64_array(&tile, "stream_offsets")?;
+    let n = streams_u64(&map, "n_streams")? as usize;
+    offsets[n] += 1;
+    tile.insert(
+        "stream_offsets".to_owned(),
+        Value::Array(offsets.into_iter().map(Value::U64).collect()),
+    );
+    set_streams_tile(&mut map, 0, tile)?;
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(
+        dir,
+        "105_plane_boundary_mismatch",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 106: an exponent stream shorter than its 256-byte code-length table.
+    let mut map = tiled_meta_map(&meta_value)?;
+    let mut tile = streams_tile_mut(&map, 0)?;
+    let mut offsets = streams_u64_array(&tile, "stream_offsets")?;
+    offsets[1] = offsets[0];
+    tile.insert(
+        "stream_offsets".to_owned(),
+        Value::Array(offsets.into_iter().map(Value::U64).collect()),
+    );
+    set_streams_tile(&mut map, 0, tile)?;
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(
+        dir,
+        "106_exponent_stream_shorter_than_table",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 107: a tile root that does not cover the stored tile.
+    let mut map = tiled_meta_map(&meta_value)?;
+    let mut tile = streams_tile_mut(&map, 0)?;
+    tile.insert("tile_root".to_owned(), Value::Bytes(vec![0u8; 32]));
+    set_streams_tile(&mut map, 0, tile)?;
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(dir, "107_tile_root_mismatch", ErrorClass::Corrupt, &frame)?;
+
+    // 108: delete one byte from the end of exponent stream 0 of tile 0. All
+    // later boundaries, the tile's plane lengths, the later tiles' offsets and
+    // the payload length shift by one, so the frame is structurally consistent
+    // and the first stream is genuinely truncated.
+    let mut map = tiled_meta_map(&meta_value)?;
+    let mut tile = streams_tile_mut(&map, 0)?;
+    let mut offsets = streams_u64_array(&tile, "stream_offsets")?;
+    let tile_offset = streams_u64(&tile, "offset")?;
+    let drop: u64 = 8;
+    if offsets[1] < crate::huffman::TABLE_BYTES as u64 + drop {
+        return Err(Error::corrupt(
+            "108 vector needs an exponent stream larger than its table",
+        ));
+    }
+    let mut stored_truncated = stored.clone();
+    let remove_start = (tile_offset + offsets[1] - drop) as usize;
+    stored_truncated.drain(remove_start..remove_start + drop as usize);
+    offsets[1] -= drop;
+    for offset in offsets.iter_mut().skip(2) {
+        *offset -= drop;
+    }
+    let exponent_plane_len = streams_u64(&tile, "exponent_plane_len")? - drop;
+    let compressed_len = streams_u64(&tile, "compressed_len")? - drop;
+    tile.insert(
+        "exponent_plane_len".to_owned(),
+        Value::U64(exponent_plane_len),
+    );
+    tile.insert("compressed_len".to_owned(), Value::U64(compressed_len));
+    tile.insert(
+        "stream_offsets".to_owned(),
+        Value::Array(offsets.into_iter().map(Value::U64).collect()),
+    );
+    set_streams_tile(&mut map, 0, tile)?;
+    let tile_count = match map.get("tiles") {
+        Some(Value::Array(items)) => items.len(),
+        _ => 0,
+    };
+    for position in 1..tile_count {
+        let mut later = streams_tile_mut(&map, position)?;
+        let offset = streams_u64(&later, "offset")?;
+        later.insert("offset".to_owned(), Value::U64(offset - drop));
+        set_streams_tile(&mut map, position, later)?;
+    }
+    let payload_len = streams_u64(&map, "payload_len")? - drop;
+    map.insert("payload_len".to_owned(), Value::U64(payload_len));
+    let frame = float_tiled_streams_rebuild(
+        &Value::Map(map),
+        &stored_truncated,
+        decoded_len,
+        content_hash,
+        limits,
+    )?;
+    write_float_tiled_streams_reject(dir, "108_truncated_stream", ErrorClass::Corrupt, &frame)?;
+
+    // 109: a stream whose interleave boundary makes it decode to the wrong
+    // length (one byte moved from stream 0 to stream 1).
+    let mut map = tiled_meta_map(&meta_value)?;
+    let mut tile = streams_tile_mut(&map, 0)?;
+    let mut offsets = streams_u64_array(&tile, "stream_offsets")?;
+    offsets[1] -= 1;
+    tile.insert(
+        "stream_offsets".to_owned(),
+        Value::Array(offsets.into_iter().map(Value::U64).collect()),
+    );
+    set_streams_tile(&mut map, 0, tile)?;
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(
+        dir,
+        "109_stream_decoded_length_disagrees",
+        ErrorClass::Corrupt,
+        &frame,
+    )?;
+
+    // 110: a declared n_streams that disagrees with the offset table.
+    let mut map = tiled_meta_map(&meta_value)?;
+    map.insert("n_streams".to_owned(), Value::U64(2));
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(
+        dir,
+        "110_stream_count_without_retable",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 111: unknown exponent coder.
+    let mut map = tiled_meta_map(&meta_value)?;
+    map.insert(
+        "exponent_coder".to_owned(),
+        Value::Str("zstd-native-v1".to_owned()),
+    );
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(
+        dir,
+        "111_unknown_exponent_coder",
+        ErrorClass::Malformed,
+        &frame,
+    )?;
+
+    // 112: a logical root that does not match the assembled tensor.
+    let mut map = tiled_meta_map(&meta_value)?;
+    map.insert("logical_root".to_owned(), Value::Bytes(vec![0u8; 32]));
+    let frame =
+        float_tiled_streams_rebuild(&Value::Map(map), &stored, decoded_len, content_hash, limits)?;
+    write_float_tiled_streams_reject(
+        dir,
+        "112_logical_root_mismatch",
+        ErrorClass::Corrupt,
+        &frame,
+    )?;
+
     Ok(())
 }

@@ -257,6 +257,27 @@ representations of the same logical tensor. A region read decodes only the
 intersecting tiles; a full decode recomputes the logical root from the
 assembled bytes.
 
+### 5.3 Multi-stream float tiles (mode 18, WEFT-AI-CODEC §19)
+
+Mode 18 uses the same grid and tile identity discipline as mode 17, but within
+one tile the exponent plane is split round-robin into `n_streams` independently
+coded `huffman-canonical-v1` streams and the raw sign+mantissa plane is split
+round-robin into `n_streams` raw streams. `1 <= n_streams <= 16`. The tile
+entry carries a fixed-width u64 `stream_offsets` table of `2 * n_streams`
+entries and its identity is
+
+```
+tile_root = H("weft/tensor/float_tile_streams/v1",
+              WCB({dtype, dims, element_len,
+                   exponent_plane_len, mantissa_plane_len,
+                   n_streams, stream_offsets, values_hash}))
+```
+
+so the stream count and offset table are part of the root. With
+`n_streams = 1` the stored tile bytes are identical to mode 17's. The
+whole-tensor `LogicalTensorRoot` is again unchanged by the physical
+arrangement.
+
 ## 6. Shard container
 
 A stored shard is a self-describing container:
