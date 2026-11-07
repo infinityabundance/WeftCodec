@@ -234,6 +234,29 @@ The whole-tensor `LogicalTensorRoot` is unchanged by tiling.
 This is a physical arrangement, not a new logical identity: the tiled and
 untiled bytes of the same tensor have the same `LogicalTensorRoot`.
 
+### 5.2 Float tiles (mode 17, WEFT-AI-CODEC §18)
+
+Mode 17 uses the same tile grid, ordering, full-tile rule, and
+`tiles_touched` region addressing as mode 15, but each tile is an exact
+mode-9 float plane split: a `huffman-canonical-v1` exponent plane plus a raw
+sign+mantissa plane. It is defined for `bf16`, `fp16`, and `fp32` (the float
+dtypes with a tensor identity layout).
+
+Each tile's identity is
+
+```
+tile_root = H("weft/tensor/float_tile/v1",
+              WCB({dtype, dims, element_len,
+                   exponent_plane_len, mantissa_plane_len, values_hash}))
+```
+
+with `values_hash = H("weft/tensor/values/v1", decoded tile bytes)`. The
+tile's decoded bytes are its canonical row-major element bytes, so the
+whole-tensor `LogicalTensorRoot` is identical to the mode-9 and mode-15
+representations of the same logical tensor. A region read decodes only the
+intersecting tiles; a full decode recomputes the logical root from the
+assembled bytes.
+
 ## 6. Shard container
 
 A stored shard is a self-describing container:

@@ -150,6 +150,7 @@ A reader MUST reject:
 | 14 | `SEMANTIC_DELTA` | body is `u32le(meta_len) || WCB(meta) || huffman-canonical-v1 planes`; one dependency; WEFT-AI-CODEC §15 |
 | 15 | `TENSOR_TILED` | body is `u32le(meta_len) || WCB(meta) || tile payload`; WEFT-AI-CODEC §16 |
 | 16 | `SPARSE_DELTA` | body is `u32le(meta_len) || WCB(meta) || u32le(run_count) || zero-run records`; one dependency; WEFT-AI-CODEC §17 |
+| 17 | `FLOAT_TILED` | body is `u32le(meta_len) || WCB(meta) || tile payload`; WEFT-AI-CODEC §18 |
 | 17..127 | — | reserved; `UnsupportedMode` |
 | 128..255 | — | experimental; MUST be rejected for persistence |
 
@@ -167,7 +168,7 @@ Global mode rules:
   body decodes with the dependency bytes as a raw content dictionary.
 - `STRUCTURED`: `domain == 1`, `mode == 5`, `body_len == decoded_len`; body is
   canonical WCB; `dep_count` MUST be `0` in v1; `chunk_count` MUST be `0`.
-- AI modes 6–16: `domain == 0`, `chunk_count == 0`, `flags.DICT_RAW` clear,
+- AI modes 6–17: `domain == 0`, `chunk_count == 0`, `flags.DICT_RAW` clear,
   `body_len >= 4`. The frame's `decoded_len` is the reconstructed payload
   length and `content_hash` is `H("weft/chunk/v1", reconstructed payload)`.
   Modes 6, 7, 8, 9, 10, 12, 13, and 15 have `dep_count == 0`; modes 11, 14, and

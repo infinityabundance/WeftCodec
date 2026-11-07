@@ -1781,3 +1781,130 @@ Rejects: `101_unknown_op`, `102_unknown_sparse_codec`,
 
 The cross-language gate asserts byte-identical mode-16 frames and
 decode-equivalence in both directions.
+
+## 18. Mode 17 — `FLOAT_TILED` (implemented)
+
+Mode 17 is the independently decodable form of the mode-9 `FLOAT_TENSOR` split.
+Every tile is an exact stand-alone mode-9 frame body: a
+`huffman-canonical-v1` exponent plane plus a raw sign+mantissa plane, computed
+**per tile**. A whole decode verifies every tile root and the logical root; a
+region read decodes only intersecting tiles and reports `tiles_touched`.
+
+The tile grid, canonical row-major tile order, contiguous offsets, full-tiles-
+only rule, and no-silent-padding rule are identical to mode 15 (§16). The
+difference is the tile payload and the per-tile identity.
+
+### 18.1 Frame shape
+
+```
+domain        = 0 (payload)
+mode          = 17
+flags         = 0
+dep_count     = 0
+chunk_count   = 0
+decoded_len   = product(shape) * element_size
+content_hash  = H("weft/chunk/v1", canonical row-major element bytes)
+body          = u32le(meta_len) || WCB(meta) || stored_payload
+```
+
+The stored payload is `sum(tile.compressed_len)` bytes. Mode 17 is defined for
+`bf16`, `fp16`, and `fp32` (the float dtypes with a `WEFT-TENSOR` identity
+layout). `fp8-e4m3` and `fp8-e5m2` are `UnsupportedFeature` in v1.
+
+### 18.2 Descriptor
+
+Schema `weft.ai.float_tiled.v1`. Exactly these keys:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `schema` | text | `"weft.ai.float_tiled.v1"` |
+| `dtype` | text | `bf16`, `fp16`, or `fp32` |
+| `shape` | array of u64 | full logical extent, rank >= 1 |
+| `element_count` | u64 | `product(shape)` |
+| `layout` | text | `"row_major"` (the only v1 layout) |
+| `tile_shape` | array of u64 | divides every extent exactly |
+| `tile_counts` | array of u64 | `shape[i] / tile_shape[i]` |
+| `exponent_coder` | text | `"huffman-canonical-v1"` |
+| `tiles` | array | exactly `product(tile_counts)` entries |
+| `payload_len` | u64 | stored payload bytes |
+| `logical_root` | bytes32 | `WEFT-TENSOR` logical root of the whole tensor |
+
+Each tile entry has exactly: `index`, `dims`, `offset`, `compressed_len`,
+`exponent_plane_len`, `mantissa_plane_len`, `element_len`, `tile_root`.
+
+### 18.3 Tile payload
+
+For tile `t`, `stored[t] = huffman(exponent_plane) || mantissa_plane` where:
+
+* `exponent_plane` is the mode-9 exponent byte of every element of tile `t`;
+* `mantissa_plane` is the mode-9 pack of `(sign, mantissa)` per element;
+* `exponent_plane_len` is the Huffman stream length (>= 256, the table);
+* `mantissa_plane_len = ceil(tile_elements * (sign_bits + mantissa_bits) / 8)`;
+* `compressed_len = exponent_plane_len + mantissa_plane_len`.
+
+Decoding one tile is exactly `join_float_tensor_payload` on the two planes,
+including the exponent-width and zero-padding checks of §5.
+
+### 18.4 Tile identity
+
+```
+tile_root = H("weft/tensor/float_tile/v1",
+              WCB({dtype, dims, element_len,
+                   exponent_plane_len, mantissa_plane_len,
+                   values_hash}))
+values_hash = H("weft/tensor/values/v1", decoded tile bytes)
+```
+
+`element_len = product(dims) * element_size`. A full decode recomputes
+`logical_root = LogicalTensorRoot(dtype, shape, assembled_bytes)`; a region
+read verifies only the roots of the tiles it decodes (the whole-tensor trailer
+and content hash are not read).
+
+### 18.5 Validation order (normative for error classes)
+
+1. Descriptor WCB decode and exact key sets — `Malformed`.
+2. `schema`, `layout`, `exponent_coder`, dtype support — `Malformed` /
+   `UnsupportedFeature`.
+3. Shape product, `element_count`, `decoded_len` — `Malformed` / `Corrupt`.
+4. `tile_shape` divisibility, `tile_counts`, tile count — `Malformed` /
+   `LimitExceeded`.
+5. `payload_len` equality; entry count; canonical `index`; `dims ==
+   tile_shape`; `element_len`; contiguous `offset`; `exponent_plane_len >= 256`;
+   `mantissa_plane_len`; `compressed_len` arithmetic; tile range sum —
+   `Malformed`.
+6. Per-tile Huffman decode, exponent width, mantissa padding — `Corrupt`.
+7. Per-tile `tile_root` — `Corrupt`.
+8. `tiles_bytes == decoded_len` and `logical_root` — `Corrupt`.
+
+### 18.6 Limits
+
+`max_tensor_elements`, `max_tensor_rank`, `max_decoded_bytes`,
+`max_structured_items` (tile count), and the Huffman stream limits apply. No
+new limit was added.
+
+### 18.7 API and CLI
+
+Library: `encode_float_tiled`, `parse_float_tiled`,
+`parse_float_tiled_descriptor`, `decode_float_tiled`, `decode_float_tile`,
+`float_tiled_metadata`, `float_tile_root`, `read_float_region`,
+`read_float_region_with`, `float_tiled_region_indices`, `place_float_tile`,
+`place_float_tile_region`. CLI: `weftcodec encode --mode float-tiled --dtype
+bf16 --shape 4,4 --tile-shape 2,2`; decoding is the generic `decode`. Go has
+the same surface; `ReadFloatRegion` returns `(bytes, tilesTouched)`.
+
+### 18.8 Conformance vectors
+
+`conformance/v1/float-tiled/` (byte-identical in both codec repositories):
+
+* `001_float_tiled_bf16_4x4` — 2x2 tiles (`tile_shape` `[2,2]`).
+* `002_float_tiled_fp32_2x2x2` — rank 3, `tile_shape` `[1,2,2]`.
+* `003_float_tiled_f16_single_tile` — one full-tile `[2,3]`.
+
+Rejects: `101_non_dividing_tile_shape`, `102_tile_rank_mismatch`,
+`103_tile_root_mismatch`, `104_truncated_payload`,
+`105_out_of_range_tile_index`, `106_unknown_exponent_coder`,
+`107_zero_dimension`, `108_logical_root_mismatch`.
+
+The cross-language gate asserts `YES byte-identical float_tiled_bf16` and
+`float_tiled_fp32`, decode equivalence in both directions, and that the
+reserved-mode reject moved to 18 (`017_unknown_mode_reserved17` is superseded).
