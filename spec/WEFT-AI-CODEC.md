@@ -1,5 +1,38 @@
 # WEFT-AI-CODEC v1.2.0 — AI-native codec modes
 
+## 0. Mode index
+
+Every AI-native payload mode, in one place. `version` is the schema version
+carried in the descriptor; `status` is `normative` (implemented in both codecs
+and backed by committed vectors), `experimental` (implemented behind an opt-in
+and not yet frozen), or `reserved` (a wire value with no definition; decoders
+reject it). Every frame also carries `content_hash = H("weft/chunk/v1", payload)`
+and `decoded_len`; the domains below are the additional, mode-specific roots.
+
+| Mode | Name (CLI) | Schema id | Mode-specific root domains | Version | Status | Conformance vectors |
+|---:|---|---|---|---|---|---|
+| 6 | `TENSOR` (`tensor`) | `weft.tensor.v1` | `weft/tensor/payload/v1` | v1 | normative | `conformance/v1/codec/100–102` + rejects |
+| 7 | `TOKEN_SEQUENCE` (`tokens`) | `weft.tokens.v1` | `weft/tokens/payload/v1` | v1 | normative | `conformance/v1/codec/103–104` + rejects |
+| 8 | `QUANTIZED_TENSOR` (`quantized`) | `weft.quantized-tensor.v1` | `weft/quantized-tensor/payload/v1` | v1 | normative | `conformance/v1/codec/105–107` + rejects |
+| 9 | `FLOAT_TENSOR` (`float-tensor`) | `weft.ai.float_tensor.v1` | `weft/float-tensor/payload/v1` | v1 | normative | `conformance/v1/codec/108–110` + rejects |
+| 10 | `TENSOR_SHARDED` (`tensor-sharded`) | `weft.ai.tensor_sharded.v1` | `weft/tensor-sharded/payload/v1` | v1 | normative | `conformance/v1/sharded/001–003` + rejects |
+| 11 | `WEIGHT_DELTA` (`weight-delta`) | `weft.ai.weight_delta.v1` | `weft/tensor/values/v1` (`delta_root`) | v1 | normative | `conformance/v1/weight-delta/001–003` + rejects |
+| 12 | `KV_CACHE` (`kv-cache`) | `weft.ai.kv_cache.v1` | none beyond `weft/chunk/v1` (per-plane `huffman-canonical-v1`) | v1 | normative | `conformance/v1/kv-cache/001–003` + rejects |
+| 13 | `ACTIVATION_STREAM` (`activation-stream`) | `weft.ai.activation_stream.v1` | `weft/tensor/values/v1` (`digest_root`), `weft/ai/stream/v1` (stream root) | v1 | normative | `conformance/v1/activation-stream/001–003` + rejects |
+| 14 | `SEMANTIC_DELTA` (`semantic-delta`) | `weft.ai.semantic_delta.v1` | `weft/tensor/values/v1` (`delta_root`); base roots `weft/tensor/semantic/v1`, `weft/tensor/semantic-values/v1` | v1 | normative | `conformance/v1/semantic-delta/001–003`, `conformance/v1/semantic-root/` + rejects |
+| 15 | `TENSOR_TILED` (`tensor-tiled`) | `weft.ai.tensor_tiled.v1` | `weft/tensor/tile/v1` (`tile_root`), `weft/tensor/values/v1` (`values_hash`), `weft/tensor/logical/v1` | v1 | normative | `conformance/v1/tensor-tiled/001–003` + rejects |
+| 16 | `SPARSE_DELTA` (`sparse-delta`) | `weft.ai.sparse_delta.v1` | `weft/tensor/values/v1` (`delta_root`) | v1 | normative | `conformance/v1/sparse-delta/001–004` + rejects |
+| 17 | `FLOAT_TILED` (`float-tiled`) | `weft.ai.float_tiled.v1` | `weft/tensor/float_tile/v1` (`tile_root`), `weft/tensor/values/v1` | v1 | normative | `conformance/v1/float-tiled/001–003` + rejects |
+| 18 | — | — | — | — | **reserved** | `conformance/v1/codec/017_unknown_mode_reserved18.json` (reject only) |
+
+Modes 0–5 (RAW, ZSTD, REFERENCE, DELTA, DICTIONARY, STRUCTURED) are defined in
+`WEFTCODEC-FORMAT.md`; this document covers 6–17 and the reserved 18. A value
+above 18 is `UnsupportedMode` by the frame parser. Vector paths in the last
+column are relative to the program home; the authoritative list, with sizes and
+digests, is `conformance/manifest.json`, and `scripts/check-conformance-coverage.sh`
+enforces that every mode 0–17 has valid **and** reject vectors.
+
+
 **Status: PARTIALLY IMPLEMENTED.** Exactly eleven AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 
