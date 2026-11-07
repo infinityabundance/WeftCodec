@@ -248,14 +248,6 @@ pub fn decode(encoded: &[u8], expected_len: usize) -> Result<Vec<u8>> {
 /// with one table probe; longer codes fall back to the exact canonical loop.
 const PRIMARY_BITS_MAX: usize = 12;
 
-/// One primary lookup-table entry. `length == 0` marks a code longer than
-/// `primary_bits` (a sentinel) and is never consumed by the fast path.
-#[derive(Clone, Copy, Default)]
-struct FastEntry {
-    symbol: u8,
-    length: u8,
-}
-
 /// MSB-aligned 64-bit bit reader over the encoded stream.
 ///
 /// Bits live in the high end of `acc`: the next unread bit is bit 63. Bytes are
@@ -354,6 +346,24 @@ fn decode_one_canonical(
 /// byte planes). The padding bits of the last consumed byte must be zero; any
 /// bytes after the consumed prefix belong to the caller, not to this stream.
 pub fn decode_prefix(encoded: &[u8], expected_len: usize) -> Result<(Vec<u8>, usize)> {
+    decode_prefix_impl(encoded, expected_len, false)
+}
+
+/// Force the scalar bit-unpack kernel.
+///
+/// This exists so the differential test can compare the runtime-dispatched
+/// kernel with the scalar one on the same input. It is not part of the public
+/// API contract and never changes the wire format or the decoded bytes.
+#[doc(hidden)]
+pub fn decode_prefix_scalar(encoded: &[u8], expected_len: usize) -> Result<(Vec<u8>, usize)> {
+    decode_prefix_impl(encoded, expected_len, true)
+}
+
+fn decode_prefix_impl(
+    encoded: &[u8],
+    expected_len: usize,
+    force_scalar: bool,
+) -> Result<(Vec<u8>, usize)> {
     if encoded.len() < TABLE_BYTES {
         return Err(Error::corrupt(format!(
             "huffman-canonical-v1 stream is {} bytes, shorter than its {TABLE_BYTES}-byte code-length table",
@@ -435,10 +445,14 @@ pub fn decode_prefix(encoded: &[u8], expected_len: usize) -> Result<(Vec<u8>, us
 
     // Canonical decode arrays: for each length, the first code and the index
     // of its first symbol in the `(length, symbol)`-sorted symbol list. The
-    // same pass fills the primary lookup table: every code no longer than
-    // `primary_bits` expands into its whole primary-prefix range.
+    // same pass fills the packed primary lookup table: every code no longer
+    // than `primary_bits` expands into its whole primary-prefix range.
+    //
+    // Each entry is `symbol | length << 8`; zero is the sentinel for a code
+    // longer than the table and is never consumed. The packed form is what the
+    // SIMD kernel reads, so there is exactly one table layout.
     let primary_bits = max_len.min(PRIMARY_BITS_MAX);
-    let mut table = vec![FastEntry::default(); 1usize << primary_bits];
+    let mut table = vec![0u16; 1usize << primary_bits];
     let mut order: Vec<(u8, u8)> = (0..256)
         .filter(|&symbol| lengths[symbol] > 0)
         .map(|symbol| (lengths[symbol], symbol as u8))
@@ -463,8 +477,9 @@ pub fn decode_prefix(encoded: &[u8], expected_len: usize) -> Result<(Vec<u8>, us
             let shift = primary_bits - slot;
             let start = (code as usize) << shift;
             let width = 1usize << shift;
+            let packed = u16::from(symbol) | (u16::from(length) << 8);
             for entry in &mut table[start..start + width] {
-                *entry = FastEntry { symbol, length };
+                *entry = packed;
             }
         }
         code += 1;
@@ -481,57 +496,56 @@ pub fn decode_prefix(encoded: &[u8], expected_len: usize) -> Result<(Vec<u8>, us
 
     let capacity = expected_len.min(1 << 20);
     let mut out = Vec::with_capacity(capacity);
-    let stream_len = stream.len();
-    let primary_shift = 64 - primary_bits;
     let primary_bits_u32 = primary_bits as u32;
-    let mut acc = 0u64;
-    let mut acc_bits = 0u32;
-    let mut next_byte = 0usize;
-    let mut bits_consumed = 0usize;
-    while out.len() < expected_len {
-        // Fast path: a single probe when enough real bits are buffered and the
-        // code is no longer than the table width.
-        if acc_bits < primary_bits_u32 {
-            while acc_bits <= 56 && next_byte < stream_len {
-                acc |= u64::from(stream[next_byte]) << (56 - acc_bits);
-                next_byte += 1;
-                acc_bits += 8;
-            }
+    let mut state = crate::simd::UnpackState::default();
+    loop {
+        // Fast path: the runtime-dispatched kernel decodes every symbol the
+        // primary table can prove, then returns. AVX2 is selected when the CPU
+        // exposes it; the scalar kernel is byte-refill, single probe.
+        if force_scalar {
+            crate::simd::unpack_scalar_forced(
+                &table,
+                primary_bits_u32,
+                stream,
+                expected_len,
+                &mut out,
+                &mut state,
+            );
+        } else {
+            crate::simd::unpack(
+                &table,
+                primary_bits_u32,
+                stream,
+                expected_len,
+                &mut out,
+                &mut state,
+            );
         }
-        if acc_bits >= primary_bits_u32 {
-            // The shifted value is exactly `primary_bits` wide, so it is always
-            // a valid table index.
-            let entry = table[(acc >> primary_shift) as usize];
-            if entry.length != 0 {
-                out.push(entry.symbol);
-                let consumed = u32::from(entry.length);
-                acc <<= consumed;
-                acc_bits -= consumed;
-                bits_consumed += usize::from(entry.length);
-                continue;
-            }
+        if out.len() >= expected_len {
+            break;
         }
 
         // Rare exact path: codes longer than the table covers and stream tails
         // with fewer than `primary_bits` buffered bits.
         let mut reader = BitReader {
             stream,
-            next_byte,
-            acc,
-            acc_bits,
+            next_byte: state.next_byte,
+            acc: state.acc,
+            acc_bits: state.acc_bits,
         };
         let symbol = decode_one_canonical(
             &tables,
             &mut reader,
-            &mut bits_consumed,
+            &mut state.bits_consumed,
             out.len(),
             expected_len,
         )?;
-        next_byte = reader.next_byte;
-        acc = reader.acc;
-        acc_bits = reader.acc_bits;
+        state.next_byte = reader.next_byte;
+        state.acc = reader.acc;
+        state.acc_bits = reader.acc_bits;
         out.push(symbol);
     }
+    let bits_consumed = state.bits_consumed;
 
     // Padding is checked only inside the bytes this stream consumed; any
     // further bytes belong to the caller (the next plane).

@@ -1556,6 +1556,18 @@ pub fn join_float_tensor_payload(
     // The output is exactly the declared decoded byte count, which was bounded
     // by `max_decoded_bytes` above, so the allocation is bounded as well.
     let mut out = vec![0u8; capacity];
+
+    // BF16 is the one width where the sign+mantissa plane is exactly one byte
+    // per element, so the join is a pure byte interleave and has a
+    // runtime-dispatched AVX2 kernel. Other dtypes keep the exact word loop
+    // below (their sign+mantissa widths are not byte-aligned).
+    let joined_by_kernel = if dtype == FloatDtype::Bf16 {
+        crate::simd::join_bf16(exponent_plane, mantissa_plane, &mut out);
+        true
+    } else {
+        false
+    };
+
     let mantissa_mask = (1u64 << mantissa_bits) - 1;
     let width = sign_bits + mantissa_bits;
     let width_bits = width as u32;
@@ -1566,33 +1578,35 @@ pub fn join_float_tensor_payload(
     // shift and drop it by shifting left. `accumulated_bits >= width` always
     // holds because the mantissa plane is exactly
     // ceil(element_count * width / 8) bytes and `width <= 24`.
-    let mut accumulator = 0u64;
-    let mut accumulated_bits = 0u32;
-    let mut plane_pos = 0usize;
-    for (chunk, &exponent_byte) in out
-        .chunks_exact_mut(element_bytes)
-        .zip(exponent_plane.iter())
-    {
-        if u64::from(exponent_byte) >> exponent_bits != 0 {
-            return Err(Error::corrupt(
-                "float tensor exponent byte exceeds the dtype exponent width",
-            ));
-        }
-        while accumulated_bits <= 56 && plane_pos < mantissa_plane.len() {
-            accumulator |= u64::from(mantissa_plane[plane_pos]) << (56 - accumulated_bits);
-            plane_pos += 1;
-            accumulated_bits += 8;
-        }
-        let value = accumulator >> (64 - width_bits);
-        accumulator <<= width_bits;
-        accumulated_bits -= width_bits;
+    if !joined_by_kernel {
+        let mut accumulator = 0u64;
+        let mut accumulated_bits = 0u32;
+        let mut plane_pos = 0usize;
+        for (chunk, &exponent_byte) in out
+            .chunks_exact_mut(element_bytes)
+            .zip(exponent_plane.iter())
+        {
+            if u64::from(exponent_byte) >> exponent_bits != 0 {
+                return Err(Error::corrupt(
+                    "float tensor exponent byte exceeds the dtype exponent width",
+                ));
+            }
+            while accumulated_bits <= 56 && plane_pos < mantissa_plane.len() {
+                accumulator |= u64::from(mantissa_plane[plane_pos]) << (56 - accumulated_bits);
+                plane_pos += 1;
+                accumulated_bits += 8;
+            }
+            let value = accumulator >> (64 - width_bits);
+            accumulator <<= width_bits;
+            accumulated_bits -= width_bits;
 
-        let sign = value >> mantissa_bits;
-        let mantissa = value & mantissa_mask;
-        let word = (sign << (exponent_bits + mantissa_bits))
-            | (u64::from(exponent_byte) << mantissa_bits)
-            | mantissa;
-        chunk.copy_from_slice(&word.to_le_bytes()[..element_bytes]);
+            let sign = value >> mantissa_bits;
+            let mantissa = value & mantissa_mask;
+            let word = (sign << (exponent_bits + mantissa_bits))
+                | (u64::from(exponent_byte) << mantissa_bits)
+                | mantissa;
+            chunk.copy_from_slice(&word.to_le_bytes()[..element_bytes]);
+        }
     }
 
     // Unused low bits of the final mantissa byte are canonical zero padding.

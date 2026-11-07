@@ -167,7 +167,10 @@ fn main() {
                 huffman::decode(&exponent_plane, element_count as usize).expect("huffman");
 
             let mut huffman_ms = Vec::new();
+            let mut huffman_scalar_ms = Vec::new();
             let mut join_ms = Vec::new();
+            let mut join_scalar_ms = Vec::new();
+            let mut join_explicit_ms = Vec::new();
             let mut decode_ms = Vec::new();
             let mut encode_ms = Vec::new();
 
@@ -177,6 +180,12 @@ fn main() {
                     huffman::decode(&exponent_plane, element_count as usize).expect("huffman");
                 huffman_ms.push(start.elapsed().as_secs_f64() * 1e3);
                 assert_eq!(out, decoded_exponent, "huffman repeat mismatch");
+
+                let start = Instant::now();
+                let out = huffman::decode_prefix_scalar(&exponent_plane, element_count as usize)
+                    .expect("huffman scalar");
+                huffman_scalar_ms.push(start.elapsed().as_secs_f64() * 1e3);
+                assert_eq!(out.0, decoded_exponent, "scalar huffman repeat mismatch");
 
                 let start = Instant::now();
                 let out = join_float_tensor_payload(
@@ -189,6 +198,56 @@ fn main() {
                 .expect("join");
                 join_ms.push(start.elapsed().as_secs_f64() * 1e3);
                 assert_eq!(out, source, "plane join repeat mismatch");
+
+                if dtype == FloatDtype::Bf16 {
+                    // Kernel-to-kernel comparison into preallocated buffers; the
+                    // end-to-end `plane_join` row above includes the output
+                    // allocation and the descriptor checks.
+                    let mut scalar_out = vec![0u8; source.len()];
+                    let start = Instant::now();
+                    weftcodec::simd::join_bf16_scalar(
+                        &decoded_exponent,
+                        &mantissa_plane,
+                        &mut scalar_out,
+                    );
+                    join_scalar_ms.push(start.elapsed().as_secs_f64() * 1e3);
+                    assert_eq!(scalar_out, source, "scalar plane join repeat mismatch");
+
+                    let mut explicit = vec![0u8; source.len()];
+                    let start = Instant::now();
+                    weftcodec::simd::join_bf16_avx2_path(
+                        &decoded_exponent,
+                        &mantissa_plane,
+                        &mut explicit,
+                    );
+                    join_explicit_ms.push(start.elapsed().as_secs_f64() * 1e3);
+                    assert_eq!(explicit, source, "explicit AVX2 plane join repeat mismatch");
+                } else {
+                    // No vector kernel exists for non-BF16 joins; both kernel
+                    // rows repeat the same end-to-end computation.
+                    let start = Instant::now();
+                    let out = join_float_tensor_payload(
+                        &decoded_exponent,
+                        &mantissa_plane,
+                        dtype,
+                        element_count,
+                        &limits,
+                    )
+                    .expect("join scalar");
+                    join_scalar_ms.push(start.elapsed().as_secs_f64() * 1e3);
+                    assert_eq!(out, source, "scalar plane join repeat mismatch");
+                    let start = Instant::now();
+                    let out = join_float_tensor_payload(
+                        &decoded_exponent,
+                        &mantissa_plane,
+                        dtype,
+                        element_count,
+                        &limits,
+                    )
+                    .expect("join avx2");
+                    join_explicit_ms.push(start.elapsed().as_secs_f64() * 1e3);
+                    assert_eq!(out, source, "avx2 plane join repeat mismatch");
+                }
 
                 let start = Instant::now();
                 let out = decode_float_tensor(&parsed, &limits).expect("decode");
@@ -203,9 +262,34 @@ fn main() {
 
             let mib = bytes as f64 / (1024.0 * 1024.0);
             let physical = frame.len();
+            let huffman_median = median(huffman_ms.clone());
+            let huffman_scalar_median = median(huffman_scalar_ms.clone());
+            let join_median = median(join_ms.clone());
+            let join_scalar_median = median(join_scalar_ms.clone());
+            let join_explicit_median = median(join_explicit_ms.clone());
+            println!(
+                "{}",
+                json!({
+                    "schema": "weft.decode-floor-bench.v1",
+                    "event": "speedup",
+                    "dtype": dtype.as_str(),
+                    "size": size_name,
+                    "decode_path": weftcodec::simd::active_path(),
+                    "huffman_scalar_ms": huffman_scalar_median,
+                    "huffman_optimised_ms": huffman_median,
+                    "huffman_speedup": huffman_scalar_median / huffman_median,
+                    "join_kernel_scalar_ms": join_scalar_median,
+                    "join_kernel_avx2_ms": join_explicit_median,
+                    "join_kernel_avx2_speedup": join_scalar_median / join_explicit_median,
+                    "join_end_to_end_ms": join_median,
+                })
+            );
             for (component, samples) in [
                 ("huffman_decode", &huffman_ms),
+                ("huffman_decode_scalar", &huffman_scalar_ms),
                 ("plane_join", &join_ms),
+                ("plane_join_scalar_kernel", &join_scalar_ms),
+                ("plane_join_avx2_kernel", &join_explicit_ms),
                 ("mode9_decode", &decode_ms),
                 ("mode9_encode", &encode_ms),
             ] {
@@ -228,7 +312,6 @@ fn main() {
             }
             // Isolated exponent-plane unpack rate, in decoded exponent MiB/s.
             let exponent_mib = element_count as f64 / (1024.0 * 1024.0);
-            let huffman_median = median(huffman_ms.clone());
             println!(
                 "{}",
                 json!({

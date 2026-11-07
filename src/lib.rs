@@ -16,10 +16,12 @@
 //! * [`stream`] — chunked encoding and random-range reads.
 //! * [`tensor`] — logical tensor identity, layouts, and region addressing.
 //!
-//! All parsing of untrusted input returns `Result`; the crate forbids unsafe
-//! code and has no panic paths on malformed input.
+//! All parsing of untrusted input returns `Result`; the crate denies unsafe
+//! code. The single exception is [`simd`], which contains the AVX2 intrinsics
+//! and carries a local `allow(unsafe_code)`; `tests/no_unsafe_outside_simd.rs`
+//! fails if `unsafe` appears in any other source file.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod activation_stream;
 pub mod adversarial;
@@ -41,6 +43,7 @@ pub mod modes;
 pub mod selector;
 pub mod semantic;
 pub mod semantic_delta;
+pub mod simd;
 pub mod sparse_delta;
 pub mod stream;
 pub mod tensor;
