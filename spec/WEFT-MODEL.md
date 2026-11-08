@@ -114,6 +114,52 @@ Canonical WCB map:
 }
 ```
 
+A commit MAY instead carry schema `weftfs.commit.v2`, which is the v1 key set
+plus one optional field:
+
+```
+{
+  "schema": "weftfs.commit.v2",
+  "generation": u64,
+  "parent": bytes32 | null,
+  "timestamp_ns": timestamp,
+  "ops": [ op, ... ],
+  "checkpoint": bytes32 | null,
+  "index_attestation": map | null
+}
+```
+
+`index_attestation` records the shape of the advisory selector index the commit
+published, so an index segment can be trusted only when the commit says what it
+must contain:
+
+```
+{
+  "object_count": u64,
+  "relation_count": u64,
+  "entry_count": u64,
+  "state_root": bytes32,
+  "candidates_root": bytes32
+}
+```
+
+`state_root` is `H("weft/index/state/v1", WCB)` over the six v1 fields (schema
+`weftfs.commit.v1`, generation, parent, timestamp_ns, ops, checkpoint) with no
+attestation, so a v1 and a v2 commit with the same fields share it.
+`candidates_root` is `H("weft/index/candidates/v1", sections)` over the WFX2
+candidate section bytes. The index segment layout is unchanged (internal,
+advisory, rebuildable).
+
+**Migration / compatibility.** `weftfs.commit.v1` remains fully valid and is
+still read and written (a store may be configured to write only v1, which is
+how the frozen conformance fixture is reproduced). A v1 commit carries **no**
+attestation: any index segment named by it is rejected on load and rebuilt —
+never trusted. Both implementations here read and write v2. Adding the field
+changes the commit identity (`H("weft/store/commit/v1", WCB)`, domain
+unchanged), so a v2 commit is a different hash than the same v1 commit; old
+stores keep their v1 chain and continue to replay. A reader that checks exact
+map keys MUST be updated before it can read a v2 store.
+
 `checkpoint` is the manifest hash of a full state snapshot (§2.4) used as a
 replay base. Without it, replay starts at generation 1. Checkpoints are written
 every 256 commits (configurable) and by `weftfs checkpoint`. A checkpoint named
