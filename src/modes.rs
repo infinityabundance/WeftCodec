@@ -528,8 +528,14 @@ pub fn decompress_with_dictionary(body: &[u8], declared_len: u64, dict: &[u8]) -
     check_zstd_preamble(body, declared_len)?;
     let mut decoder = zstd::stream::read::Decoder::with_dictionary(body, dict)
         .map_err(|e| Error::corrupt(format!("zstd dictionary init failed: {e}")))?;
+    // Only ever *raise* the window bound: zstd's default is 27 (128 MiB), and a
+    // small dictionary must not lower it below what a normal dictionary frame
+    // already needs (which is set from the compression parameters, not the
+    // dictionary length). A patch frame needs a window that covers its base, so
+    // the bound is the larger of the default and the loaded dependency size.
+    let window = window_log_for(dict.len().max(1024)).max(27);
     decoder
-        .window_log_max(window_log_for(dict.len().max(1024)))
+        .window_log_max(window)
         .map_err(|e| Error::corrupt(format!("zstd dictionary window init failed: {e}")))?;
     read_exact_zstd(decoder, declared_len)
 }
