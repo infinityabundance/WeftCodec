@@ -65,7 +65,7 @@ pub use capability::{
 };
 pub use error::{Error, ErrorClass, Result};
 pub use frame::{Dependency, Frame, FrameHeader, Mode};
-pub use hash::Hash32;
+pub use hash::{DomainHasher, Hash32};
 pub use kv_cache::{
     decode_kv_page, decode_kv_page_range, encode_kv_page, kv_cache_metadata, DecodedKvPage,
     KvCacheInput, KvCacheMeta, KvDtype, KvPageSet, KV_CACHE_SCHEMA,
@@ -105,8 +105,8 @@ pub use sparse_delta::{
     SPARSE_DELTA_OP, SPARSE_DELTA_SCHEMA,
 };
 pub use tensor::{
-    logical_root, shard_root, LayoutDescriptor, LogicalRecord, PhysicalTensor, Region, RegionRead,
-    TensorLayout,
+    logical_root, logical_root_from_values_hash, shard_root, values_hasher, LayoutDescriptor,
+    LogicalRecord, PhysicalTensor, Region, RegionRead, TensorLayout,
 };
 pub use tensor_sharded::{
     assemble_sharded_words, decode_shard_frame, encode_shard_frame, encode_sharded_tensor,

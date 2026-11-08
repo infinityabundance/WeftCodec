@@ -166,6 +166,39 @@ pub fn hash_domain(domain: &str, data: &[u8]) -> Hash32 {
     Hash32(*hasher.finalize().as_bytes())
 }
 
+/// Incremental form of [`hash_domain`] with byte-identical output.
+///
+/// The v1 digest is `BLAKE3(u32le(|domain|) || domain || data)`, so feeding
+/// `data` in bounded pieces yields exactly the same digest without
+/// materialising it. This exists for streaming ingest paths (a tensor larger
+/// than the ingest budget, a file read in fixed-size windows); it does not
+/// change any hash, descriptor or frame byte.
+#[derive(Clone)]
+pub struct DomainHasher {
+    inner: blake3::Hasher,
+}
+
+impl DomainHasher {
+    /// Start a domain-separated digest.
+    pub fn new(domain: &str) -> Self {
+        let len = u32::try_from(domain.len()).unwrap_or(u32::MAX);
+        let mut inner = blake3::Hasher::new();
+        inner.update(&len.to_le_bytes());
+        inner.update(domain.as_bytes());
+        DomainHasher { inner }
+    }
+
+    /// Feed the next piece of the hashed data.
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    /// Finish the digest.
+    pub fn finalize(self) -> Hash32 {
+        Hash32(*self.inner.finalize().as_bytes())
+    }
+}
+
 /// Checked variant of [`hash_domain`] that rejects domains which are not
 /// representable in v1 (longer than `u32::MAX`) with `LimitExceeded`, and
 /// rejects non-ASCII domains or domains containing NUL with `Malformed`.
@@ -192,6 +225,19 @@ pub fn hash_selector(bytes: &[u8]) -> Hash32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn domain_hasher_matches_one_shot() {
+        let pieces: [&[u8]; 4] = [b"", b"abc", &[0u8; 7], b"0123456789abcdef"];
+        for domain in ["", DOMAIN_CHUNK, "weft/tensor/values/v1"] {
+            let joined: Vec<u8> = pieces.concat();
+            let mut hasher = DomainHasher::new(domain);
+            for piece in pieces {
+                hasher.update(piece);
+            }
+            assert_eq!(hasher.finalize(), hash_domain(domain, &joined));
+        }
+    }
 
     #[test]
     fn domain_separation_changes_digest() {

@@ -143,6 +143,15 @@ pub fn values_hash(row_major: &[u8]) -> Hash32 {
     hash_domain(DOMAIN_TENSOR_VALUES, row_major)
 }
 
+/// Incremental form of [`values_hash`].
+///
+/// Feeding the canonical row-major bytes in bounded windows produces the same
+/// digest as [`values_hash`], so a tensor larger than the ingest budget can be
+/// identified without materialising it.
+pub fn values_hasher() -> crate::hash::DomainHasher {
+    crate::hash::DomainHasher::new(DOMAIN_TENSOR_VALUES)
+}
+
 /// The canonical logical-tensor identity record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalRecord {
@@ -166,6 +175,28 @@ impl LogicalRecord {
             shape: shape.to_vec(),
             element_count,
             values_hash: values_hash(row_major),
+        })
+    }
+
+    /// Build the record from an already-computed [`values_hash`].
+    ///
+    /// This is the streaming counterpart of [`Self::from_row_major`]: the byte
+    /// length is implied by the shape and dtype, and the caller has already
+    /// hashed the canonical bytes in bounded windows. It performs the same
+    /// shape and payload-size validation.
+    pub fn from_values_hash(
+        dtype: TensorDtype,
+        shape: &[u64],
+        values_hash: Hash32,
+        limits: &Limits,
+    ) -> Result<Self> {
+        let element_count = validate_shape(shape, limits)?;
+        payload_len(element_count, dtype)?;
+        Ok(LogicalRecord {
+            dtype,
+            shape: shape.to_vec(),
+            element_count,
+            values_hash,
         })
     }
 
@@ -268,6 +299,16 @@ pub fn logical_root(
     limits: &Limits,
 ) -> Result<Hash32> {
     LogicalRecord::from_row_major(dtype, shape, row_major, limits)?.root_with_limits(limits)
+}
+
+/// `LogicalTensorRoot` computed from a streamed [`values_hash`].
+pub fn logical_root_from_values_hash(
+    dtype: TensorDtype,
+    shape: &[u64],
+    values_hash: Hash32,
+    limits: &Limits,
+) -> Result<Hash32> {
+    LogicalRecord::from_values_hash(dtype, shape, values_hash, limits)?.root_with_limits(limits)
 }
 
 // ---------------------------------------------------------------------------
@@ -2117,6 +2158,36 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 0xff;
         assert!(LogicalRecord::from_canonical_bytes(&tampered, &limits).is_err());
+    }
+
+    #[test]
+    fn streamed_values_hash_matches_one_shot() {
+        let limits = Limits::default();
+        let (dtype, shape, row_major) = fixture();
+        for window in [1usize, 3, 64, 4096] {
+            let mut hasher = values_hasher();
+            for piece in row_major.chunks(window) {
+                hasher.update(piece);
+            }
+            let streamed = hasher.finalize();
+            assert_eq!(streamed, values_hash(&row_major));
+            assert_eq!(
+                logical_root_from_values_hash(dtype, &shape, streamed, &limits).unwrap(),
+                logical_root(dtype, &shape, &row_major, &limits).unwrap()
+            );
+            assert_eq!(
+                LogicalRecord::from_values_hash(dtype, &shape, streamed, &limits).unwrap(),
+                LogicalRecord::from_row_major(dtype, &shape, &row_major, &limits).unwrap()
+            );
+        }
+        // A shape whose element count overflows the v1 bounds still fails.
+        assert!(LogicalRecord::from_values_hash(
+            dtype,
+            &[u64::MAX / 2, 4],
+            values_hash(b""),
+            &limits
+        )
+        .is_err());
     }
 
     #[test]
