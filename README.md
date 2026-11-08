@@ -1,6 +1,7 @@
-# WeftCodec (Rust)
+# WeftCodec — Lossless Coding for AI Tensors, Checkpoint Deltas, and Inference State
 
-WeftCodec v1: a deterministic, lossless, context-conditioned codec.
+WeftCodec v1: a deterministic, lossless codec for tensor weights, checkpoint
+deltas, tiled views, and inference-time state.
 
 - Normative format: `../spec/WEFTCODEC-FORMAT.md`
 - Normative selectors: `../spec/WEFT-SELECTORS.md`

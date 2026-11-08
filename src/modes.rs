@@ -407,6 +407,62 @@ fn compress_with_dictionary(data: &[u8], dict: &[u8], level: i32) -> Result<Vec<
         .map_err(|e| Error::malformed(format!("zstd compression failed: {e}")))
 }
 
+/// `ceil(log2(value))`, clamped to a valid `WindowLog`.
+fn window_log_for(value: usize) -> u32 {
+    let mut log = 10u32;
+    while log < 31 && (1usize << log) < value {
+        log += 1;
+    }
+    log
+}
+
+/// Compress `data` against the whole of `base` with a window that covers it,
+/// mirroring `zstd --patch-from` (a raw-content dictionary plus long-distance
+/// matching). Plain [`encode_dictionary`] uses the level's default window, which
+/// silently truncates the visible base for bases above that window; this entry
+/// point makes the whole base addressable, up to the 2 GiB zstd window bound.
+fn compress_patch(data: &[u8], base: &[u8], level: i32) -> Result<Vec<u8>> {
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(level, base)
+        .map_err(|e| Error::malformed(format!("zstd patch init failed: {e}")))?;
+    compressor
+        .set_parameter(zstd::zstd_safe::CParameter::WindowLog(window_log_for(
+            base.len().max(1024),
+        )))
+        .map_err(|e| Error::malformed(format!("zstd patch window failed: {e}")))?;
+    compressor
+        .set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
+            true,
+        ))
+        .map_err(|e| Error::malformed(format!("zstd patch long-distance failed: {e}")))?;
+    compressor
+        .compress(data)
+        .map_err(|e| Error::malformed(format!("zstd patch compression failed: {e}")))
+}
+
+/// Encode a patch frame: a DICTIONARY frame whose raw-content dictionary is the
+/// whole declared base and whose window covers that base. This is the exact
+/// analogue of `zstd --patch-from`; the wire mode is the frozen mode 4.
+pub fn encode_patch(data: &[u8], base: &[u8], level: i32, limits: &Limits) -> Result<Vec<u8>> {
+    check_len(data.len() as u64, limits.max_decoded_bytes, "decoded data")?;
+    check_len(base.len() as u64, limits.max_dictionary_bytes, "patch base")?;
+    let body = compress_patch(data, base, level)?;
+    let dependency = dependency_for(base, DEP_DOMAIN_DICTIONARY, 0);
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::Dictionary,
+        flags: crate::frame::flags::DICT_RAW,
+        level: level_to_u16(level)?,
+        decoded_len: data.len() as u64,
+        content_hash: hash_domain(DOMAIN_CHUNK, data),
+        dependencies: &[dependency],
+        chunks: &[],
+        body: &body,
+    };
+    encode_frame(&parts, limits)
+}
+
 /// Read exactly `declared_len` bytes from a zstd stream, never preallocating
 /// the declared length. A tiny frame that *claims* a huge output therefore
 /// costs only the bytes it actually produces.
@@ -461,10 +517,20 @@ pub fn decompress(body: &[u8], declared_len: u64) -> Result<Vec<u8>> {
 
 /// Decompress one zstd frame using a raw-content dictionary, with an exact
 /// output bound.
+///
+/// The decoder's maximum window is raised to cover the supplied dictionary.
+/// A patch frame (see [`encode_patch`]) may declare a window as large as its
+/// base, and zstd's default decoder limit is far below that. The bound is
+/// derived from the dictionary that is *already in memory*, not from the
+/// frame, so a malicious frame cannot force an allocation larger than the
+/// dependency it names.
 pub fn decompress_with_dictionary(body: &[u8], declared_len: u64, dict: &[u8]) -> Result<Vec<u8>> {
     check_zstd_preamble(body, declared_len)?;
-    let decoder = zstd::stream::read::Decoder::with_dictionary(body, dict)
+    let mut decoder = zstd::stream::read::Decoder::with_dictionary(body, dict)
         .map_err(|e| Error::corrupt(format!("zstd dictionary init failed: {e}")))?;
+    decoder
+        .window_log_max(window_log_for(dict.len().max(1024)))
+        .map_err(|e| Error::corrupt(format!("zstd dictionary window init failed: {e}")))?;
     read_exact_zstd(decoder, declared_len)
 }
 

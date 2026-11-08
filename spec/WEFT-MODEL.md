@@ -228,7 +228,7 @@ canonical WCB `representation` map:
   "kind": "raw" | "codec",
   "frame": bytes32 | null,        # WFT1 frame blob for codec
   "dependencies": [bytes32, ...], # base content roots (manifest ids)
-  "strategy": "raw" | "zstd" | "delta" | "reference",
+  "strategy": "raw" | "zstd" | "delta" | "reference" | "zstd-patch",
   "decoded_size": u64            # MUST equal size
 }
 ```
@@ -240,10 +240,16 @@ Rules:
   `kind:"codec"` stores bytes only inside the named frame and has no chunks.
 - `strategy` MUST equal the decoded frame's payload mode; a mismatch is
   `Corrupt`. The frame is validated with the codec's own limits.
+- `zstd-patch` is an additive strategy: the frame is mode 4 `DICTIONARY`, the
+  single dependency is the whole base as a raw-content dictionary, and the
+  encoder MUST set a zstd window that covers that base (the
+  `zstd --patch-from` analogue). No existing byte changes: v1 manifests, and
+  v2 manifests using the four original strategies, are unaffected.
 - `dependencies` are content roots (manifest ids). Decoding a dependent MUST
   fail closed if a dependency is missing, unreadable, or cyclic; dependency
   depth MUST be bounded (default 8). No approximate or partial reconstruction
-  is permitted.
+  is permitted. A `zstd-patch` decoder MUST bound its decompression window by
+  the already-loaded dependency, never by a frame-declared size.
 - `content_hash` remains the frozen whole-content digest
   `H("weft/chunk/v1", plaintext)` and MUST verify over the decoded bytes.
 - Retention MUST follow dependencies: a GC that keeps a dependent MUST keep
