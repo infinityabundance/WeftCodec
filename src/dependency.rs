@@ -82,6 +82,20 @@ impl Resolver for MapResolver {
         verify_dependency(hash, decoded_len, bytes)?;
         Ok(bytes.clone())
     }
+
+    /// A map entry may be a complete frame instead of plaintext. This is what
+    /// lets a test or a caller resolve an engram reference (which needs the
+    /// earlier artifact's group table, not its plaintext) with the same map.
+    /// Plaintext entries simply report that no frame is available.
+    fn resolve_frame(&self, content_hash: &Hash32) -> Result<Option<Vec<u8>>> {
+        let Some(bytes) = self.entries.get(content_hash) else {
+            return Ok(None);
+        };
+        match Frame::parse(bytes, &Limits::default()) {
+            Ok(frame) if frame.header.content_hash == *content_hash => Ok(Some(bytes.clone())),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Resolver backed by a directory of files named with lowercase hex digests.

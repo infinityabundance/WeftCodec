@@ -54,6 +54,11 @@ pub const DEFAULT_MAX_CAUSAL_ENTRIES: u64 = 4_096;
 /// dense representation; a delta with more non-zero words than this is
 /// `LimitExceeded` under mode 16 by design.
 pub const DEFAULT_MAX_SPARSE_RUNS: u64 = 16_777_216;
+/// Default maximum elements in one engram row group (2^26 = 67,108,864).
+///
+/// One group is decoded in a single allocation; at 8-byte elements this bounds
+/// a group at 512 MiB. Group **count** is bounded by `max_structured_items`.
+pub const DEFAULT_MAX_ENGRAM_GROUP_ELEMENTS: u64 = 1 << 26;
 /// Default maximum capability grant-list entries (4,096).
 pub const DEFAULT_MAX_CAPABILITY_ENTRIES: u64 = 4_096;
 /// Default maximum `weft://` URI length (64 KiB).
@@ -97,6 +102,8 @@ pub struct Limits {
     pub max_capability_entries: u64,
     /// `weft://` URI length (WEFT-CONTEXT-ROOT §3.3).
     pub max_uri_bytes: u64,
+    /// Elements in one engram row group (WEFT-ENGRAM §10).
+    pub max_engram_group_elements: u64,
 }
 
 impl Default for Limits {
@@ -125,6 +132,7 @@ impl Default for Limits {
             max_sparse_runs: DEFAULT_MAX_SPARSE_RUNS,
             max_capability_entries: DEFAULT_MAX_CAPABILITY_ENTRIES,
             max_uri_bytes: DEFAULT_MAX_URI_BYTES,
+            max_engram_group_elements: DEFAULT_MAX_ENGRAM_GROUP_ELEMENTS,
         }
     }
 }
@@ -225,6 +233,10 @@ impl Limits {
     }
     pub fn with_max_uri_bytes(mut self, value: u64) -> Self {
         self.max_uri_bytes = value;
+        self
+    }
+    pub fn with_max_engram_group_elements(mut self, value: u64) -> Self {
+        self.max_engram_group_elements = value;
         self
     }
     /// Alias for [`Limits::with_max_string_bytes`] used by some callers.

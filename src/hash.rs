@@ -57,6 +57,12 @@ pub const DOMAIN_FLOAT_TILE: &str = "weft/tensor/float_tile/v1";
 /// Independently decodable multi-stream float-tile identity
 /// (WEFT-AI-CODEC §19).
 pub const DOMAIN_FLOAT_TILE_STREAMS: &str = "weft/tensor/float_tile_streams/v1";
+/// Engram-shard descriptor identity (WEFT-AI-CODEC §21, WEFT-ENGRAM §5).
+pub const DOMAIN_ENGRAM: &str = "weft/engram/v1";
+/// Engram row-group identity (WEFT-ENGRAM §4).
+pub const DOMAIN_ENGRAM_GROUP: &str = "weft/engram/group/v1";
+/// Engram stored-payload identity (WEFT-ENGRAM §5).
+pub const DOMAIN_ENGRAM_PAYLOAD: &str = "weft/engram/payload/v1";
 
 /// A 32-byte Weft digest.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

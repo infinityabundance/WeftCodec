@@ -16,6 +16,7 @@ use weftcodec::context::{self, Budget, ContextRoot, ContextUri, DEFAULT_RESOLVER
 use weftcodec::dependency::{
     decode_frame_dag, DirectoryFrameSource, DirectoryResolver, MapResolver, Resolver,
 };
+use weftcodec::engram;
 use weftcodec::error::{Error, ErrorClass, Result};
 use weftcodec::frame::{Frame, Mode};
 use weftcodec::hash::hash_domain;
@@ -99,7 +100,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "tensor_tiled", "tensor-tiled", "float_tiled", "float-tiled", "float_tiled_streams", "float-tiled-streams", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "sparse_delta", "sparse-delta", "kv_cache", "kv-cache", "kv_prov", "kv-prov", "activation_stream", "activation-stream", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "tensor_tiled", "tensor-tiled", "float_tiled", "float-tiled", "float_tiled_streams", "float-tiled-streams", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "sparse_delta", "sparse-delta", "kv_cache", "kv-cache", "kv_prov", "kv-prov", "activation_stream", "activation-stream", "engram_shard", "engram-shard", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -158,6 +159,23 @@ struct EncodeArgs {
     /// FLOAT_TILED_STREAMS per-tile interleaved stream count (1..=16, default 4).
     #[arg(long = "n-streams")]
     n_streams: Option<u64>,
+    /// ENGRAM_SHARD row-group edges as comma-separated u64 values (first 0,
+    /// last = rows, strictly increasing).
+    #[arg(long = "group-edges")]
+    group_edges: Option<String>,
+    /// ENGRAM_SHARD key-hash registry id (`ngram-sha256-v1` or
+    /// `ngram-blake3-v1`).
+    #[arg(long = "hash-function", default_value = engram::ENGRAM_HASH_BLAKE3)]
+    hash_function: String,
+    /// ENGRAM_SHARD vocabulary size (1..=rows).
+    #[arg(long = "vocab-size")]
+    vocab_size: Option<u64>,
+    /// ENGRAM_SHARD declared precision (defaults to `--dtype`).
+    #[arg(long)]
+    precision: Option<String>,
+    /// ENGRAM_SHARD optional quantization scheme (only `none` is implemented).
+    #[arg(long)]
+    quantization: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -626,6 +644,9 @@ struct ConformanceArgs {
     /// `<dir>/capability`.
     #[arg(long)]
     capability_only: bool,
+    /// Write only the ENGRAM_SHARD (mode 20) vectors into `<dir>/engram`.
+    #[arg(long)]
+    engram_only: bool,
 }
 
 fn main() -> ExitCode {
@@ -754,6 +775,9 @@ fn run(cli: Cli) -> Result<()> {
             } else if args.capability_only {
                 weftcodec::conformance::generate_capability_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote capability vectors to {}/capability", args.dir);
+            } else if args.engram_only {
+                weftcodec::conformance::generate_engram_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote engram vectors to {}/engram", args.dir);
             } else {
                 weftcodec::conformance::generate_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote conformance vectors to {}", args.dir);
@@ -808,6 +832,27 @@ fn encode(args: EncodeArgs) -> Result<()> {
         let tile_shape = tile_shape_arg(&args)?;
         let n_streams = args.n_streams.unwrap_or(modes::FLOAT_TILED_STREAMS_DEFAULT);
         modes::encode_float_tiled_streams(&data, dtype, &shape, &tile_shape, n_streams, &limits)?
+    } else if args.mode == "engram_shard" || args.mode == "engram-shard" {
+        let (dtype, shape) = tensor_metadata_args(&args)?;
+        let edges = engram_edges_arg(&args)?;
+        let vocab_size = args.vocab_size.unwrap_or(shape[0]);
+        let mut input = engram::EngramInput::inline(
+            dtype,
+            shape.clone(),
+            edges,
+            args.hash_function.clone(),
+            vocab_size,
+        );
+        if let Some(precision) = &args.precision {
+            input.precision.storage_dtype = modes::TensorDtype::from_name(precision)?;
+        }
+        if let Some(scheme) = &args.quantization {
+            input.precision.quantization = Some(engram::EngramQuantization {
+                scheme: scheme.clone(),
+                lossless: true,
+            });
+        }
+        engram::encode_engram(&data, &input, &limits)?
     } else if args.mode == "weight_delta" || args.mode == "weight-delta" {
         let (dtype, shape) = weight_delta_metadata_args(&args)?;
         let base_frame = base
@@ -940,6 +985,9 @@ fn encode_mode(
         Mode::FloatTiledStreams => Err(Error::malformed(
             "FLOAT_TILED_STREAMS encoding requires the dedicated CLI path with --dtype/--shape/--tile-shape/--n-streams",
         )),
+        Mode::EngramShard => Err(Error::malformed(
+            "ENGRAM_SHARD encoding requires the dedicated CLI path with --dtype/--shape/--group-edges/--hash-function/--vocab-size",
+        )),
     }
 }
 
@@ -1042,6 +1090,24 @@ fn quantized_metadata_args(args: &EncodeArgs) -> Result<(modes::TensorDtype, Vec
 }
 
 /// Parse `--tile-shape` for TENSOR_TILED.
+/// Parse `--group-edges` for ENGRAM_SHARD.
+fn engram_edges_arg(args: &EncodeArgs) -> Result<Vec<u64>> {
+    let text = args.group_edges.as_deref().ok_or_else(|| {
+        Error::malformed("ENGRAM_SHARD encoding requires --group-edges 0,A,...,ROWS")
+    })?;
+    let mut out = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(Error::malformed("bad --group-edges: empty extent"));
+        }
+        out.push(part.parse::<u64>().map_err(|err| {
+            Error::malformed(format!("bad --group-edges extent `{part}`: {err}"))
+        })?);
+    }
+    Ok(out)
+}
+
 fn tile_shape_arg(args: &EncodeArgs) -> Result<Vec<u64>> {
     let text = args
         .tile_shape

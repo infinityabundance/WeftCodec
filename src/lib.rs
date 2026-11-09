@@ -30,6 +30,7 @@ pub mod capability;
 pub mod conformance;
 pub mod context;
 pub mod dependency;
+pub mod engram;
 pub mod error;
 /// **EXPERIMENTAL — not a wire-format module.** See [`experimental`].
 pub mod experimental;
@@ -63,6 +64,14 @@ pub use capability::{
     public_key_for_seed, sign_bytes, sign_envelope, verify_bytes, verify_envelope,
     verify_envelope_for_tenant, CapabilityBlob, CapabilityEnvelope, EnvelopeError, EnvelopeResult,
     Rejection, VerifiedEnvelope,
+};
+pub use engram::{
+    decode_engram, decode_engram_without_dependencies, encode_engram,
+    encode_engram_with_dependencies, engram_group_root, engram_metadata, engram_region_groups,
+    parse_engram, parse_engram_descriptor, read_engram_groups, read_engram_region,
+    EngramDescriptor, EngramGroup, EngramInput, EngramMeta, EngramPrecision, EngramQuantization,
+    EngramReference, EngramStorage, ENGRAM_GROUP_CODEC, ENGRAM_HASH_BLAKE3, ENGRAM_HASH_SHA256,
+    ENGRAM_LAYOUT, ENGRAM_SCHEMA,
 };
 pub use error::{Error, ErrorClass, Result};
 pub use frame::{Dependency, Frame, FrameHeader, Mode};

@@ -15,6 +15,7 @@ use serde_json::{json, Value as Json};
 use crate::activation_stream;
 use crate::capability::{self, CapabilityEnvelope};
 use crate::context::{self, Budget, CausalClosure, ContextRoot, DEFAULT_RESOLVER};
+use crate::engram;
 use crate::error::{Error, ErrorClass, Result};
 use crate::frame::{
     encode_frame, Dependency, Frame, FrameParts, Mode, DEP_DOMAIN_DICTIONARY, DEP_DOMAIN_PAYLOAD,
@@ -60,6 +61,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let sparse_delta_dir = dir.join("sparse-delta");
     let float_tiled_dir = dir.join("float-tiled");
     let float_tiled_streams_dir = dir.join("float-tiled-streams");
+    let engram_dir = dir.join("engram");
     for sub in [
         &codec_dir,
         &structured_dir,
@@ -79,6 +81,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
         &sparse_delta_dir,
         &float_tiled_dir,
         &float_tiled_streams_dir,
+        &engram_dir,
     ] {
         fs::create_dir_all(sub)
             .map_err(|e| Error::io(format!("cannot create {}: {e}", sub.display())))?;
@@ -102,7 +105,16 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_sparse_delta_vectors(&sparse_delta_dir, limits)?;
     write_float_tiled_vectors(&float_tiled_dir, limits)?;
     write_float_tiled_streams_vectors(&float_tiled_streams_dir, limits)?;
+    write_engram_vectors(&engram_dir, limits)?;
     Ok(())
+}
+
+/// Generate only the ENGRAM_SHARD (mode 20) vectors into `<dir>/engram`.
+pub fn generate_engram_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let engram_dir = dir.join("engram");
+    fs::create_dir_all(&engram_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", engram_dir.display())))?;
+    write_engram_vectors(&engram_dir, limits)
 }
 
 /// Generate only the authenticated capability-envelope vectors into
@@ -754,9 +766,24 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     let mut unknown_mode = good.clone();
     unknown_mode[7] = 20;
     refix_header_and_trailer(&mut unknown_mode);
-    push_error(
+    push_error_superseded(
         &mut vectors,
         "017_unknown_mode_reserved20",
+        "raw",
+        &unknown_mode,
+        &[],
+        ErrorClass::UnsupportedMode,
+        None,
+        "017_unknown_mode_reserved21",
+        "Historical: this vector asserted that mode value 20 was reserved. WEFT-AI-CODEC allocates 20 to ENGRAM_SHARD, so the authoritative unknown-mode vector is 017_unknown_mode_reserved21. The frozen bytes and original expectation are retained unchanged.",
+    );
+
+    let mut unknown_mode = good.clone();
+    unknown_mode[7] = 21;
+    refix_header_and_trailer(&mut unknown_mode);
+    push_error(
+        &mut vectors,
+        "017_unknown_mode_reserved21",
         "raw",
         &unknown_mode,
         &[],
@@ -5146,14 +5173,14 @@ fn write_kv_prov_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     )?;
 
     let mut reserved = base_frame.clone();
-    reserved[7] = 20;
+    reserved[7] = 21;
     refix_header_and_trailer(&mut reserved);
     kv_prov_reject(
         dir,
-        "112_reserved_mode_20",
+        "112_reserved_mode_21",
         &reserved,
         ErrorClass::UnsupportedMode,
-        "mode 20 is reserved; KV_CACHE_PROV is mode 19",
+        "mode 21 is reserved; KV_CACHE_PROV is mode 19 and ENGRAM_SHARD is mode 20",
     )?;
 
     Ok(())
@@ -7314,4 +7341,726 @@ fn write_float_tiled_streams_vectors(dir: &Path, limits: &Limits) -> Result<()> 
     )?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ENGRAM_SHARD (mode 20, WEFT-AI-CODEC §21 / WEFT-ENGRAM)
+// ---------------------------------------------------------------------------
+
+fn engram_pattern(rows: u64, dim: u64, element_size: u64, seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    (0..rows * dim * element_size)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xff) as u8
+        })
+        .collect()
+}
+
+fn engram_frame_parts(
+    frame: &[u8],
+    limits: &Limits,
+) -> Result<(Value, Vec<u8>, u64, Hash32, Vec<Dependency>)> {
+    let parsed = Frame::parse(frame, limits)?;
+    let body = parsed.body;
+    if body.len() < 4 {
+        return Err(Error::malformed(
+            "engram frame body is shorter than 4 bytes",
+        ));
+    }
+    let meta_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let end = 4usize
+        .checked_add(meta_len)
+        .ok_or_else(|| Error::malformed("engram metadata length overflows"))?;
+    if end > body.len() {
+        return Err(Error::malformed("engram metadata extends past the body"));
+    }
+    let meta = wcb::decode(&body[4..end], limits)?;
+    Ok((
+        meta,
+        body[end..].to_vec(),
+        parsed.header.decoded_len,
+        parsed.header.content_hash,
+        parsed.dependencies,
+    ))
+}
+
+fn engram_rebuild(
+    meta: &Value,
+    payload: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    dependencies: &[Dependency],
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let body = ai_body(meta, payload, limits)?;
+    build_frame(
+        Mode::EngramShard,
+        DOMAIN_PAYLOAD,
+        0,
+        decoded_len,
+        content_hash,
+        dependencies,
+        &body,
+        limits,
+    )
+}
+
+fn engram_rebuild_raw(
+    descriptor: &[u8],
+    payload: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    dependencies: &[Dependency],
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let len = u32::try_from(descriptor.len())
+        .map_err(|_| Error::limit_exceeded("engram descriptor does not fit u32"))?;
+    let mut body = Vec::with_capacity(4 + descriptor.len() + payload.len());
+    body.extend_from_slice(&len.to_le_bytes());
+    body.extend_from_slice(descriptor);
+    body.extend_from_slice(payload);
+    build_frame(
+        Mode::EngramShard,
+        DOMAIN_PAYLOAD,
+        0,
+        decoded_len,
+        content_hash,
+        dependencies,
+        &body,
+        limits,
+    )
+}
+
+fn engram_group_json(group: &engram::EngramGroup) -> Json {
+    let (storage, offset, compressed_len, dependency) = match &group.storage {
+        engram::EngramStorage::Inline {
+            offset,
+            compressed_len,
+        } => ("inline", *offset, *compressed_len, Json::Null),
+        engram::EngramStorage::Reference { dependency } => ("reference", 0, 0, json!(*dependency)),
+    };
+    json!({
+        "index": group.index,
+        "row_start": group.row_start,
+        "row_end": group.row_end,
+        "storage": storage,
+        "offset": offset,
+        "compressed_len": compressed_len,
+        "group_root": group.group_root.to_hex(),
+        "supersedes": group.supersedes.map(|root| root.to_hex()),
+        "dependency": dependency,
+    })
+}
+
+fn write_engram_valid_frame(
+    dir: &Path,
+    name: &str,
+    frame: &[u8],
+    table: &[u8],
+    region: Option<(u64, u64)>,
+    note: Option<&str>,
+    limits: &Limits,
+) -> Result<()> {
+    let parsed = Frame::parse(frame, limits)?;
+    let descriptor = engram::parse_engram(&parsed, limits)?;
+    let decoded = engram::decode_engram_without_dependencies(&parsed, limits)?;
+    if decoded != table {
+        return Err(Error::corrupt(format!(
+            "{name}: engram round trip is not exact"
+        )));
+    }
+    let root = descriptor.meta.descriptor_root(limits)?;
+    let mut value = json!({
+        "name": name,
+        "mode": "engram_shard",
+        "mode_value": 20,
+        "schema": engram::ENGRAM_SCHEMA,
+        "hash_function": descriptor.meta.hash_function,
+        "vocab_size": descriptor.meta.vocab_size,
+        "table_shape": descriptor.meta.table_shape,
+        "dtype": descriptor.meta.dtype.as_str(),
+        "precision": {
+            "storage_dtype": descriptor.meta.precision.storage_dtype.as_str(),
+            "quantization": descriptor.meta.precision.quantization.as_ref().map(|q| json!({
+                "scheme": q.scheme,
+                "lossless": q.lossless,
+            })),
+        },
+        "row_group_edges": descriptor.meta.row_group_edges,
+        "group_count": descriptor.meta.groups.len(),
+        "groups": descriptor.meta.groups.iter().map(engram_group_json).collect::<Vec<_>>(),
+        "payload_len": descriptor.meta.payload_len,
+        "payload_hash": descriptor.meta.payload_hash.to_hex(),
+        "descriptor_root": root.to_hex(),
+        "decoded_len": table.len(),
+        "content_hash": parsed.header.content_hash.to_hex(),
+        "table_hex": hexs(table),
+        "frame_hex": hexs(frame),
+        "dependencies": parsed.dependencies.iter().map(|dep| json!({
+            "hash": dep.hash.to_hex(),
+            "decoded_len": dep.decoded_len,
+            "dep_domain": dep.dep_domain,
+        })).collect::<Vec<_>>(),
+        "expect": { "ok": true },
+    });
+    if let Some(note) = note {
+        value["note"] = json!(note);
+    }
+    if let Some((start, end)) = region {
+        let resolver = crate::dependency::MapResolver::new();
+        let (bytes, touched) =
+            engram::read_engram_region(&parsed, &descriptor, start, end, &resolver, limits)?;
+        value["region"] = json!({
+            "row_start": start,
+            "row_end": end,
+            "bytes_hex": hexs(&bytes),
+            "groups_touched": touched,
+        });
+    }
+    write_json(&dir.join(format!("{name}.json")), &value)
+}
+
+fn write_engram_reject(
+    dir: &Path,
+    name: &str,
+    class: ErrorClass,
+    frame: &[u8],
+    dependency_frames: &[Vec<u8>],
+    note: &str,
+) -> Result<()> {
+    let value = json!({
+        "name": name,
+        "mode": "engram_shard",
+        "mode_value": 20,
+        "expect_error": class.as_str(),
+        "note": note,
+        "frame_hex": hexs(frame),
+        "dependency_frames": dependency_frames.iter().map(|frame| hexs(frame)).collect::<Vec<_>>(),
+    });
+    write_json(&dir.join(format!("{name}.json")), &value)
+}
+
+fn engram_group_map(
+    meta: &BTreeMap<String, Value>,
+    position: usize,
+) -> Result<BTreeMap<String, Value>> {
+    let groups = match meta.get("groups") {
+        Some(Value::Array(items)) => items,
+        _ => return Err(Error::malformed("engram descriptor has no groups array")),
+    };
+    let entry = groups
+        .get(position)
+        .ok_or_else(|| Error::malformed("engram descriptor is missing a group entry"))?;
+    match entry {
+        Value::Map(map) => Ok(map.clone()),
+        _ => Err(Error::malformed("engram group entry is not a WCB map")),
+    }
+}
+
+fn write_engram_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    // 001: bf16, one group covering the whole table.
+    let bf16 = engram_pattern(4, 3, 2, 0x11);
+    let input = engram::EngramInput::inline(
+        modes::TensorDtype::Bf16,
+        vec![4, 3],
+        vec![0, 4],
+        engram::ENGRAM_HASH_BLAKE3,
+        4,
+    );
+    let frame = engram::encode_engram(&bf16, &input, limits)?;
+    write_engram_valid_frame(
+        dir,
+        "001_engram_bf16_one_group",
+        &frame,
+        &bf16,
+        None,
+        None,
+        limits,
+    )?;
+
+    // 002: fp16, four uneven groups.
+    let fp16 = engram_pattern(10, 2, 2, 0x22);
+    let input = engram::EngramInput::inline(
+        modes::TensorDtype::F16,
+        vec![10, 2],
+        vec![0, 2, 5, 7, 10],
+        engram::ENGRAM_HASH_BLAKE3,
+        10,
+    );
+    let frame = engram::encode_engram(&fp16, &input, limits)?;
+    write_engram_valid_frame(
+        dir,
+        "002_engram_fp16_many_groups",
+        &frame,
+        &fp16,
+        None,
+        None,
+        limits,
+    )?;
+
+    // 003: fp32, two groups, the SHA-256 key registry.
+    let fp32 = engram_pattern(6, 2, 4, 0x33);
+    let input = engram::EngramInput::inline(
+        modes::TensorDtype::F32,
+        vec![6, 2],
+        vec![0, 3, 6],
+        engram::ENGRAM_HASH_SHA256,
+        6,
+    );
+    let frame = engram::encode_engram(&fp32, &input, limits)?;
+    write_engram_valid_frame(
+        dir,
+        "003_engram_fp32_basic",
+        &frame,
+        &fp32,
+        None,
+        None,
+        limits,
+    )?;
+
+    // 004: explicit null supersession entries.
+    let table = engram_pattern(5, 2, 2, 0x44);
+    let mut input = engram::EngramInput::inline(
+        modes::TensorDtype::Bf16,
+        vec![5, 2],
+        vec![0, 2, 5],
+        engram::ENGRAM_HASH_BLAKE3,
+        5,
+    );
+    input.supersedes = vec![None, None];
+    let frame = engram::encode_engram(&table, &input, limits)?;
+    write_engram_valid_frame(
+        dir,
+        "004_engram_empty_supersession",
+        &frame,
+        &table,
+        None,
+        Some("every group explicitly records a null supersession edge"),
+        limits,
+    )?;
+
+    // 005: an in-frame, acyclic supersession chain of length two.
+    let chain = engram_pattern(8, 2, 2, 0x55);
+    let mut input = engram::EngramInput::inline(
+        modes::TensorDtype::Bf16,
+        vec![8, 2],
+        vec![0, 4, 8],
+        engram::ENGRAM_HASH_BLAKE3,
+        8,
+    );
+    let first = engram::encode_engram(&chain, &input, limits)?;
+    let first_parsed = Frame::parse(&first, limits)?;
+    let first_meta = engram::engram_metadata(&first_parsed, limits)?;
+    input.supersedes = vec![None, Some(first_meta.groups[0].group_root)];
+    let frame = engram::encode_engram(&chain, &input, limits)?;
+    write_engram_valid_frame(
+        dir,
+        "005_engram_chain_two",
+        &frame,
+        &chain,
+        None,
+        Some("group 1 supersedes group 0's root; the chain is acyclic"),
+        limits,
+    )?;
+
+    // 006: a row region that touches a strict subset of the groups.
+    let region_table = engram_pattern(8, 2, 2, 0x66);
+    let input = engram::EngramInput::inline(
+        modes::TensorDtype::Bf16,
+        vec![8, 2],
+        vec![0, 2, 5, 8],
+        engram::ENGRAM_HASH_BLAKE3,
+        8,
+    );
+    let frame = engram::encode_engram(&region_table, &input, limits)?;
+    write_engram_valid_frame(
+        dir,
+        "006_engram_region_subset",
+        &frame,
+        &region_table,
+        Some((3, 4)),
+        Some("rows [3,4) lie inside group 1 only"),
+        limits,
+    )?;
+
+    // Reject vectors start from a two-group frame and change one thing.
+    let base_table = engram_pattern(8, 2, 2, 0x77);
+    let base_input = engram::EngramInput::inline(
+        modes::TensorDtype::Bf16,
+        vec![8, 2],
+        vec![0, 4, 8],
+        engram::ENGRAM_HASH_BLAKE3,
+        8,
+    );
+    let base = engram::encode_engram(&base_table, &base_input, limits)?;
+    let (meta, stored, decoded_len, content_hash, dependencies) =
+        engram_frame_parts(&base, limits)?;
+
+    // 101: edges not strictly increasing.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert(
+        "row_group_edges".to_owned(),
+        Value::Array(vec![
+            Value::U64(0),
+            Value::U64(4),
+            Value::U64(4),
+            Value::U64(8),
+        ]),
+    );
+    let frame = engram_rebuild(
+        &Value::Map(map),
+        &stored,
+        decoded_len,
+        content_hash,
+        &dependencies,
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "101_edges_not_increasing",
+        ErrorClass::Malformed,
+        &frame,
+        &[],
+        "row_group_edges repeat 4",
+    )?;
+
+    // 102: last edge is not the row count.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert(
+        "row_group_edges".to_owned(),
+        Value::Array(vec![Value::U64(0), Value::U64(4), Value::U64(7)]),
+    );
+    let frame = engram_rebuild(
+        &Value::Map(map),
+        &stored,
+        decoded_len,
+        content_hash,
+        &dependencies,
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "102_last_edge_not_rows",
+        ErrorClass::Malformed,
+        &frame,
+        &[],
+        "the last edge is 7 but the table has 8 rows",
+    )?;
+
+    // 103: group_count disagrees with the edge list.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert("group_count".to_owned(), Value::U64(99));
+    let frame = engram_rebuild(
+        &Value::Map(map),
+        &stored,
+        decoded_len,
+        content_hash,
+        &dependencies,
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "103_group_count_mismatch",
+        ErrorClass::Malformed,
+        &frame,
+        &[],
+        "group_count is 99",
+    )?;
+
+    // 104: a group root that does not match the group bytes.
+    let mut map = tiled_meta_map(&meta)?;
+    let mut first = engram_group_map(&map, 0)?;
+    first.insert("group_root".to_owned(), Value::Bytes(vec![0xAB; 32]));
+    let mut groups = match map.get("groups") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => return Err(Error::malformed("engram descriptor has no groups array")),
+    };
+    groups[0] = Value::Map(first);
+    map.insert("groups".to_owned(), Value::Array(groups));
+    let frame = engram_rebuild(
+        &Value::Map(map),
+        &stored,
+        decoded_len,
+        content_hash,
+        &dependencies,
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "104_group_root_mismatch",
+        ErrorClass::Corrupt,
+        &frame,
+        &[],
+        "group 0 records a different non-zero root",
+    )?;
+
+    // 105: the stored payload is truncated by one byte and the descriptor and
+    // payload hash follow it, so the group plane decode is what fails.
+    let mut map = tiled_meta_map(&meta)?;
+    let mut second = engram_group_map(&map, 1)?;
+    let compressed = match second.get("compressed_len") {
+        Some(Value::U64(value)) => *value,
+        _ => return Err(Error::malformed("group has no compressed_len")),
+    };
+    second.insert("compressed_len".to_owned(), Value::U64(compressed - 1));
+    let mut groups = match map.get("groups") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => return Err(Error::malformed("engram descriptor has no groups array")),
+    };
+    groups[1] = Value::Map(second);
+    map.insert("groups".to_owned(), Value::Array(groups));
+    let payload_len = match map.get("payload_len") {
+        Some(Value::U64(value)) => *value,
+        _ => return Err(Error::malformed("engram descriptor has no payload_len")),
+    };
+    map.insert("payload_len".to_owned(), Value::U64(payload_len - 1));
+    let mut truncated = stored.clone();
+    truncated.pop();
+    map.insert(
+        "payload_hash".to_owned(),
+        Value::Bytes(
+            hash_domain(crate::hash::DOMAIN_ENGRAM_PAYLOAD, &truncated)
+                .as_bytes()
+                .to_vec(),
+        ),
+    );
+    let frame = engram_rebuild(
+        &Value::Map(map),
+        &truncated,
+        decoded_len,
+        content_hash,
+        &dependencies,
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "105_payload_truncated",
+        ErrorClass::Corrupt,
+        &frame,
+        &[],
+        "the last group loses one stored byte",
+    )?;
+
+    // 106: the payload hash does not describe the stored payload.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert("payload_hash".to_owned(), Value::Bytes(vec![0xCD; 32]));
+    let frame = engram_rebuild(
+        &Value::Map(map),
+        &stored,
+        decoded_len,
+        content_hash,
+        &dependencies,
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "106_payload_hash_mismatch",
+        ErrorClass::Corrupt,
+        &frame,
+        &[],
+        "payload_hash is a different non-zero digest",
+    )?;
+
+    // 107: a supersession cycle between two in-frame groups.
+    let mut input = engram::EngramInput::inline(
+        modes::TensorDtype::Bf16,
+        vec![8, 2],
+        vec![0, 4, 8],
+        engram::ENGRAM_HASH_BLAKE3,
+        8,
+    );
+    let base_meta = engram::engram_metadata(&Frame::parse(&base, limits)?, limits)?;
+    input.supersedes = vec![
+        Some(base_meta.groups[1].group_root),
+        Some(base_meta.groups[0].group_root),
+    ];
+    let frame = engram::encode_engram(&base_table, &input, limits)?;
+    write_engram_reject(
+        dir,
+        "107_supersession_cycle",
+        ErrorClass::Corrupt,
+        &frame,
+        &[],
+        "group 0 supersedes group 1 and group 1 supersedes group 0",
+    )?;
+
+    // 108: a supersession edge to a root that resolves to nothing.
+    let mut input = engram::EngramInput::inline(
+        modes::TensorDtype::Bf16,
+        vec![8, 2],
+        vec![0, 4, 8],
+        engram::ENGRAM_HASH_BLAKE3,
+        8,
+    );
+    input.supersedes = vec![None, Some(Hash32::from_bytes([0xEE; 32]))];
+    let frame = engram::encode_engram(&base_table, &input, limits)?;
+    write_engram_reject(
+        dir,
+        "108_supersession_missing",
+        ErrorClass::Corrupt,
+        &frame,
+        &[],
+        "group 1 supersedes an unknown root",
+    )?;
+
+    // 109: a supersession edge to a group in a dependency whose rows do not
+    // match the group being replaced.
+    let old_table = engram_pattern(8, 2, 2, 0x88);
+    let old_input = engram::EngramInput::inline(
+        modes::TensorDtype::F16,
+        vec![8, 2],
+        vec![0, 4, 8],
+        engram::ENGRAM_HASH_BLAKE3,
+        8,
+    );
+    let old_frame = engram::encode_engram(&old_table, &old_input, limits)?;
+    let old_parsed = Frame::parse(&old_frame, limits)?;
+    let old_meta = engram::engram_metadata(&old_parsed, limits)?;
+    let mut input = engram::EngramInput::inline(
+        modes::TensorDtype::Bf16,
+        vec![8, 2],
+        vec![0, 4, 8],
+        engram::ENGRAM_HASH_BLAKE3,
+        8,
+    );
+    input.supersedes = vec![None, Some(old_meta.groups[0].group_root)];
+    let frame = engram::encode_engram_with_dependencies(
+        &base_table,
+        &input,
+        &[old_parsed.header.content_hash],
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "109_supersession_incompatible",
+        ErrorClass::Corrupt,
+        &frame,
+        &[old_frame.clone()],
+        "the superseded old group stores fp16 while the new table is bf16",
+    )?;
+
+    // 110: an unknown hash-function registry id.
+    let mut map = tiled_meta_map(&meta)?;
+    map.insert(
+        "hash_function".to_owned(),
+        Value::Str("ngram-md5-v1".to_owned()),
+    );
+    let frame = engram_rebuild(
+        &Value::Map(map),
+        &stored,
+        decoded_len,
+        content_hash,
+        &dependencies,
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "110_unknown_hash_function",
+        ErrorClass::UnsupportedMode,
+        &frame,
+        &[],
+        "ngram-md5-v1 is not in the registry",
+    )?;
+
+    // 111: an unknown exact storage precision.
+    let mut map = tiled_meta_map(&meta)?;
+    let mut precision = match map.get("precision") {
+        Some(Value::Map(value)) => value.clone(),
+        _ => return Err(Error::malformed("engram descriptor has no precision map")),
+    };
+    precision.insert("storage_dtype".to_owned(), Value::Str("fp4".to_owned()));
+    map.insert("precision".to_owned(), Value::Map(precision));
+    let frame = engram_rebuild(
+        &Value::Map(map),
+        &stored,
+        decoded_len,
+        content_hash,
+        &dependencies,
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "111_unknown_precision",
+        ErrorClass::UnsupportedFeature,
+        &frame,
+        &[],
+        "fp4 is not an implemented storage dtype",
+    )?;
+
+    // 112: reserved mode 21.
+    let mut reserved = base.clone();
+    reserved[7] = 21;
+    refix_header_and_trailer(&mut reserved);
+    let value = json!({
+        "name": "112_reserved_mode_21",
+        "mode": "engram_shard",
+        "mode_value": 20,
+        "expect_error": ErrorClass::UnsupportedMode.as_str(),
+        "note": "mode 21 is reserved; ENGRAM_SHARD is mode 20",
+        "frame_hex": hexs(&reserved),
+        "dependency_frames": [],
+    });
+    write_json(&dir.join("112_reserved_mode_21.json"), &value)?;
+
+    // 113: a non-canonical descriptor (trailing bytes after the WCB value).
+    let mut descriptor = match wcb::encode(&meta, limits) {
+        Ok(bytes) => bytes,
+        Err(err) => return Err(err),
+    };
+    descriptor.push(0x00);
+    let frame = engram_rebuild_raw(
+        &descriptor,
+        &stored,
+        decoded_len,
+        content_hash,
+        &dependencies,
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "113_non_canonical_descriptor",
+        ErrorClass::NonCanonical,
+        &frame,
+        &[],
+        "the descriptor has one trailing byte after the WCB map",
+    )?;
+
+    // 114: a reference whose dependency frame is not supplied.
+    let mut input = engram::EngramInput::inline(
+        modes::TensorDtype::Bf16,
+        vec![8, 2],
+        vec![0, 4, 8],
+        engram::ENGRAM_HASH_BLAKE3,
+        8,
+    );
+    input.references.insert(
+        1,
+        engram::EngramReference {
+            group_root: base_meta.groups[1].group_root,
+            dependency: 0,
+        },
+    );
+    let frame = engram::encode_engram_with_dependencies(
+        &base_table,
+        &input,
+        &[base_parsed_content(&base, limits)?],
+        limits,
+    )?;
+    write_engram_reject(
+        dir,
+        "114_reference_missing",
+        ErrorClass::DependencyMissing,
+        &frame,
+        &[],
+        "group 1 is a reference and the dependency frame is absent",
+    )?;
+
+    Ok(())
+}
+
+fn base_parsed_content(frame: &[u8], limits: &Limits) -> Result<Hash32> {
+    Ok(Frame::parse(frame, limits)?.header.content_hash)
 }

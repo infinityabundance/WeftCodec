@@ -232,6 +232,7 @@ pub fn decode_bytes(
         Mode::TensorTiled => decode_tiled_tensor(&frame, limits)?,
         Mode::FloatTiled => decode_float_tiled(&frame, limits)?,
         Mode::FloatTiledStreams => decode_float_tiled_streams(&frame, limits, 1)?,
+        Mode::EngramShard => crate::engram::decode_frame(&frame, resolver, limits)?,
     };
 
     if plaintext.len() as u64 != frame.header.decoded_len {

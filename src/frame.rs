@@ -109,6 +109,9 @@ pub enum Mode {
     /// One paged attention KV cache page bound to its provenance dimensions
     /// (WEFT-AI-CODEC §20, WEFT-KV-PROVENANCE).
     KvCacheProv = 19,
+    /// One incrementally updateable, region-addressable row-group table
+    /// (WEFT-AI-CODEC §21, WEFT-ENGRAM).
+    EngramShard = 20,
 }
 
 impl Mode {
@@ -135,7 +138,8 @@ impl Mode {
             17 => Ok(Mode::FloatTiled),
             18 => Ok(Mode::FloatTiledStreams),
             19 => Ok(Mode::KvCacheProv),
-            20..=127 => Err(Error::unsupported_mode(format!(
+            20 => Ok(Mode::EngramShard),
+            21..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -172,6 +176,7 @@ impl Mode {
             Mode::FloatTiled => "float_tiled",
             Mode::FloatTiledStreams => "float_tiled_streams",
             Mode::KvCacheProv => "kv_cache_prov",
+            Mode::EngramShard => "engram_shard",
         }
     }
 
@@ -204,6 +209,7 @@ impl Mode {
             "kv_prov" | "kv-prov" | "kv_cache_prov" | "kv-cache-prov" | "kcacheprov" => {
                 Ok(Mode::KvCacheProv)
             }
+            "engram_shard" | "engram-shard" | "engram" => Ok(Mode::EngramShard),
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -895,6 +901,37 @@ fn validate_mode_rules(
             if header.body_len < 4 {
                 return Err(Error::malformed(
                     "AI-mode body is shorter than its 4-byte metadata length",
+                ));
+            }
+        }
+        Mode::EngramShard => {
+            if header.domain != DOMAIN_PAYLOAD {
+                return Err(Error::malformed(
+                    "ENGRAM_SHARD frame must use the payload domain",
+                ));
+            }
+            if dict_flag {
+                return Err(Error::malformed("DICT_RAW is only valid for DICTIONARY"));
+            }
+            if u64::from(header.dep_count) > limits.max_dependency_count {
+                return Err(Error::limit_exceeded(format!(
+                    "ENGRAM_SHARD dependency count {} exceeds limit {}",
+                    header.dep_count, limits.max_dependency_count
+                )));
+            }
+            for (index, dep) in dependencies.iter().enumerate() {
+                if dep.dep_domain != DEP_DOMAIN_PAYLOAD {
+                    return Err(Error::malformed(format!(
+                        "ENGRAM_SHARD dependency {index} must use dep_domain 0 (payload)"
+                    )));
+                }
+            }
+            if header.chunk_count != 0 {
+                return Err(Error::malformed("ENGRAM_SHARD frame must not be chunked"));
+            }
+            if header.body_len < 4 {
+                return Err(Error::malformed(
+                    "ENGRAM_SHARD body is shorter than its 4-byte descriptor length",
                 ));
             }
         }

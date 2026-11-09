@@ -63,9 +63,9 @@ fn structural_header_errors() {
     fix_header_and_trailer(&mut minor);
     assert_eq!(parse(&minor), ErrorClass::UnsupportedVersion);
 
-    // Modes 6..=19 are allocated (TENSOR .. KV_CACHE_PROV); 20 is reserved.
+    // Modes 6..=20 are allocated (TENSOR .. ENGRAM_SHARD); 21 is reserved.
     let mut mode = good.clone();
-    mode[7] = 20;
+    mode[7] = 21;
     fix_header_and_trailer(&mut mode);
     assert_eq!(parse(&mode), ErrorClass::UnsupportedMode);
 

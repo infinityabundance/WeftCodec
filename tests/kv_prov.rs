@@ -356,6 +356,7 @@ struct KvProvVector {
     expect: Option<Json>,
     expect_error: Option<String>,
     frame_hex: Option<String>,
+    superseded_by: Option<String>,
 }
 
 fn json_to_wcb(value: &Json) -> Value {
@@ -399,13 +400,20 @@ fn committed_kv_prov_vectors_replay() {
         .filter(|path| path.extension().map(|ext| ext == "json").unwrap_or(false))
         .collect();
     files.sort();
-    assert_eq!(files.len(), 20, "expected 8 valid and 12 reject vectors");
+    assert_eq!(
+        files.len(),
+        21,
+        "expected 8 valid, 12 current rejects, 1 superseded"
+    );
 
     let mut valid_vectors = 0usize;
     let mut valid_pages = 0usize;
     let mut rejects = 0usize;
     for path in files {
         let vector = load(&path);
+        if vector.superseded_by.is_some() {
+            continue;
+        }
         if let Some(expect_error) = vector.expect_error {
             let frame_hex = vector.frame_hex.expect("reject frame");
             let frame = hex::decode(frame_hex).expect("hex");
