@@ -492,7 +492,7 @@ transaction API.
 * No serializable isolation and no distributed snapshot isolation.
 * No automatic branching or merge policy for named pointers: a conflict is
   returned to the caller.
-* No last-writer-wins and no blind overwrite, anywhere.
+* No last-writer-wins path and no blind overwrite, anywhere.
 * No physical power-loss claim.
 * No claim that a finite history check proves linearizability.
 * No claim that optimistic mode is faster; the benchmark reports both the
