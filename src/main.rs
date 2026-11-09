@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
+use std::os::unix::fs::FileExt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -30,6 +31,8 @@ use weftcodec::semantic_delta;
 use weftcodec::sparse_delta;
 use weftcodec::tensor;
 use weftcodec::tensor_sharded;
+use weftcodec::transport;
+use weftcodec::transport::RangeReader as _;
 use weftcodec::wcb;
 use weftcodec::weight_delta;
 
@@ -58,6 +61,11 @@ enum Command {
     Archive {
         #[command(subcommand)]
         command: ArchiveCommand,
+    },
+    /// Transport-aligned `weft.transport.v1` container operations.
+    Transport {
+        #[command(subcommand)]
+        command: TransportCommand,
     },
     /// WeftQL selector identity operations.
     Selector {
@@ -370,6 +378,49 @@ enum ArchiveCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum TransportCommand {
+    /// Pack frames into a transport-aligned container.
+    Create {
+        #[arg(long)]
+        output: String,
+        /// Section alignment: 512, 4096, or 65536.
+        #[arg(long, default_value_t = 4096)]
+        alignment: u32,
+        /// Comma-separated roles, one per frame (`payload|dependency|metadata|provenance`).
+        #[arg(long)]
+        roles: Option<String>,
+        /// Frame files in container order.
+        #[arg(required = true)]
+        frames: Vec<String>,
+    },
+    /// Print the validated header and section table.
+    Inspect {
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify structure, every section root/mode, and the payload digest.
+    Verify {
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch exactly one section with one byte-range read and verify it.
+    ReadSection {
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        index: u32,
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum SelectorCommand {
     /// Print the selector id (hex, or JSON).
     Id {
@@ -640,6 +691,9 @@ struct ConformanceArgs {
     /// `<dir>/float-tiled-streams`.
     #[arg(long)]
     float_tiled_streams_only: bool,
+    /// Write only the `weft.transport.v1` vectors into `<dir>/transport`.
+    #[arg(long)]
+    transport_only: bool,
     /// Write only the authenticated capability-envelope vectors into
     /// `<dir>/capability`.
     #[arg(long)]
@@ -672,6 +726,22 @@ fn run(cli: Cli) -> Result<()> {
                 out_dir,
                 limits,
             } => archive_decode(&input, &out_dir, &limits.to_limits()),
+        },
+        Command::Transport { command } => match command {
+            TransportCommand::Create {
+                output,
+                alignment,
+                roles,
+                frames,
+            } => transport_create(&output, alignment, roles.as_deref(), &frames),
+            TransportCommand::Inspect { input, json } => transport_inspect(&input, json),
+            TransportCommand::Verify { input, json } => transport_verify(&input, json),
+            TransportCommand::ReadSection {
+                input,
+                index,
+                output,
+                json,
+            } => transport_read_section(&input, index, &output, json),
         },
         Command::Selector { command } => match command {
             SelectorCommand::Id {
@@ -778,6 +848,9 @@ fn run(cli: Cli) -> Result<()> {
             } else if args.engram_only {
                 weftcodec::conformance::generate_engram_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote engram vectors to {}/engram", args.dir);
+            } else if args.transport_only {
+                weftcodec::conformance::generate_transport_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote transport vectors to {}/transport", args.dir);
             } else {
                 weftcodec::conformance::generate_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote conformance vectors to {}", args.dir);
@@ -2069,6 +2142,203 @@ fn archive_decode(input: &str, out_dir: &str, limits: &Limits) -> Result<()> {
         fs::write(&path, &entry.bytes)
             .map_err(|e| Error::io(format!("cannot write {}: {e}", path.display())))?;
         println!("{} {}", entry.content_hash, entry.bytes.len());
+    }
+    Ok(())
+}
+
+
+/// Byte-range source over a file, used by `transport read-section` to model
+/// exactly what an aligned USRBIO request would issue.
+struct FileRange {
+    file: fs::File,
+}
+
+impl transport::RangeReader for FileRange {
+    fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let len = usize::try_from(len)
+            .map_err(|_| Error::limit_exceeded("range length does not fit usize"))?;
+        let mut out = vec![0u8; len];
+        let mut done = 0usize;
+        while done < len {
+            let read = self
+                .file
+                .read_at(&mut out[done..], offset + done as u64)
+                .map_err(|e| Error::io(format!("cannot read range: {e}")))?;
+            if read == 0 {
+                return Err(Error::io("short read while fetching a transport section"));
+            }
+            done += read;
+        }
+        Ok(out)
+    }
+}
+
+fn transport_create(
+    output: &str,
+    alignment: u32,
+    roles: Option<&str>,
+    frame_paths: &[String],
+) -> Result<()> {
+    let limits = Limits::default();
+    let mut frames = Vec::with_capacity(frame_paths.len());
+    for path in frame_paths {
+        frames.push(read_limited(path, limits.max_frame_bytes)?);
+    }
+    let role_list: Vec<transport::SectionRole> = match roles {
+        Some(text) => text
+            .split(',')
+            .map(|role| transport::SectionRole::parse(role.trim()))
+            .collect::<Result<Vec<_>>>()?,
+        None => vec![transport::SectionRole::Payload; frames.len()],
+    };
+    if role_list.len() != frames.len() {
+        return Err(Error::parse(format!(
+            "{} roles were supplied for {} frames",
+            role_list.len(),
+            frames.len()
+        )));
+    }
+    let entries: Vec<transport::TransportFrame<'_>> = frames
+        .iter()
+        .zip(role_list)
+        .map(|(frame, role)| transport::TransportFrame::new(frame.as_slice(), role))
+        .collect();
+    let container = transport::create(&entries, alignment, &limits)?;
+    write_output(output, &container)
+}
+
+fn transport_inspect(input: &str, as_json: bool) -> Result<()> {
+    let limits = Limits::default();
+    let bytes = read_limited(input, limits.max_total_fetched_bytes)?;
+    let parsed = transport::parse_metadata(&bytes, &limits)?;
+    if as_json {
+        let sections: Vec<serde_json::Value> = parsed
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(index, section)| {
+                json!({
+                    "index": index,
+                    "offset": section.offset,
+                    "length": section.length,
+                    "alignment": section.alignment,
+                    "mode": section.mode,
+                    "role": section.role.as_str(),
+                    "root": section.root.to_hex(),
+                })
+            })
+            .collect();
+        let value = json!({
+            "schema": transport::DOMAIN_TRANSPORT,
+            "format": "weft.transport.v1",
+            "flags": parsed.header.flags,
+            "section_count": parsed.header.section_count,
+            "section_table_offset": parsed.header.section_table_offset,
+            "total_len": parsed.header.total_len,
+            "payload_hash": parsed.header.payload_hash.to_hex(),
+            "sections": sections,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| Error::io(format!("cannot serialize transport: {e}")))?
+        );
+    } else {
+        println!(
+            "weft.transport.v1 sections={} total_len={} payload_hash={}",
+            parsed.header.section_count, parsed.header.total_len, parsed.header.payload_hash
+        );
+        for (index, section) in parsed.sections.iter().enumerate() {
+            println!(
+                "  [{index}] offset={} length={} alignment={} mode={} role={} root={}",
+                section.offset,
+                section.length,
+                section.alignment,
+                section.mode,
+                section.role,
+                section.root
+            );
+        }
+    }
+    Ok(())
+}
+
+fn transport_verify(input: &str, as_json: bool) -> Result<()> {
+    let limits = Limits::default();
+    let bytes = read_limited(input, limits.max_total_fetched_bytes)?;
+    let parsed = transport::verify(&bytes, &limits)?;
+    if as_json {
+        let value = json!({
+            "schema": "weft.transport.v1",
+            "verified": true,
+            "section_count": parsed.header.section_count,
+            "total_len": parsed.header.total_len,
+            "payload_hash": parsed.header.payload_hash.to_hex(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| Error::io(format!("cannot serialize transport verify: {e}")))?
+        );
+    } else {
+        println!(
+            "ok: {} sections, {} bytes, payload_hash {}",
+            parsed.header.section_count, parsed.header.total_len, parsed.header.payload_hash
+        );
+    }
+    Ok(())
+}
+
+fn transport_read_section(input: &str, index: u32, output: &str, as_json: bool) -> Result<()> {
+    let limits = Limits::default();
+    let file = fs::File::open(input)
+        .map_err(|e| Error::io(format!("cannot open {input}: {e}")))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| Error::io(format!("cannot stat {input}: {e}")))?
+        .len();
+    let reader = FileRange { file };
+    let header_bytes = reader.read_range(0, transport::HEADER_LEN as u64)?;
+    let header = transport::read_header(&header_bytes)?;
+    if header.total_len != file_len {
+        return Err(Error::malformed(format!(
+            "transport total_len {} does not match the file's {file_len} bytes",
+            header.total_len
+        )));
+    }
+    let table_len = u64::from(header.section_count)
+        .checked_mul(transport::SECTION_ENTRY_LEN as u64)
+        .ok_or_else(|| Error::limit_exceeded("transport table length overflows u64"))?;
+    let table = reader.read_range(transport::HEADER_LEN as u64, table_len)?;
+    let sections = transport::read_section_table(&header, &table)?;
+    let section = *sections.get(index as usize).ok_or_else(|| {
+        Error::parse(format!(
+            "section index {index} is outside the {} sections",
+            sections.len()
+        ))
+    })?;
+    let bytes = transport::fetch_section(&reader, &section)?;
+    transport::verify_section_bytes(&section, &bytes, &limits)?;
+    write_output(output, &bytes)?;
+    if as_json {
+        let value = json!({
+            "schema": "weft.transport.v1",
+            "section": index,
+            "offset": section.offset,
+            "length": section.length,
+            "alignment": section.alignment,
+            "mode": section.mode,
+            "role": section.role.as_str(),
+            "root": section.root.to_hex(),
+            "bytes_read": bytes.len(),
+            "payload_hash_verified": false,
+            "note": "a single-section read verifies the section root, not the whole-container payload_hash",
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| Error::io(format!("cannot serialize section read: {e}")))?
+        );
     }
     Ok(())
 }

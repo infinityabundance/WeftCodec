@@ -50,6 +50,7 @@ pub mod sparse_delta;
 pub mod stream;
 pub mod tensor;
 pub mod tensor_sharded;
+pub mod transport;
 pub mod varint;
 pub mod wcb;
 pub mod weight_delta;
@@ -122,6 +123,15 @@ pub use tensor::{
 pub use tensor_sharded::{
     assemble_sharded_words, decode_shard_frame, encode_shard_frame, encode_sharded_tensor,
     shard_set_root, DecodedTensorShard, ShardedDtype, ShardedTensorInput, TensorShardedMeta,
+};
+pub use transport::{
+    allowed_alignment, create as create_transport, fetch_section,
+    parse_metadata as parse_transport, read_header as read_transport_header, read_section_table,
+    verify as verify_transport, verify_payload as verify_transport_payload, verify_section_bytes,
+    RangeReader, Section, SectionRole, Transport, TransportFrame, TransportHeader, ALIGNMENTS,
+    DOMAIN_TRANSPORT, FORMAT_MAJOR as TRANSPORT_MAJOR, FORMAT_MINOR as TRANSPORT_MINOR,
+    HEADER_LEN as TRANSPORT_HEADER_LEN, MAGIC as TRANSPORT_MAGIC, MAX_SECTIONS,
+    SECTION_ENTRY_LEN as TRANSPORT_SECTION_ENTRY_LEN,
 };
 pub use weight_delta::{
     base_frame_descriptor, decode_frame as decode_weight_delta, decode_with_base_frame,

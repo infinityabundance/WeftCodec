@@ -8061,6 +8061,376 @@ fn write_engram_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     Ok(())
 }
 
+
+// ---------------------------------------------------------------------------
+// weft.transport.v1 — transport-aligned frame containers
+// ---------------------------------------------------------------------------
+
+/// Generate the `weft.transport.v1` vectors into `<dir>/transport`.
+pub fn generate_transport_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let transport_dir = dir.join("transport");
+    fs::create_dir_all(&transport_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", transport_dir.display())))?;
+    write_transport_vectors(&transport_dir, limits)
+}
+
+fn transport_frame(text: &[u8], salt: u64, limits: &Limits) -> Result<Vec<u8>> {
+    let mut payload = text.to_vec();
+    payload.extend_from_slice(&salt.to_le_bytes());
+    modes::encode_raw(&payload, None, limits)
+}
+
+fn write_transport_valid(
+    dir: &Path,
+    name: &str,
+    container: &[u8],
+    note: &str,
+    limits: &Limits,
+) -> Result<()> {
+    use crate::transport;
+    // Self-check: every valid vector must fully verify with this encoder.
+    transport::verify(container, limits)?;
+    let header = transport::read_header(container)?;
+    let table_end = 4096 + header.section_count as usize * transport::SECTION_ENTRY_LEN;
+    let sections = transport::read_section_table(&header, &container[4096..table_end])?;
+    let value = json!({
+        "schema": "weft.transport.v1",
+        "name": name,
+        "alignment": sections.first().map(|s| s.alignment).unwrap_or(4096),
+        "section_count": header.section_count,
+        "total_len": header.total_len,
+        "payload_hash": header.payload_hash.to_hex(),
+        "section_roles": sections.iter().map(|s| s.role.as_str()).collect::<Vec<_>>(),
+        "container_hex": hexs(container),
+        "note": note,
+    });
+    write_json(&dir.join(format!("{name}.json")), &value)
+}
+
+fn write_transport_reject(
+    dir: &Path,
+    name: &str,
+    class: ErrorClass,
+    container: &[u8],
+    reason: &str,
+    limits: &Limits,
+) -> Result<()> {
+    use crate::transport;
+    let err = transport::verify(container, limits).err().ok_or_else(|| {
+        Error::malformed(format!("transport reject vector {name} unexpectedly verified"))
+    })?;
+    if err.class() != class {
+        return Err(Error::malformed(format!(
+            "transport reject vector {name} produced {} instead of {} ({})",
+            err.class(),
+            class,
+            err.message()
+        )));
+    }
+    let value = json!({
+        "schema": "weft.transport.v1",
+        "name": name,
+        "expect_error": class.as_str(),
+        "reject": reason,
+        "container_hex": hexs(container),
+        "note": reason,
+    });
+    write_json(&dir.join(format!("{name}.json")), &value)
+}
+
+fn write_transport_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    use crate::transport::{self, SectionRole, TransportFrame};
+
+    let a = transport_frame(b"transport section alpha", 1, limits)?;
+    let b = transport_frame(b"transport section beta", 2, limits)?;
+    let mut many = Vec::new();
+    for index in 0..8u64 {
+        many.push(transport_frame(
+            format!("transport section {index}").as_bytes(),
+            100 + index,
+            limits,
+        )?);
+    }
+
+    let single_512 = transport::create(
+        &[TransportFrame::new(&a, SectionRole::Payload)],
+        512,
+        limits,
+    )?;
+    write_transport_valid(
+        dir,
+        "001_align512_single",
+        &single_512,
+        "one raw frame at 512-byte alignment; the table ends at 4152 and the section starts at 4608",
+        limits,
+    )?;
+
+    let single_4096 = transport::create(
+        &[TransportFrame::new(&a, SectionRole::Payload)],
+        4096,
+        limits,
+    )?;
+    write_transport_valid(
+        dir,
+        "002_align4096_single",
+        &single_4096,
+        "one raw frame at 4096-byte alignment",
+        limits,
+    )?;
+
+    let single_65536 = transport::create(
+        &[TransportFrame::new(&a, SectionRole::Payload)],
+        65536,
+        limits,
+    )?;
+    write_transport_valid(
+        dir,
+        "003_align65536_single",
+        &single_65536,
+        "one raw frame at 65536-byte alignment; the section starts at 65536 and the tail pads to 131072",
+        limits,
+    )?;
+
+    let eight_frames: Vec<TransportFrame<'_>> = many
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            let role = if index == 0 {
+                SectionRole::Payload
+            } else {
+                SectionRole::Dependency
+            };
+            TransportFrame::new(frame.as_slice(), role)
+        })
+        .collect();
+    let eight = transport::create(&eight_frames, 4096, limits)?;
+    write_transport_valid(
+        dir,
+        "004_align4096_eight_sections",
+        &eight,
+        "eight sections preserve supplied order; offsets are strictly increasing multiples of 4096",
+        limits,
+    )?;
+
+    let pair = transport::create(
+        &[
+            TransportFrame::new(&b, SectionRole::Dependency),
+            TransportFrame::new(&a, SectionRole::Payload),
+        ],
+        512,
+        limits,
+    )?;
+    write_transport_valid(
+        dir,
+        "005_align512_two_roles",
+        &pair,
+        "roles are hints: dependency then payload, 512-byte alignment",
+        limits,
+    )?;
+
+    // ---- rejects ---------------------------------------------------------
+    let first_entry = transport::HEADER_LEN;
+    let second_entry = first_entry + transport::SECTION_ENTRY_LEN;
+    let table_end = transport::HEADER_LEN + transport::SECTION_ENTRY_LEN;
+
+    let mut bad = single_4096.clone();
+    bad[0] = b'X';
+    write_transport_reject(
+        dir,
+        "010_bad_magic",
+        ErrorClass::Malformed,
+        &bad,
+        "magic is XFTT",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad[4] = 2;
+    write_transport_reject(
+        dir,
+        "011_bad_version",
+        ErrorClass::UnsupportedVersion,
+        &bad,
+        "format_major is 2",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad[8..12].copy_from_slice(&1u32.to_le_bytes());
+    write_transport_reject(
+        dir,
+        "012_nonzero_flags",
+        ErrorClass::UnsupportedFeature,
+        &bad,
+        "flags is 1; v1 reserves every flag",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad[12..16].copy_from_slice(&0u32.to_le_bytes());
+    write_transport_reject(
+        dir,
+        "013_zero_sections",
+        ErrorClass::Malformed,
+        &bad,
+        "section_count is 0",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad[16..24].copy_from_slice(&0u64.to_le_bytes());
+    write_transport_reject(
+        dir,
+        "014_wrong_table_offset",
+        ErrorClass::Malformed,
+        &bad,
+        "section_table_offset is 0 instead of 4096",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    let offset = u64::from_le_bytes(bad[first_entry..first_entry + 8].try_into().unwrap());
+    bad[first_entry..first_entry + 8].copy_from_slice(&(offset + 1).to_le_bytes());
+    write_transport_reject(
+        dir,
+        "015_misaligned_offset",
+        ErrorClass::Malformed,
+        &bad,
+        "the first section offset is one byte past a 4096-byte boundary",
+        limits,
+    )?;
+
+    let mut bad = eight.clone();
+    let first_offset = u64::from_le_bytes(bad[first_entry..first_entry + 8].try_into().unwrap());
+    let second_offset =
+        u64::from_le_bytes(bad[second_entry..second_entry + 8].try_into().unwrap());
+    // Widen section 0 so it runs into section 1.
+    let widened = second_offset - first_offset + 16;
+    bad[first_entry + 8..first_entry + 16].copy_from_slice(&widened.to_le_bytes());
+    write_transport_reject(
+        dir,
+        "016_overlapping_sections",
+        ErrorClass::Malformed,
+        &bad,
+        "section 0 was widened past the start of section 1",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    let total = u64::from_le_bytes(bad[24..32].try_into().unwrap());
+    bad[first_entry + 8..first_entry + 16].copy_from_slice(&total.to_le_bytes());
+    write_transport_reject(
+        dir,
+        "017_out_of_bounds_section",
+        ErrorClass::Malformed,
+        &bad,
+        "the section length reaches past total_len",
+        limits,
+    )?;
+
+    let mut bad = eight.clone();
+    bad[second_entry..second_entry + 8].copy_from_slice(&first_offset.to_le_bytes());
+    write_transport_reject(
+        dir,
+        "018_duplicate_offsets",
+        ErrorClass::Malformed,
+        &bad,
+        "sections 0 and 1 name the same offset",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad[12..16].copy_from_slice(&2u32.to_le_bytes());
+    write_transport_reject(
+        dir,
+        "019_table_count_mismatch",
+        ErrorClass::Malformed,
+        &bad,
+        "section_count is 2 but only one entry was written; the second reads as an undefined alignment",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad[table_end] = 1;
+    write_transport_reject(
+        dir,
+        "020_padding_not_zero",
+        ErrorClass::Malformed,
+        &bad,
+        "one byte of alignment padding is 1",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad[first_entry + 24] ^= 0x01;
+    write_transport_reject(
+        dir,
+        "021_wrong_section_root",
+        ErrorClass::Corrupt,
+        &bad,
+        "the table root differs from the enclosed frame's content_hash",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad.truncate(bad.len() - 1);
+    write_transport_reject(
+        dir,
+        "022_truncated_container",
+        ErrorClass::Malformed,
+        &bad,
+        "the object is one byte shorter than total_len",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    let mode = bad[first_entry + 20];
+    bad[first_entry + 20] = if mode == 0 { 1 } else { 0 };
+    write_transport_reject(
+        dir,
+        "023_mode_mismatch",
+        ErrorClass::Corrupt,
+        &bad,
+        "the table mode differs from the enclosed frame header mode",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad[first_entry + 16..first_entry + 20].copy_from_slice(&1024u32.to_le_bytes());
+    write_transport_reject(
+        dir,
+        "024_disallowed_alignment",
+        ErrorClass::Malformed,
+        &bad,
+        "alignment 1024 is not one of 512, 4096, 65536",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad[first_entry + 21] = 9;
+    write_transport_reject(
+        dir,
+        "025_unknown_role",
+        ErrorClass::Malformed,
+        &bad,
+        "role 9 is not defined in v1",
+        limits,
+    )?;
+
+    let mut bad = single_4096.clone();
+    bad[64] = 1;
+    write_transport_reject(
+        dir,
+        "026_header_reserved_nonzero",
+        ErrorClass::Malformed,
+        &bad,
+        "a reserved header byte after payload_hash is non-zero",
+        limits,
+    )?;
+
+    Ok(())
+}
+
 fn base_parsed_content(frame: &[u8], limits: &Limits) -> Result<Hash32> {
     Ok(Frame::parse(frame, limits)?.header.content_hash)
 }
