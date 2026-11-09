@@ -2,9 +2,9 @@
 
 Status: **normative for the MW2 surfaces implemented in subphase R4.** The
 single-committer surfaces documented here are already implemented and frozen;
-the optimistic-committer surfaces are implemented in Rust and Go for the
-`local` and `object` commit planes and in Rust for `s3`/`gcs`/`azure`. Anything
-not listed as implemented in §12 is specified design, not a claim.
+the optimistic-committer surfaces are implemented in Rust for the `local`,
+`object`, `3fs`, and `s3` commit planes and in Go for `local` and `object`.
+Everything not listed as implemented in §12 is specified design, not a claim.
 
 Version: `weft.multiwriter/v1`.
 
@@ -124,10 +124,10 @@ Primitive per backend:
 
 | backend | conditional head | publication helper | concurrency proof |
 |---|---|---|---|
-| `local`, `object` | read–verify–write under a short publication lock on `LOCK.publish` (`fcntl` OFD + compatibility `flock`), then one 4 KiB slot write | store acquires the publication lock for the critical section only | the publication lock serialises only the head critical section; prepare and encode run outside it |
+| `local`, `object`, `3fs` | read–verify–write under a short publication lock on `LOCK.publish` (`fcntl` OFD + compatibility `flock`), then one 4 KiB slot write | store acquires the publication lock for the critical section only | the publication lock serialises only the head critical section; prepare and encode run outside it |
 | `s3` | `GET` + `PUT` with `If-Match: <ETag>` on `superblock` | native conditional write | the object store's conditional PUT |
-| `gcs` | metadata+media read, then upload with `ifGenerationMatch=<observed>` | native conditional write | the object store's generation precondition |
-| `azure` | `Get Blob` + `Put Blob` with `If-Match: <ETag>` | native conditional write | the object store's conditional PUT |
+| `gcs` *(specified only; refused in R4)* | metadata+media read, then upload with `ifGenerationMatch=<observed>` | native conditional write | the object store's generation precondition |
+| `azure` *(specified only; refused in R4)* | `Get Blob` + `Put Blob` with `If-Match: <ETag>` | native conditional write | the object store's conditional PUT |
 
 `LOCK.publish` is **not** the single-writer `LOCK`. It is created lazily only
 by an optimistic store, is never read for correctness, and carries no bytes
@@ -467,9 +467,9 @@ exact.
 |---|---|---|---|
 | MW0 blob workers | yes, frozen | yes | `tests/parallel_checkpoint.rs`, `store/group_test.go` |
 | MW1 single committer | yes, default | yes, default | all pre-R4 suites |
-| MW2 explicit transaction API on `local`/`object` | yes | yes | `tests/multiwriter.rs`, `store/mw2_test.go` |
-| MW2 on `s3` (MinIO, Ceph RGW) | yes | no (R4) | `examples/bench_multiwriter.rs` MinIO receipt |
-| MW2 on `gcs`/`azure` | code path only, no concurrent court | no | not claimed |
+| MW2 explicit transaction API on `local`/`object`/`3fs` | yes | yes on `local`/`object` (no `3fs` in Go) | `tests/multiwriter.rs`, `store/mw2_test.go` |
+| MW2 on `s3` (MinIO) | yes | no (R4) | `scripts/bench_multiwriter.sh` MinIO row; receipt cited in `bench/RESULTS-multiwriter.md` |
+| MW2 on `gcs`/`azure` | **refused** `UnsupportedVersion` in R4 | no | not claimed |
 | MW2 for FUSE file mutations | **not implemented** | **not implemented** | FUSE remains MW1 |
 | MW2 for checkpoint publish | **not implemented as a generic path**; a tensor/shard set can be expressed as a transaction | no | not claimed |
 | mixed Rust/Go concurrent writers | yes | yes | `scripts/multiwriter_court.sh`, receipt `multiwriter-court-20261109T143346Z` (parity commit file and superblock byte-identical; 160/160 disjoint; 1/80 contended winner; finite history check) |
