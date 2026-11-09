@@ -283,7 +283,13 @@ digest = <64 hex>
 parent_generation = u64
 commit = <64 hex or "-">
 updated_ns = i64
+pins = [<64 hex manifest id>, ...]      # sorted, unique
 ```
+
+`pins` names the manifest ids the prepared transaction still needs. GC marks
+them while the record is live and within the grace window, which is what stops
+a concurrent or immediately following sweep from reclaiming a blob the eventual
+commit names.
 
 Protocol:
 
@@ -428,13 +434,16 @@ GC marks from:
    of live records.
 
 A prepared transaction pins only the blobs its ops name, not the whole store.
-GC is an **exclusive administration pass**: it may run concurrently with
-readers, but not with an optimistic publisher unless the implementation holds
-the publication lock. In R4 the `local`/`object` GC pass takes the publication
-lock while enumerating and deleting, and S3-family GC marks under the fenced
-administration lease. A prepared transaction older than the grace is treated as
-abandoned: GC may reclaim its unreferenced blobs and the record is deleted.
-This is safe because an abandoned prepared transaction has no commit naming it.
+GC is an **exclusive administration pass**. In R4 it does **not** run
+concurrently with an optimistic publisher: a caller that wants to run GC on an
+optimistic store must quiesce its committers first. The `pins` field is what
+makes the interleaving *prepared → GC → publish* exact; true concurrent
+GC/publication is not claimed in R4. The `local`/`object` GC pass does not take
+the publication lock, because it also republishes logical state for orphan
+removal; making that path transaction-aware is future work. A prepared
+transaction older than the grace is treated as abandoned: GC may reclaim its
+unreferenced blobs and the record is deleted. This is safe because an abandoned
+prepared transaction has no commit naming it.
 
 GC never deletes a blob named by a committed head or by a live (unexpired)
 prepared transaction. A test must demonstrate that a GC pass racing an
