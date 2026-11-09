@@ -66,12 +66,13 @@ pub use capability::{
     Rejection, VerifiedEnvelope,
 };
 pub use engram::{
-    decode_engram, decode_engram_without_dependencies, encode_engram,
-    encode_engram_with_dependencies, engram_group_root, engram_metadata, engram_region_groups,
-    parse_engram, parse_engram_descriptor, read_engram_groups, read_engram_region,
-    EngramDescriptor, EngramGroup, EngramInput, EngramMeta, EngramPrecision, EngramQuantization,
-    EngramReference, EngramStorage, ENGRAM_GROUP_CODEC, ENGRAM_HASH_BLAKE3, ENGRAM_HASH_SHA256,
-    ENGRAM_LAYOUT, ENGRAM_SCHEMA,
+    decode_engram, decode_engram_group, decode_engram_without_dependencies, encode_engram,
+    encode_engram_with_dependencies, engram_group_decode_count, engram_group_root, engram_metadata,
+    engram_region_groups, parse_engram, parse_engram_descriptor, read_engram_groups,
+    read_engram_groups_with, read_engram_region, read_engram_region_with,
+    reset_engram_group_decode_count, EngramDescriptor, EngramGroup, EngramInput, EngramMeta,
+    EngramPrecision, EngramQuantization, EngramReference, EngramStorage, ENGRAM_GROUP_CODEC,
+    ENGRAM_HASH_BLAKE3, ENGRAM_HASH_SHA256, ENGRAM_LAYOUT, ENGRAM_SCHEMA,
 };
 pub use error::{Error, ErrorClass, Result};
 pub use frame::{Dependency, Frame, FrameHeader, Mode};

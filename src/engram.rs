@@ -14,6 +14,7 @@
 //! and deliberately does **not** check the payload hash, frame trailer or
 //! whole-table content hash (the same caveat as the mode-15 prefix reader).
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::dependency::Resolver;
@@ -29,6 +30,28 @@ use crate::huffman;
 use crate::limits::Limits;
 use crate::tensor::{self, TensorDtype};
 use crate::wcb::{self, Value};
+
+thread_local! {
+    static ENGRAM_GROUP_DECODES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Reset the per-thread engram group decode counter.
+pub fn reset_engram_group_decode_count() {
+    ENGRAM_GROUP_DECODES.with(|counter| counter.set(0));
+}
+
+/// Number of engram row groups decoded on this thread since the last reset.
+///
+/// This is the counter a region-read court uses to prove untouched groups are
+/// never decoded. It is thread-local because a read runs on its calling
+/// thread; a parallel reader should sum the per-thread values.
+pub fn engram_group_decode_count() -> u64 {
+    ENGRAM_GROUP_DECODES.with(|counter| counter.get())
+}
+
+fn note_group_decode() {
+    ENGRAM_GROUP_DECODES.with(|counter| counter.set(counter.get().saturating_add(1)));
+}
 
 /// Canonical engram descriptor schema.
 pub const ENGRAM_SCHEMA: &str = "weft.ai.engram_shard.v1";
@@ -1063,25 +1086,19 @@ fn group_byte_len(meta: &EngramMeta, group: &EngramGroup) -> Result<u64> {
         .ok_or_else(|| Error::limit_exceeded("engram group byte length overflows u64"))
 }
 
-fn decode_inline_group(
+/// Decode one stored engram group and verify its `group_root`.
+///
+/// `stored` is exactly the group's recorded stored range. The returned bytes
+/// are the group's canonical row-major element bytes. This is the public
+/// single-group primitive a store range reader uses after fetching only that
+/// group's bytes.
+pub fn decode_engram_group(
     meta: &EngramMeta,
     group: &EngramGroup,
-    payload: &[u8],
-    offset: u64,
-    compressed_len: u64,
+    stored: &[u8],
     limits: &Limits,
 ) -> Result<Vec<u8>> {
-    let start = usize::try_from(offset)
-        .map_err(|_| Error::limit_exceeded("engram group offset does not fit usize"))?;
-    let end = start
-        .checked_add(
-            usize::try_from(compressed_len)
-                .map_err(|_| Error::limit_exceeded("engram group length does not fit usize"))?,
-        )
-        .ok_or_else(|| Error::limit_exceeded("engram group range overflows usize"))?;
-    let stored = payload
-        .get(start..end)
-        .ok_or_else(|| Error::corrupt("engram group range is outside the payload"))?;
+    note_group_decode();
     let element_len = group_byte_len(meta, group)?;
     let bytes = decode_group_planes(
         stored,
@@ -1108,6 +1125,28 @@ fn decode_inline_group(
     Ok(bytes)
 }
 
+fn decode_inline_group(
+    meta: &EngramMeta,
+    group: &EngramGroup,
+    payload: &[u8],
+    offset: u64,
+    compressed_len: u64,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let start = usize::try_from(offset)
+        .map_err(|_| Error::limit_exceeded("engram group offset does not fit usize"))?;
+    let end = start
+        .checked_add(
+            usize::try_from(compressed_len)
+                .map_err(|_| Error::limit_exceeded("engram group length does not fit usize"))?,
+        )
+        .ok_or_else(|| Error::limit_exceeded("engram group range overflows usize"))?;
+    let stored = payload
+        .get(start..end)
+        .ok_or_else(|| Error::corrupt("engram group range is outside the payload"))?;
+    decode_engram_group(meta, group, stored, limits)
+}
+
 struct FoundGroup {
     meta: EngramMeta,
     group: EngramGroup,
@@ -1132,6 +1171,38 @@ fn compatible_reference(
 /// replacement and is `Corrupt`.
 fn compatible_supersession(meta_a: &EngramMeta, meta_b: &EngramMeta) -> bool {
     meta_a.dtype == meta_b.dtype && meta_a.precision.storage_dtype == meta_b.precision.storage_dtype
+}
+
+fn resolve_engram_reference(
+    dependencies: &[Dependency],
+    root: Hash32,
+    resolver: &(impl Resolver + ?Sized),
+    limits: &Limits,
+    visiting: &mut BTreeSet<Hash32>,
+    depth: u64,
+) -> Result<Option<FoundGroup>> {
+    if depth == 0 {
+        return Ok(None);
+    }
+    for dep in dependencies {
+        if !visiting.insert(dep.hash) {
+            return Err(Error::dependency_cycle(
+                "engram dependency cycle while resolving a group",
+            ));
+        }
+        let found = match resolver.resolve_frame(&dep.hash)? {
+            Some(bytes) => {
+                let nested = Frame::parse(&bytes, limits)?;
+                find_group_in_frame(&nested, root, resolver, limits, visiting, depth - 1)?
+            }
+            None => None,
+        };
+        visiting.remove(&dep.hash);
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
 }
 
 /// Find a group root in a frame (or its dependencies) and decode it.
@@ -1166,39 +1237,21 @@ fn find_group_in_frame(
                 compressed_len,
                 limits,
             )?,
-            EngramStorage::Reference { dependency } => {
-                let dep = frame.dependencies.get(dependency as usize).ok_or_else(|| {
-                    Error::corrupt("engram reference dependency index is out of range")
+            EngramStorage::Reference { .. } => {
+                let found = resolve_engram_reference(
+                    &frame.dependencies,
+                    root,
+                    resolver,
+                    limits,
+                    visiting,
+                    depth - 1,
+                )?
+                .ok_or_else(|| {
+                    Error::dependency_missing(format!(
+                        "engram referenced group {root} is absent from its dependencies"
+                    ))
                 })?;
-                if !visiting.insert(dep.hash) {
-                    return Err(Error::dependency_cycle(
-                        "engram dependency cycle while resolving a referenced group",
-                    ));
-                }
-                let nested = resolver.resolve_frame(&dep.hash)?;
-                let found = match nested {
-                    Some(bytes) => {
-                        let nested_frame = Frame::parse(&bytes, limits)?;
-                        find_group_in_frame(
-                            &nested_frame,
-                            root,
-                            resolver,
-                            limits,
-                            visiting,
-                            depth - 1,
-                        )?
-                    }
-                    None => None,
-                };
-                visiting.remove(&dep.hash);
-                found
-                    .ok_or_else(|| {
-                        Error::dependency_missing(format!(
-                            "engram referenced group {root} is absent from dependency {}",
-                            dep.hash
-                        ))
-                    })?
-                    .bytes
+                found.bytes
             }
         };
         return Ok(Some(FoundGroup {
@@ -1207,25 +1260,7 @@ fn find_group_in_frame(
             bytes,
         }));
     }
-    for dep in &frame.dependencies {
-        if !visiting.insert(dep.hash) {
-            return Err(Error::dependency_cycle(
-                "engram dependency cycle while resolving a group",
-            ));
-        }
-        let found = match resolver.resolve_frame(&dep.hash)? {
-            Some(bytes) => {
-                let nested = Frame::parse(&bytes, limits)?;
-                find_group_in_frame(&nested, root, resolver, limits, visiting, depth - 1)?
-            }
-            None => None,
-        };
-        visiting.remove(&dep.hash);
-        if found.is_some() {
-            return Ok(found);
-        }
-    }
-    Ok(None)
+    resolve_engram_reference(&frame.dependencies, root, resolver, limits, visiting, depth)
 }
 
 /// Read explicit group indices. Returns the concatenated canonical group bytes
@@ -1240,6 +1275,48 @@ pub fn read_engram_groups<R: Resolver + ?Sized>(
     resolver: &R,
     limits: &Limits,
 ) -> Result<(Vec<u8>, Vec<u32>)> {
+    read_engram_groups_with(frame, descriptor, indices, resolver, limits, |group| {
+        let (offset, compressed_len) = match group.storage {
+            EngramStorage::Inline {
+                offset,
+                compressed_len,
+            } => (offset, compressed_len),
+            EngramStorage::Reference { .. } => return Ok(None),
+        };
+        let start = usize::try_from(offset)
+            .map_err(|_| Error::limit_exceeded("engram group offset does not fit usize"))?;
+        let end = start
+            .checked_add(
+                usize::try_from(compressed_len)
+                    .map_err(|_| Error::limit_exceeded("engram group length does not fit usize"))?,
+            )
+            .ok_or_else(|| Error::limit_exceeded("engram group range overflows usize"))?;
+        let stored = descriptor
+            .payload
+            .get(start..end)
+            .ok_or_else(|| Error::corrupt("engram group range is outside the payload"))?;
+        Ok(Some(stored.to_vec()))
+    })
+}
+
+/// Read explicit group indices with a caller-supplied stored-group fetch.
+///
+/// The fetch returns `Some(stored_bytes)` for an inline group, or `None` to
+/// let the resolver handle a reference. It lets a range reader fetch exactly
+/// one group's stored range from storage; the codec still decodes the planes
+/// and verifies the group root.
+pub fn read_engram_groups_with<R, F>(
+    frame: &Frame<'_>,
+    descriptor: &EngramDescriptor<'_>,
+    indices: &[u32],
+    resolver: &R,
+    limits: &Limits,
+    mut fetch: F,
+) -> Result<(Vec<u8>, Vec<u32>)>
+where
+    R: Resolver + ?Sized,
+    F: FnMut(&EngramGroup) -> Result<Option<Vec<u8>>>,
+{
     let mut unique: BTreeSet<u32> = BTreeSet::new();
     for index in indices {
         if *index as usize >= descriptor.meta.groups.len() {
@@ -1252,21 +1329,11 @@ pub fn read_engram_groups<R: Resolver + ?Sized>(
     let mut out = Vec::new();
     for index in &unique {
         let group = &descriptor.meta.groups[*index as usize];
-        let bytes = match group.storage {
-            EngramStorage::Inline {
-                offset,
-                compressed_len,
-            } => decode_inline_group(
-                &descriptor.meta,
-                group,
-                descriptor.payload,
-                offset,
-                compressed_len,
-                limits,
-            )?,
-            EngramStorage::Reference { .. } => {
-                let found = find_group_in_frame(
-                    frame,
+        let bytes = match fetch(group)? {
+            Some(stored) => decode_engram_group(&descriptor.meta, group, &stored, limits)?,
+            None => {
+                let found = resolve_engram_reference(
+                    &frame.dependencies,
                     group.group_root,
                     resolver,
                     limits,
@@ -1340,6 +1407,41 @@ pub fn read_engram_region<R: Resolver + ?Sized>(
         return Ok((Vec::new(), Vec::new()));
     }
     let (bytes, touched) = read_engram_groups(frame, descriptor, &indices, resolver, limits)?;
+    trim_engram_region(meta, &indices, row_start, row_end, bytes, touched)
+}
+
+/// [`read_engram_region`] with a caller-supplied stored-group fetch.
+pub fn read_engram_region_with<R, F>(
+    frame: &Frame<'_>,
+    descriptor: &EngramDescriptor<'_>,
+    row_start: u64,
+    row_end: u64,
+    resolver: &R,
+    limits: &Limits,
+    fetch: F,
+) -> Result<(Vec<u8>, Vec<u32>)>
+where
+    R: Resolver + ?Sized,
+    F: FnMut(&EngramGroup) -> Result<Option<Vec<u8>>>,
+{
+    let meta = &descriptor.meta;
+    let indices = engram_region_groups(meta, row_start, row_end)?;
+    if indices.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let (bytes, touched) =
+        read_engram_groups_with(frame, descriptor, &indices, resolver, limits, fetch)?;
+    trim_engram_region(meta, &indices, row_start, row_end, bytes, touched)
+}
+
+fn trim_engram_region(
+    meta: &EngramMeta,
+    indices: &[u32],
+    row_start: u64,
+    row_end: u64,
+    bytes: Vec<u8>,
+    touched: Vec<u32>,
+) -> Result<(Vec<u8>, Vec<u32>)> {
     let word = meta.dtype.element_size();
     let row_bytes = usize::try_from(
         meta.dim()
@@ -1469,8 +1571,8 @@ pub fn decode_engram<R: Resolver + ?Sized>(
                 limits,
             )?,
             EngramStorage::Reference { .. } => {
-                let found = find_group_in_frame(
-                    frame,
+                let found = resolve_engram_reference(
+                    &frame.dependencies,
                     group.group_root,
                     resolver,
                     limits,
