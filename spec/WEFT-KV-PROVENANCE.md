@@ -105,7 +105,7 @@ Schema: `weft.ai.kv_prov.v1`. Exactly these keys, no others:
 | Key | Type | Rule |
 |---|---|---|
 | `schema` | text | exactly `weft.ai.kv_prov.v1` |
-| `page` | map | the frozen mode-12 descriptor of `WEFT-AI-CODEC.md` §13.2 **without** its `schema` key: `model`, `layer`, `session`, `page_index`, `page_count`, `seq_start`, `seq_end`, `dtype`, `head_count`, `head_dim`, `shape`, `page_bytes`, `plane_codec`, `payload_len` (fourteen keys, no others) |
+| `page` | map | the frozen mode-12 descriptor of `WEFT-AI-CODEC.md` §13.2 **verbatim**, including its `schema` key: `schema` (`weft.ai.kv_cache.v1`), `model`, `layer`, `session`, `page_index`, `page_count`, `seq_start`, `seq_end`, `dtype`, `head_count`, `head_dim`, `shape`, `page_bytes`, `plane_codec`, `payload_len` (fifteen keys, no others) |
 | `model_root` | bytes | 32 bytes, non-zero |
 | `adapter_roots` | array(bytes) | sorted, unique, non-zero, may be empty |
 | `adapter_set_root` | bytes | `H("weft/kv/adapters/v1", WCB(adapter_roots))` |
@@ -120,6 +120,10 @@ Schema: `weft.ai.kv_prov.v1`. Exactly these keys, no others:
 
 `page.payload_len` is the exact stored payload length in bytes.
 `page.page_bytes` is the exact decoded page length.
+
+The `page` map is the canonical mode-12 descriptor value, so the frozen
+mode-12 validation is reused unchanged (including its `schema` check). The
+provenance dimensions and `payload_hash` sit beside it.
 
 ### 3.3 Identity
 
