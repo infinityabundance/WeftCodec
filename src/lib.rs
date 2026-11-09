@@ -38,6 +38,7 @@ pub mod generated;
 pub mod hash;
 pub mod huffman;
 pub mod kv_cache;
+pub mod kv_prov;
 pub mod limits;
 pub mod modes;
 pub mod selector;

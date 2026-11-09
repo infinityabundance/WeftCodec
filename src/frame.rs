@@ -106,6 +106,9 @@ pub enum Mode {
     /// plane is split into bounded interleaved streams
     /// (WEFT-AI-CODEC §19).
     FloatTiledStreams = 18,
+    /// One paged attention KV cache page bound to its provenance dimensions
+    /// (WEFT-AI-CODEC §20, WEFT-KV-PROVENANCE).
+    KvCacheProv = 19,
 }
 
 impl Mode {
@@ -131,7 +134,8 @@ impl Mode {
             16 => Ok(Mode::SparseDelta),
             17 => Ok(Mode::FloatTiled),
             18 => Ok(Mode::FloatTiledStreams),
-            19..=127 => Err(Error::unsupported_mode(format!(
+            19 => Ok(Mode::KvCacheProv),
+            20..=127 => Err(Error::unsupported_mode(format!(
                 "reserved mode {value} is not defined in v1"
             ))),
             128..=255 => Err(Error::unsupported_mode(format!(
@@ -167,6 +171,7 @@ impl Mode {
             Mode::SparseDelta => "sparse_delta",
             Mode::FloatTiled => "float_tiled",
             Mode::FloatTiledStreams => "float_tiled_streams",
+            Mode::KvCacheProv => "kv_cache_prov",
         }
     }
 
@@ -196,6 +201,9 @@ impl Mode {
             | "float_tile_streams"
             | "ftiled_streams"
             | "tiled_streams" => Ok(Mode::FloatTiledStreams),
+            "kv_prov" | "kv-prov" | "kv_cache_prov" | "kv-cache-prov" | "kcacheprov" => {
+                Ok(Mode::KvCacheProv)
+            }
             other => Err(Error::unsupported_mode(format!("unknown mode `{other}`"))),
         }
     }
@@ -866,7 +874,8 @@ fn validate_mode_rules(
         | Mode::ActivationStream
         | Mode::TensorTiled
         | Mode::FloatTiled
-        | Mode::FloatTiledStreams => {
+        | Mode::FloatTiledStreams
+        | Mode::KvCacheProv => {
             if header.domain != DOMAIN_PAYLOAD {
                 return Err(Error::malformed(
                     "AI-mode frames must use the payload domain",

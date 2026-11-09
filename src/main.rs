@@ -20,6 +20,7 @@ use weftcodec::error::{Error, ErrorClass, Result};
 use weftcodec::frame::{Frame, Mode};
 use weftcodec::hash::hash_domain;
 use weftcodec::kv_cache;
+use weftcodec::kv_prov;
 use weftcodec::limits::{self, Limits};
 use weftcodec::modes;
 use weftcodec::selector;
@@ -98,7 +99,7 @@ struct EncodeArgs {
     #[arg(
         long,
         default_value = "auto",
-        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "tensor_tiled", "tensor-tiled", "float_tiled", "float-tiled", "float_tiled_streams", "float-tiled-streams", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "sparse_delta", "sparse-delta", "kv_cache", "kv-cache", "activation_stream", "activation-stream", "auto"]
+        value_parser = ["raw", "zstd", "reference", "delta", "dictionary", "structured", "tensor", "tokens", "quantized", "quantized_tensor", "float_tensor", "float-tensor", "tensor_sharded", "tensor-sharded", "tensor_tiled", "tensor-tiled", "float_tiled", "float-tiled", "float_tiled_streams", "float-tiled-streams", "weight_delta", "weight-delta", "semantic_delta", "semantic-delta", "sparse_delta", "sparse-delta", "kv_cache", "kv-cache", "kv_prov", "kv-prov", "activation_stream", "activation-stream", "auto"]
     )]
     mode: String,
     /// Base bytes for reference/delta/auto.
@@ -122,6 +123,9 @@ struct EncodeArgs {
     /// TENSOR metadata JSON file: `{"dtype":"f32","shape":[2,3]}`.
     #[arg(long)]
     metadata: Option<String>,
+    /// KV_CACHE_PROV (mode 19) provenance JSON. Required for that mode.
+    #[arg(long)]
+    provenance: Option<String>,
     /// QUANTIZED_TENSOR affine scale (finite, > 0). Required for that mode.
     #[arg(long)]
     scale: Option<f64>,
@@ -601,6 +605,9 @@ struct ConformanceArgs {
     /// Write only the KV_CACHE (mode 12) vectors into `<dir>/kv-cache`.
     #[arg(long)]
     kv_cache_only: bool,
+    /// Write only the KV_CACHE_PROV (mode 19) vectors into `<dir>/kv-prov`.
+    #[arg(long)]
+    kv_prov_only: bool,
     /// Write only the ACTIVATION_STREAM (mode 13) vectors into
     /// `<dir>/activation-stream`.
     #[arg(long)]
@@ -717,6 +724,9 @@ fn run(cli: Cli) -> Result<()> {
             } else if args.kv_cache_only {
                 weftcodec::conformance::generate_kv_cache_v1(Path::new(&args.dir), &limits)?;
                 eprintln!("wrote kv-cache vectors to {}/kv-cache", args.dir);
+            } else if args.kv_prov_only {
+                weftcodec::conformance::generate_kv_prov_v1(Path::new(&args.dir), &limits)?;
+                eprintln!("wrote kv-prov vectors to {}/kv-prov", args.dir);
             } else if args.activation_stream_only {
                 weftcodec::conformance::generate_activation_stream_v1(
                     Path::new(&args.dir),
@@ -820,6 +830,10 @@ fn encode(args: EncodeArgs) -> Result<()> {
     } else if args.mode == "kv_cache" || args.mode == "kv-cache" {
         let input = kv_cache_input_args(&args)?;
         kv_cache::encode_kv_page(&input, &data, &limits)?
+    } else if args.mode == "kv_prov" || args.mode == "kv-prov" {
+        let input = kv_cache_input_args(&args)?;
+        let provenance = kv_prov_provenance_args(&args)?;
+        kv_prov::encode_kv_prov_page(&input, &data, &provenance, &limits)?
     } else if args.mode == "activation_stream" || args.mode == "activation-stream" {
         let (head, chunk_index) = activation_stream_input_args(&args, &limits)?;
         activation_stream::encode_activation_chunk(&head, chunk_index, &data, &limits)?
@@ -910,6 +924,9 @@ fn encode_mode(
         )),
         Mode::KvCache => Err(Error::malformed(
             "KV_CACHE encoding requires the dedicated CLI path with --metadata",
+        )),
+        Mode::KvCacheProv => Err(Error::malformed(
+            "KV_CACHE_PROV encoding requires the dedicated CLI path with --metadata and --provenance",
         )),
         Mode::ActivationStream => Err(Error::malformed(
             "ACTIVATION_STREAM encoding requires the dedicated CLI path with --metadata",
@@ -1193,6 +1210,199 @@ fn kv_cache_input_args(args: &EncodeArgs) -> Result<kv_cache::KvCacheInput> {
         head_count: input.head_count,
         head_dim: input.head_dim,
     })
+}
+
+/// Parse a KV_CACHE_PROV provenance document from `--provenance`.
+fn kv_prov_provenance_args(args: &EncodeArgs) -> Result<kv_prov::KvProvenanceInput> {
+    let path = args
+        .provenance
+        .as_deref()
+        .ok_or_else(|| Error::malformed("KV_CACHE_PROV encoding requires --provenance FILE"))?;
+    let bytes = read_limited(path, Limits::default().max_string_bytes)?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| {
+        Error::malformed(format!("KV_CACHE_PROV provenance is not valid JSON: {err}"))
+    })?;
+    kv_prov_document(&document)
+}
+
+fn kv_prov_hex_root(value: &serde_json::Value, field: &str) -> Result<weftcodec::Hash32> {
+    let text = value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::malformed(format!("provenance `{field}` must be a hex string")))?;
+    weftcodec::Hash32::from_hex(text)
+}
+
+fn kv_prov_u64(value: &serde_json::Value, field: &str) -> Result<u64> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| Error::malformed(format!("provenance `{field}` must be a u64")))
+}
+
+/// Map strict JSON onto a canonical WCB value. Floats are not representable in
+/// WCB and are rejected rather than rounded.
+fn kv_prov_wcb_value(value: &serde_json::Value) -> Result<weftcodec::wcb::Value> {
+    use weftcodec::wcb::Value;
+    Ok(match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(flag) => Value::Bool(*flag),
+        serde_json::Value::String(text) => Value::Str(text.clone()),
+        serde_json::Value::Number(number) => {
+            if let Some(unsigned) = number.as_u64() {
+                Value::U64(unsigned)
+            } else if let Some(signed) = number.as_i64() {
+                Value::I64(signed)
+            } else {
+                return Err(Error::malformed(
+                    "provenance extension numbers must be exact integers (WCB has no float)",
+                ));
+            }
+        }
+        serde_json::Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(kv_prov_wcb_value)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        serde_json::Value::Object(map) => {
+            let mut out = std::collections::BTreeMap::new();
+            for (key, item) in map {
+                out.insert(key.clone(), kv_prov_wcb_value(item)?);
+            }
+            Value::Map(out)
+        }
+    })
+}
+
+fn kv_prov_document(document: &serde_json::Value) -> Result<kv_prov::KvProvenanceInput> {
+    let object = document
+        .as_object()
+        .ok_or_else(|| Error::malformed("KV_CACHE_PROV provenance must be a JSON object"))?;
+    let allowed = [
+        "model_root",
+        "adapter_roots",
+        "adapter_set_root",
+        "tokenizer",
+        "tokenizer_root",
+        "attention",
+        "positional",
+        "layout",
+        "salt",
+        "extensions",
+    ];
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(Error::malformed(format!(
+                "unknown KV_CACHE_PROV provenance key `{key}`"
+            )));
+        }
+    }
+    let model_root = kv_prov_hex_root(document, "model_root")?;
+    let mut adapter_roots = Vec::new();
+    if let Some(items) = document.get("adapter_roots") {
+        let items = items
+            .as_array()
+            .ok_or_else(|| Error::malformed("provenance `adapter_roots` must be an array"))?;
+        for item in items {
+            let text = item
+                .as_str()
+                .ok_or_else(|| Error::malformed("provenance adapter roots must be hex strings"))?;
+            adapter_roots.push(weftcodec::Hash32::from_hex(text)?);
+        }
+    }
+    let tokenizer = document
+        .get("tokenizer")
+        .ok_or_else(|| Error::malformed("provenance `tokenizer` is required"))?;
+    let tokenizer_scheme = tokenizer
+        .get("scheme")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::malformed("provenance `tokenizer.scheme` must be a string"))?
+        .to_owned();
+    let tokenizer_vocab_size = kv_prov_u64(tokenizer, "vocab_size")?;
+    let attention = document
+        .get("attention")
+        .ok_or_else(|| Error::malformed("provenance `attention` is required"))?;
+    let attention = kv_prov::KvAttention {
+        head_count: u32::try_from(kv_prov_u64(attention, "head_count")?)
+            .map_err(|_| Error::malformed("provenance `attention.head_count` exceeds u32"))?,
+        head_dim: u32::try_from(kv_prov_u64(attention, "head_dim")?)
+            .map_err(|_| Error::malformed("provenance `attention.head_dim` exceeds u32"))?,
+        sliding_window: kv_prov_u64(attention, "sliding_window")?,
+        rope_theta_bits: kv_prov_u64(attention, "rope_theta_bits")?,
+        rope_scale_bits: kv_prov_u64(attention, "rope_scale_bits")?,
+    };
+    let positional = kv_prov::KvPositional::from_name(
+        document
+            .get("positional")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::malformed("provenance `positional` must be text"))?,
+    )?;
+    let layout = document
+        .get("layout")
+        .ok_or_else(|| Error::malformed("provenance `layout` is required"))?;
+    let layout = kv_prov::KvLayout {
+        dtype: kv_cache::KvDtype::from_name(
+            layout
+                .get("dtype")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::malformed("provenance `layout.dtype` must be text"))?,
+        )?,
+        page_rows: kv_prov_u64(layout, "page_rows")?,
+        layer_count: kv_prov_u64(layout, "layer_count")?,
+    };
+    let salt = kv_prov_hex_root(document, "salt")?;
+    let mut extensions = Vec::new();
+    if let Some(items) = document.get("extensions") {
+        let items = items
+            .as_array()
+            .ok_or_else(|| Error::malformed("provenance `extensions` must be an array"))?;
+        for item in items {
+            let name = item
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::malformed("provenance extension `name` must be text"))?;
+            let value = item
+                .get("value")
+                .ok_or_else(|| Error::malformed("provenance extension `value` is required"))?;
+            extensions.push(kv_prov::KvExtension::new(name, kv_prov_wcb_value(value)?));
+        }
+    }
+    let input = kv_prov::KvProvenanceInput {
+        model_root,
+        adapter_roots,
+        tokenizer_scheme,
+        tokenizer_vocab_size,
+        attention,
+        positional,
+        layout,
+        salt,
+        extensions,
+    };
+    // If the document declares derived roots, they must agree with what is
+    // recomputed. The codec never trusts a declared root.
+    let canonical = input.canonicalize()?;
+    if let Some(declared) = document.get("adapter_set_root") {
+        let declared = declared
+            .as_str()
+            .ok_or_else(|| Error::malformed("provenance `adapter_set_root` must be hex"))?;
+        if weftcodec::Hash32::from_hex(declared)? != canonical.adapter_set_root {
+            return Err(Error::malformed(
+                "provenance declared adapter_set_root disagrees with adapter_roots",
+            ));
+        }
+    }
+    if let Some(declared) = document.get("tokenizer_root") {
+        let declared = declared
+            .as_str()
+            .ok_or_else(|| Error::malformed("provenance `tokenizer_root` must be hex"))?;
+        if weftcodec::Hash32::from_hex(declared)? != canonical.tokenizer_root {
+            return Err(Error::malformed(
+                "provenance declared tokenizer_root disagrees with the tokenizer descriptor",
+            ));
+        }
+    }
+    Ok(input)
 }
 
 /// Parse an ACTIVATION_STREAM chunk descriptor from `--metadata`.
@@ -1609,6 +1819,28 @@ fn inspect(args: InspectArgs) -> Result<()> {
             output["page_bytes"] = json!(meta.page_bytes);
             output["plane_codec"] = json!(meta.plane_codec);
             output["payload_len"] = json!(meta.payload_len);
+        }
+        if header.mode == Mode::KvCacheProv {
+            let meta = kv_prov::kv_prov_metadata(&frame, &limits)?;
+            output["provenance_root"] = json!(meta.root(&limits)?.to_hex());
+            output["model"] = json!(meta.page.model);
+            output["layer"] = json!(meta.page.layer);
+            output["session"] = json!(meta.page.session);
+            output["page_index"] = json!(meta.page.page_index);
+            output["page_count"] = json!(meta.page.page_count);
+            output["seq_start"] = json!(meta.page.seq_start);
+            output["seq_end"] = json!(meta.page.seq_end);
+            output["dtype"] = json!(meta.page.dtype.as_str());
+            output["head_count"] = json!(meta.page.head_count);
+            output["head_dim"] = json!(meta.page.head_dim);
+            output["shape"] = json!(meta.page.shape);
+            output["page_bytes"] = json!(meta.page.page_bytes);
+            output["plane_codec"] = json!(meta.page.plane_codec);
+            output["payload_len"] = json!(meta.page.payload_len);
+            output["positional"] = json!(meta.provenance.positional.as_str());
+            output["adapter_set_root"] = json!(meta.provenance.adapter_set_root.to_hex());
+            output["tokenizer_root"] = json!(meta.provenance.tokenizer_root.to_hex());
+            output["salt"] = json!(meta.provenance.salt.to_hex());
         }
         if header.mode == Mode::ActivationStream {
             let meta = activation_stream::activation_chunk_metadata(&frame, &limits)?;

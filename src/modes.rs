@@ -225,6 +225,7 @@ pub fn decode_bytes(
         Mode::SemanticDelta => crate::semantic_delta::decode_frame(&frame, resolver, limits)?,
         Mode::SparseDelta => crate::sparse_delta::decode_frame(&frame, resolver, limits)?,
         Mode::KvCache => crate::kv_cache::decode_kv_page(&frame, limits)?.bytes,
+        Mode::KvCacheProv => crate::kv_prov::decode_kv_prov_page(&frame, limits)?.bytes,
         Mode::ActivationStream => {
             crate::activation_stream::decode_activation_chunk(&frame, limits)?.bytes
         }

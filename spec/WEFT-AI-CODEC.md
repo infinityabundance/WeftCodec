@@ -24,17 +24,18 @@ and `decoded_len`; the domains below are the additional, mode-specific roots.
 | 16 | `SPARSE_DELTA` (`sparse-delta`) | `weft.ai.sparse_delta.v1` | `weft/tensor/values/v1` (`delta_root`) | v1 | normative | `conformance/v1/sparse-delta/001–004` + rejects |
 | 17 | `FLOAT_TILED` (`float-tiled`) | `weft.ai.float_tiled.v1` | `weft/tensor/float_tile/v1` (`tile_root`), `weft/tensor/values/v1` | v1 | normative | `conformance/v1/float-tiled/001–003` + rejects |
 | 18 | `FLOAT_TILED_STREAMS` (`float-tiled-streams`) | `weft.ai.tensor_tiled_streams.v1` | `weft/tensor/float_tile_streams/v1` (`tile_root`), `weft/tensor/values/v1` | v1 | normative | `conformance/v1/float-tiled-streams/001–004` + twelve rejects |
-| 19 | — | — | — | — | **reserved** | `conformance/v1/codec/017_unknown_mode_reserved19.json` (reject only) |
+| 19 | `KV_CACHE_PROV` (`kv-prov`) | `weft.ai.kv_prov.v1` | `weft/kv/prov/v1` (descriptor root), `weft/kv/adapters/v1`, `weft/kv/tokenizer/v1`, `weft/chunk/v1` | v1 | normative | `conformance/v1/kv-prov/001–008` + twelve rejects |
+| 20 | — | — | — | — | **reserved** | `conformance/v1/codec/017_unknown_mode_reserved20.json` (reject only) |
 
 Modes 0–5 (RAW, ZSTD, REFERENCE, DELTA, DICTIONARY, STRUCTURED) are defined in
-`WEFTCODEC-FORMAT.md`; this document covers 6–18; 19 is reserved. A value
-above 19 is `UnsupportedMode` by the frame parser. Vector paths in the last
+`WEFTCODEC-FORMAT.md`; this document covers 6–19; 20 is reserved. A value
+above 20 is `UnsupportedMode` by the frame parser. Vector paths in the last
 column are relative to the program home; the authoritative list, with sizes and
 digests, is `conformance/manifest.json`, and `scripts/check-conformance-coverage.sh`
-enforces that every mode 0–18 has valid **and** reject vectors.
+enforces that every mode 0–19 has valid **and** reject vectors.
 
 
-**Status: PARTIALLY IMPLEMENTED.** Exactly thirteen AI-native modes are normative
+**Status: PARTIALLY IMPLEMENTED.** Exactly fourteen AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 
 | Value | Name | Status | Frozen vectors |
@@ -52,6 +53,7 @@ and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 | 16 | `SPARSE_DELTA` (CLI `sparse-delta`) | **implemented** | `conformance/v1/sparse-delta/001`–`004` + fourteen rejects |
 | 17 | `FLOAT_TILED` (CLI `float-tiled`) | **implemented** | `conformance/v1/float-tiled/001`–`003` + eight rejects |
 | 18 | `FLOAT_TILED_STREAMS` (CLI `float-tiled-streams`) | **implemented** | `conformance/v1/float-tiled-streams/001`–`004` + twelve rejects |
+| 19 | `KV_CACHE_PROV` (CLI `kv-prov`) | **implemented** | `conformance/v1/kv-prov/001`–`008` + twelve rejects |
 
 Every other mode below is `specified, not implemented` and has **no allocated
 wire value**. Nothing in this document is a compression or performance claim.
@@ -2114,3 +2116,44 @@ Rejects: `101_n_streams_zero`, `102_n_streams_above_bound`,
 
 The reserved-mode reject moved to 19; `017_unknown_mode_reserved18` is
 retained and superseded.
+
+## 20. Mode 19 — `KV_CACHE_PROV` (implemented)
+
+Mode 19 binds the frozen mode-12 KV page to its provenance. The payload is the
+mode-12 payload **verbatim** (same byte planes, same per-plane
+`huffman-canonical-v1` streams, same `decoded_len`, same
+`content_hash = H("weft/chunk/v1", element bytes)`). The only wire difference
+is the descriptor envelope, which carries the complete mode-12 page descriptor
+plus the provenance dimensions and the payload hash.
+
+```text
+domain        = 0 (payload)
+mode          = 19
+flags         = 0
+dep_count     = 0
+chunk_count   = 0
+decoded_len   = page_bytes
+content_hash  = H("weft/chunk/v1", page element bytes)
+body          = u32le(descriptor_len) || WCB(descriptor) || mode-12 payload
+```
+
+Schema: `weft.ai.kv_prov.v1`. The identity is
+`descriptor_root = H("weft/kv/prov/v1", WCB(descriptor))`, derived (not stored)
+by the decoder. Because the descriptor includes every provenance dimension, the
+layout cross-checks, and the payload hash, two pages with identical token bytes
+but different provenance necessarily have different roots. A resolver that is
+asked for a page under a non-matching scope MUST fail closed and emit zero
+bytes.
+
+The normative definition — the ordered dimension registry, the exact key set,
+the cross-checks against the frozen page, the sharing-domain salt's purpose and
+non-claims, the validation order, and the store/capability scope — is
+`WEFT-KV-PROVENANCE.md`. Conformance vectors live in
+`conformance/v1/kv-prov/` and are byte-identical in both codec repositories.
+The reserved-mode reject moved to 20; `017_unknown_mode_reserved19` is retained
+and superseded.
+
+API: Rust `weftcodec::kv_prov` (`encode_kv_prov_page`, `decode_kv_prov_page`,
+`kv_prov_metadata`, `KvProvDescriptor::root`); Go `modes`
+(`EncodeKvProvPage`, `DecodeKvProvPage`, `KvProvMetadata`). CLI
+`--mode kv-prov` with `--metadata PAGE.json --provenance PROV.json`.

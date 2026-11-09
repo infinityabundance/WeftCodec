@@ -304,10 +304,25 @@ fn split_ai_body(body: &[u8]) -> Result<(&[u8], &[u8])> {
 
 fn parse_descriptor(bytes: &[u8], limits: &Limits) -> Result<KvCacheMeta> {
     let value = wcb::decode(bytes, limits)?;
+    parse_page_descriptor(&value, limits)
+}
+
+/// Parse and validate a mode-12 page descriptor from an already-decoded WCB
+/// value.
+///
+/// This is the exact frozen mode-12 descriptor validation, exposed so the
+/// additive mode 19 `KV_CACHE_PROV` descriptor can embed the same `page` map
+/// and validate it with one implementation. It performs no I/O and does not
+/// change any mode-12 byte.
+pub fn parse_page_descriptor(value: &Value, limits: &Limits) -> Result<KvCacheMeta> {
     let map = match value {
         Value::Map(map) => map,
         _ => return Err(Error::malformed("KV_CACHE metadata must be a WCB map")),
     };
+    parse_descriptor_map(map, limits)
+}
+
+fn parse_descriptor_map(map: &BTreeMap<String, Value>, limits: &Limits) -> Result<KvCacheMeta> {
     const KEYS: [&str; 15] = [
         "schema",
         "model",
@@ -400,7 +415,7 @@ fn build_planes(dtype: KvDtype, bytes: &[u8], element_count: usize) -> Vec<Vec<u
     planes
 }
 
-fn decode_planes(dtype: KvDtype, payload: &[u8], page_bytes: u64) -> Result<Vec<u8>> {
+pub fn decode_planes(dtype: KvDtype, payload: &[u8], page_bytes: u64) -> Result<Vec<u8>> {
     let word_bytes = dtype.word_bytes();
     if page_bytes % word_bytes != 0 {
         return Err(Error::malformed(

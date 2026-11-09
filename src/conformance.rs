@@ -26,6 +26,7 @@ use crate::hash::{
     DOMAIN_TENSOR_SHARDED_PAYLOAD, DOMAIN_TOKENS_PAYLOAD,
 };
 use crate::kv_cache;
+use crate::kv_prov;
 use crate::limits::Limits;
 use crate::modes;
 use crate::selector;
@@ -52,6 +53,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     let semantic_root_dir = dir.join("semantic-root");
     let semantic_delta_dir = dir.join("semantic-delta");
     let kv_cache_dir = dir.join("kv-cache");
+    let kv_prov_dir = dir.join("kv-prov");
     let activation_stream_dir = dir.join("activation-stream");
     let capability_dir = dir.join("capability");
     let tensor_tiled_dir = dir.join("tensor-tiled");
@@ -70,6 +72,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
         &semantic_root_dir,
         &semantic_delta_dir,
         &kv_cache_dir,
+        &kv_prov_dir,
         &activation_stream_dir,
         &capability_dir,
         &tensor_tiled_dir,
@@ -92,6 +95,7 @@ pub fn generate_v1(dir: &Path, limits: &Limits) -> Result<()> {
     write_semantic_root_vectors(&semantic_root_dir, limits)?;
     write_semantic_delta_vectors(&semantic_delta_dir, limits)?;
     write_kv_cache_vectors(&kv_cache_dir, limits)?;
+    write_kv_prov_vectors(&kv_prov_dir, limits)?;
     write_activation_stream_vectors(&activation_stream_dir, limits)?;
     write_capability_vectors(&capability_dir, limits)?;
     write_tiled_vectors(&tensor_tiled_dir, limits)?;
@@ -162,6 +166,14 @@ pub fn generate_kv_cache_v1(dir: &Path, limits: &Limits) -> Result<()> {
     fs::create_dir_all(&kv_cache_dir)
         .map_err(|e| Error::io(format!("cannot create {}: {e}", kv_cache_dir.display())))?;
     write_kv_cache_vectors(&kv_cache_dir, limits)
+}
+
+/// Generate only the KV_CACHE_PROV (mode 19) vectors into `<dir>/kv-prov`.
+pub fn generate_kv_prov_v1(dir: &Path, limits: &Limits) -> Result<()> {
+    let kv_prov_dir = dir.join("kv-prov");
+    fs::create_dir_all(&kv_prov_dir)
+        .map_err(|e| Error::io(format!("cannot create {}: {e}", kv_prov_dir.display())))?;
+    write_kv_prov_vectors(&kv_prov_dir, limits)
 }
 
 /// Generate only the ACTIVATION_STREAM (mode 13) vectors into
@@ -727,9 +739,24 @@ fn write_codec_vectors(dir: &Path, limits: &Limits) -> Result<()> {
     let mut unknown_mode = good.clone();
     unknown_mode[7] = 19;
     refix_header_and_trailer(&mut unknown_mode);
-    push_error(
+    push_error_superseded(
         &mut vectors,
         "017_unknown_mode_reserved19",
+        "raw",
+        &unknown_mode,
+        &[],
+        ErrorClass::UnsupportedMode,
+        None,
+        "017_unknown_mode_reserved20",
+        "Historical: this vector asserted that mode value 19 was reserved. WEFT-AI-CODEC allocates 19 to KV_CACHE_PROV, so the authoritative unknown-mode vector is 017_unknown_mode_reserved20. The frozen bytes and original expectation are retained unchanged.",
+    );
+
+    let mut unknown_mode = good.clone();
+    unknown_mode[7] = 20;
+    refix_header_and_trailer(&mut unknown_mode);
+    push_error(
+        &mut vectors,
+        "017_unknown_mode_reserved20",
         "raw",
         &unknown_mode,
         &[],
@@ -4420,6 +4447,713 @@ fn write_kv_cache_vectors(dir: &Path, limits: &Limits) -> Result<()> {
         )?,
         ErrorClass::Malformed,
         "declared payload_len is one byte larger than the stored payload",
+    )?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mode 19 KV_CACHE_PROV
+// ---------------------------------------------------------------------------
+
+fn wcb_to_json(value: &Value) -> Json {
+    match value {
+        Value::Null => Json::Null,
+        Value::Bool(flag) => json!(flag),
+        Value::U64(number) => json!(number),
+        Value::I64(number) => json!(number),
+        Value::Timestamp(number) => json!(number),
+        Value::Str(text) => json!(text),
+        Value::Bytes(bytes) => json!(hexs(bytes)),
+        Value::Array(items) => Json::Array(items.iter().map(wcb_to_json).collect()),
+        Value::Map(map) => {
+            let mut object = serde_json::Map::with_capacity(map.len());
+            for (key, item) in map {
+                object.insert(key.clone(), wcb_to_json(item));
+            }
+            Json::Object(object)
+        }
+    }
+}
+
+fn kv_prov_json(provenance: &kv_prov::KvProvenance) -> Json {
+    json!({
+        "model_root": provenance.model_root.to_hex(),
+        "adapter_roots": provenance.adapter_roots.iter().map(|root| root.to_hex()).collect::<Vec<_>>(),
+        "adapter_set_root": provenance.adapter_set_root.to_hex(),
+        "tokenizer": {
+            "scheme": provenance.tokenizer_scheme,
+            "vocab_size": provenance.tokenizer_vocab_size,
+        },
+        "tokenizer_root": provenance.tokenizer_root.to_hex(),
+        "attention": {
+            "head_count": provenance.attention.head_count,
+            "head_dim": provenance.attention.head_dim,
+            "sliding_window": provenance.attention.sliding_window,
+            "rope_theta_bits": provenance.attention.rope_theta_bits,
+            "rope_scale_bits": provenance.attention.rope_scale_bits,
+        },
+        "positional": provenance.positional.as_str(),
+        "layout": {
+            "dtype": provenance.layout.dtype.as_str(),
+            "page_rows": provenance.layout.page_rows,
+            "layer_count": provenance.layout.layer_count,
+        },
+        "salt": provenance.salt.to_hex(),
+        "extensions": provenance
+            .extensions
+            .iter()
+            .map(|extension| json!({
+                "name": extension.name,
+                "value": wcb_to_json(&extension.value),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn write_kv_prov_valid(
+    dir: &Path,
+    name: &str,
+    pages: &[(kv_cache::KvCacheInput, Vec<u8>, kv_prov::KvProvenanceInput)],
+    limits: &Limits,
+) -> Result<()> {
+    let mut page_json = Vec::with_capacity(pages.len());
+    let mut first_root = String::new();
+    for (input, elements, provenance) in pages {
+        let frame = kv_prov::encode_kv_prov_page(input, elements, provenance, limits)?;
+        let parsed = Frame::parse(&frame, limits)?;
+        let decoded = kv_prov::decode_kv_prov_page(&parsed, limits)?;
+        if decoded.bytes != *elements {
+            return Err(Error::corrupt(
+                "KV_CACHE_PROV vector does not reconstruct its elements",
+            ));
+        }
+        let again = kv_prov::encode_kv_prov_page(input, elements, provenance, limits)?;
+        if again != frame {
+            return Err(Error::corrupt(
+                "KV_CACHE_PROV encoding is not deterministic",
+            ));
+        }
+        let root = decoded.root.to_hex();
+        if first_root.is_empty() {
+            first_root = root.clone();
+        }
+        page_json.push(json!({
+            "page_index": decoded.descriptor.page.page_index,
+            "seq_start": decoded.descriptor.page.seq_start,
+            "seq_end": decoded.descriptor.page.seq_end,
+            "page_rows": decoded.descriptor.page.shape[0],
+            "page_bytes": decoded.descriptor.page.page_bytes,
+            "payload_len": decoded.descriptor.page.payload_len,
+            "descriptor_root": root,
+            "elements_hex": hexs(elements),
+            "frame_hex": hexs(&frame),
+        }));
+    }
+    let first = &pages[0].0;
+    let provenance = pages[0].2.canonicalize()?;
+    let vector = json!({
+        "name": name,
+        "schema": kv_prov::KV_PROV_SCHEMA,
+        "model": first.model,
+        "layer": first.layer,
+        "session": first.session,
+        "dtype": first.dtype.as_str(),
+        "head_count": first.head_count,
+        "head_dim": first.head_dim,
+        "page_count": first.page_count,
+        "descriptor_root": first_root,
+        "provenance": kv_prov_json(&provenance),
+        "pages": page_json,
+        "expect": { "ok": true },
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+/// Build a mode-19 frame around an arbitrary descriptor value. Used only to
+/// construct reject vectors; the result is re-parsed and decoded by the caller.
+fn kv_prov_frame_value(
+    value: Value,
+    payload: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let descriptor = wcb::encode(&value, limits)?;
+    kv_prov_frame_bytes(&descriptor, payload, decoded_len, content_hash, limits)
+}
+
+fn kv_prov_frame_bytes(
+    descriptor: &[u8],
+    payload: &[u8],
+    decoded_len: u64,
+    content_hash: Hash32,
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    let len = u32::try_from(descriptor.len())
+        .map_err(|_| Error::limit_exceeded("KV_CACHE_PROV descriptor does not fit u32"))?;
+    let mut body = Vec::with_capacity(4 + descriptor.len() + payload.len());
+    body.extend_from_slice(&len.to_le_bytes());
+    body.extend_from_slice(descriptor);
+    body.extend_from_slice(payload);
+    build_frame(
+        Mode::KvCacheProv,
+        DOMAIN_PAYLOAD,
+        0,
+        decoded_len,
+        content_hash,
+        &[],
+        &body,
+        limits,
+    )
+}
+
+fn kv_prov_reject(
+    dir: &Path,
+    name: &str,
+    frame: &[u8],
+    expected: ErrorClass,
+    note: &str,
+) -> Result<()> {
+    let vector = json!({
+        "name": name,
+        "expect_error": expected.as_str(),
+        "note": note,
+        "frame_hex": hexs(frame),
+    });
+    write_json(&dir.join(format!("{name}.json")), &vector)
+}
+
+fn kv_prov_provenance(
+    model_root: Hash32,
+    adapters: &[Hash32],
+    tokenizer_scheme: &str,
+    tokenizer_vocab: u64,
+    attention: kv_prov::KvAttention,
+    positional: kv_prov::KvPositional,
+    layout: kv_prov::KvLayout,
+    salt: Hash32,
+    extensions: &[kv_prov::KvExtension],
+) -> kv_prov::KvProvenanceInput {
+    kv_prov::KvProvenanceInput {
+        model_root,
+        adapter_roots: adapters.to_vec(),
+        tokenizer_scheme: tokenizer_scheme.to_owned(),
+        tokenizer_vocab_size: tokenizer_vocab,
+        attention,
+        positional,
+        layout,
+        salt,
+        extensions: extensions.to_vec(),
+    }
+}
+
+fn write_kv_prov_vectors(dir: &Path, limits: &Limits) -> Result<()> {
+    let root = |byte: u8| Hash32::from_bytes([byte; 32]);
+    let rope = |head_count: u32, head_dim: u32| kv_prov::KvAttention {
+        head_count,
+        head_dim,
+        sliding_window: 0,
+        rope_theta_bits: 10_000.0f64.to_bits(),
+        rope_scale_bits: 1.0f64.to_bits(),
+    };
+    let bf16_input = |layer: u32, page_index: u64, page_count: u64| kv_cache::KvCacheInput {
+        model: "qwen-prov-0.5b".to_owned(),
+        layer,
+        session: "sess-prov".to_owned(),
+        page_index,
+        page_count,
+        seq_start: page_index * 4,
+        seq_end: page_index * 4 + 4,
+        dtype: kv_cache::KvDtype::Bf16,
+        head_count: 2,
+        head_dim: 4,
+    };
+    let bf16_layout = kv_prov::KvLayout {
+        dtype: kv_cache::KvDtype::Bf16,
+        page_rows: 4,
+        layer_count: 24,
+    };
+
+    // 001: bf16, single layer, empty adapter set.
+    write_kv_prov_valid(
+        dir,
+        "001_bf16_single_layer",
+        &[(
+            bf16_input(0, 0, 1),
+            kv_words_bf16(0, 32),
+            kv_prov_provenance(
+                root(0x11),
+                &[],
+                "qwen-bpe",
+                151_936,
+                rope(2, 4),
+                kv_prov::KvPositional::Rope,
+                bf16_layout,
+                root(0xA0),
+                &[],
+            ),
+        )],
+        limits,
+    )?;
+
+    // 002: fp16 with a two-adapter set and a sliding window.
+    let fp16_input = kv_cache::KvCacheInput {
+        model: "qwen-prov-0.5b".to_owned(),
+        layer: 5,
+        session: "sess-prov".to_owned(),
+        page_index: 0,
+        page_count: 1,
+        seq_start: 0,
+        seq_end: 2,
+        dtype: kv_cache::KvDtype::Fp16,
+        head_count: 3,
+        head_dim: 2,
+    };
+    write_kv_prov_valid(
+        dir,
+        "002_fp16_adapter_set",
+        &[(
+            fp16_input,
+            kv_words_fp16(11, 12),
+            kv_prov_provenance(
+                root(0x12),
+                &[root(0x21), root(0x22)],
+                "qwen-bpe",
+                151_936,
+                kv_prov::KvAttention {
+                    head_count: 3,
+                    head_dim: 2,
+                    sliding_window: 512,
+                    rope_theta_bits: 10_000.0f64.to_bits(),
+                    rope_scale_bits: 0.5f64.to_bits(),
+                },
+                kv_prov::KvPositional::Rope,
+                kv_prov::KvLayout {
+                    dtype: kv_cache::KvDtype::Fp16,
+                    page_rows: 2,
+                    layer_count: 24,
+                },
+                root(0xA1),
+                &[],
+            ),
+        )],
+        limits,
+    )?;
+
+    // 003: fp32 in the last layer of a 16-layer stack.
+    let fp32_input = kv_cache::KvCacheInput {
+        model: "llama-prov-70b".to_owned(),
+        layer: 15,
+        session: "sess-fp32".to_owned(),
+        page_index: 0,
+        page_count: 1,
+        seq_start: 0,
+        seq_end: 2,
+        dtype: kv_cache::KvDtype::Fp32,
+        head_count: 2,
+        head_dim: 3,
+    };
+    write_kv_prov_valid(
+        dir,
+        "003_fp32_multi_layer",
+        &[(
+            fp32_input,
+            kv_words_fp32(3, 12),
+            kv_prov_provenance(
+                root(0x13),
+                &[],
+                "llama-sentencepiece",
+                32_000,
+                rope(2, 3),
+                kv_prov::KvPositional::Rope,
+                kv_prov::KvLayout {
+                    dtype: kv_cache::KvDtype::Fp32,
+                    page_rows: 2,
+                    layer_count: 16,
+                },
+                root(0xA2),
+                &[],
+            ),
+        )],
+        limits,
+    )?;
+
+    // 004: explicit empty adapter set with an alibi positional treatment.
+    write_kv_prov_valid(
+        dir,
+        "004_empty_adapter_set",
+        &[(
+            bf16_input(1, 0, 1),
+            kv_words_bf16(17, 32),
+            kv_prov_provenance(
+                root(0x14),
+                &[],
+                "qwen-bpe",
+                151_936,
+                kv_prov::KvAttention {
+                    head_count: 2,
+                    head_dim: 4,
+                    sliding_window: 0,
+                    rope_theta_bits: 0.0f64.to_bits(),
+                    rope_scale_bits: 0.0f64.to_bits(),
+                },
+                kv_prov::KvPositional::Alibi,
+                bf16_layout,
+                root(0xA3),
+                &[],
+            ),
+        )],
+        limits,
+    )?;
+
+    // 005 / 006: the same page under two sharing-domain salts.
+    for (name, salt, offset) in [
+        ("005_tenant_salt_a", root(0xB0), 23usize),
+        ("006_tenant_salt_b", root(0xB1), 23usize),
+    ] {
+        write_kv_prov_valid(
+            dir,
+            name,
+            &[(
+                bf16_input(2, 0, 1),
+                kv_words_bf16(offset, 32),
+                kv_prov_provenance(
+                    root(0x15),
+                    &[],
+                    "qwen-bpe",
+                    151_936,
+                    rope(2, 4),
+                    kv_prov::KvPositional::Rope,
+                    bf16_layout,
+                    salt,
+                    &[],
+                ),
+            )],
+            limits,
+        )?;
+    }
+
+    // 007: one explicit extension dimension.
+    write_kv_prov_valid(
+        dir,
+        "007_extension_dimension",
+        &[(
+            bf16_input(3, 0, 1),
+            kv_words_bf16(29, 32),
+            kv_prov_provenance(
+                root(0x16),
+                &[root(0x31)],
+                "qwen-bpe",
+                151_936,
+                rope(2, 4),
+                kv_prov::KvPositional::Rope,
+                bf16_layout,
+                root(0xA4),
+                &[kv_prov::KvExtension::new(
+                    "weft.test.runtime",
+                    Value::Str("v2".to_owned()),
+                )],
+            ),
+        )],
+        limits,
+    )?;
+
+    // 008: two independent pages in one layer.
+    write_kv_prov_valid(
+        dir,
+        "008_two_pages",
+        &[
+            (
+                bf16_input(4, 0, 2),
+                kv_words_bf16(0, 32),
+                kv_prov_provenance(
+                    root(0x17),
+                    &[root(0x41), root(0x42)],
+                    "qwen-bpe",
+                    151_936,
+                    rope(2, 4),
+                    kv_prov::KvPositional::Rope,
+                    bf16_layout,
+                    root(0xA5),
+                    &[kv_prov::KvExtension::new("weft.test.rank", Value::U64(7))],
+                ),
+            ),
+            (
+                bf16_input(4, 1, 2),
+                kv_words_bf16(32, 32),
+                kv_prov_provenance(
+                    root(0x17),
+                    &[root(0x41), root(0x42)],
+                    "qwen-bpe",
+                    151_936,
+                    rope(2, 4),
+                    kv_prov::KvPositional::Rope,
+                    bf16_layout,
+                    root(0xA5),
+                    &[kv_prov::KvExtension::new("weft.test.rank", Value::U64(7))],
+                ),
+            ),
+        ],
+        limits,
+    )?;
+
+    // Rejects are derived from 001's descriptor and payload.
+    let base_provenance = kv_prov_provenance(
+        root(0x11),
+        &[],
+        "qwen-bpe",
+        151_936,
+        rope(2, 4),
+        kv_prov::KvPositional::Rope,
+        bf16_layout,
+        root(0xA0),
+        &[],
+    );
+    let base_elements = kv_words_bf16(0, 32);
+    let base_frame = kv_prov::encode_kv_prov_page(
+        &bf16_input(0, 0, 1),
+        &base_elements,
+        &base_provenance,
+        limits,
+    )?;
+    let parsed = Frame::parse(&base_frame, limits)?;
+    let decoded = kv_prov::decode_kv_prov_page(&parsed, limits)?;
+    let body = parsed.body;
+    let descriptor_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let payload = body[4 + descriptor_len..].to_vec();
+    let decoded_len = parsed.header.decoded_len;
+    let content_hash = parsed.header.content_hash;
+    let base_value = decoded.descriptor.descriptor_value();
+
+    let mutate = |value: &Value, path: &[&str], replacement: Option<Value>| -> Value {
+        let mut current = value.clone();
+        // Walk into nested maps, applying the final mutation.
+        fn walk(value: &mut Value, path: &[&str], replacement: &Option<Value>) -> Result<()> {
+            let Value::Map(map) = value else {
+                return Err(Error::corrupt("reject vector path is not a map"));
+            };
+            let (first, rest) = path
+                .split_first()
+                .ok_or_else(|| Error::corrupt("empty reject vector path"))?;
+            if rest.is_empty() {
+                match replacement {
+                    Some(item) => {
+                        map.insert((*first).to_owned(), item.clone());
+                    }
+                    None => {
+                        map.remove(*first);
+                    }
+                }
+                return Ok(());
+            }
+            let slot = map
+                .entry((*first).to_owned())
+                .or_insert_with(|| Value::map(std::iter::empty::<(String, Value)>()));
+            walk(slot, rest, replacement)
+        }
+        walk(&mut current, path, &replacement).expect("reject vector mutation");
+        current
+    };
+
+    let missing_salt = mutate(&base_value, &["salt"], None);
+    kv_prov_reject(
+        dir,
+        "101_missing_salt",
+        &kv_prov_frame_value(missing_salt, &payload, decoded_len, content_hash, limits)?,
+        ErrorClass::Malformed,
+        "the sharing-domain salt is required",
+    )?;
+
+    let unknown_dimension = mutate(
+        &base_value,
+        &["tenant"],
+        Some(Value::Str("tenant-a".to_owned())),
+    );
+    kv_prov_reject(
+        dir,
+        "102_unknown_dimension",
+        &kv_prov_frame_value(
+            unknown_dimension,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "`tenant` is not a dimension of weft.ai.kv_prov.v1",
+    )?;
+
+    let duplicate = mutate(
+        &base_value,
+        &["adapter_roots"],
+        Some(Value::Array(vec![
+            Value::Bytes(root(0x21).as_bytes().to_vec()),
+            Value::Bytes(root(0x21).as_bytes().to_vec()),
+        ])),
+    );
+    let duplicate = mutate(
+        &duplicate,
+        &["adapter_set_root"],
+        Some(Value::Bytes(
+            kv_prov::adapter_set_root(&[root(0x21), root(0x21)])?
+                .as_bytes()
+                .to_vec(),
+        )),
+    );
+    kv_prov_reject(
+        dir,
+        "103_duplicate_dimension",
+        &kv_prov_frame_value(duplicate, &payload, decoded_len, content_hash, limits)?,
+        ErrorClass::Malformed,
+        "the same adapter root appears twice",
+    )?;
+
+    let unsorted = mutate(
+        &base_value,
+        &["extensions"],
+        Some(Value::Array(vec![
+            Value::map([
+                ("name", Value::Str("weft.test.z".to_owned())),
+                ("value", Value::U64(1)),
+            ]),
+            Value::map([
+                ("name", Value::Str("weft.test.a".to_owned())),
+                ("value", Value::U64(2)),
+            ]),
+        ])),
+    );
+    kv_prov_reject(
+        dir,
+        "104_unsorted_extensions",
+        &kv_prov_frame_value(unsorted, &payload, decoded_len, content_hash, limits)?,
+        ErrorClass::Malformed,
+        "extension dimensions must be sorted by name",
+    )?;
+
+    let adapter_mismatch = mutate(
+        &base_value,
+        &["adapter_set_root"],
+        Some(Value::Bytes(vec![0x5A; 32])),
+    );
+    kv_prov_reject(
+        dir,
+        "105_adapter_root_mismatch",
+        &kv_prov_frame_value(
+            adapter_mismatch,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "adapter_set_root does not hash the adapter roots",
+    )?;
+
+    let tokenizer_mismatch = mutate(
+        &base_value,
+        &["tokenizer_root"],
+        Some(Value::Bytes(vec![0x5B; 32])),
+    );
+    kv_prov_reject(
+        dir,
+        "106_tokenizer_mismatch",
+        &kv_prov_frame_value(
+            tokenizer_mismatch,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "tokenizer_root does not hash the tokenizer descriptor",
+    )?;
+
+    let attention_mismatch = mutate(
+        &base_value,
+        &["attention", "head_count"],
+        Some(Value::U64(3)),
+    );
+    kv_prov_reject(
+        dir,
+        "107_attention_mismatch",
+        &kv_prov_frame_value(
+            attention_mismatch,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "attention head_count disagrees with the frozen page descriptor",
+    )?;
+
+    let layout_mismatch = mutate(
+        &base_value,
+        &["layout", "dtype"],
+        Some(Value::Str("fp32".to_owned())),
+    );
+    kv_prov_reject(
+        dir,
+        "108_layout_mismatch",
+        &kv_prov_frame_value(layout_mismatch, &payload, decoded_len, content_hash, limits)?,
+        ErrorClass::Malformed,
+        "layout dtype disagrees with the frozen page descriptor",
+    )?;
+
+    let truncated_payload = &payload[..payload.len() - 8];
+    kv_prov_reject(
+        dir,
+        "109_payload_truncated",
+        &kv_prov_frame_value(
+            base_value.clone(),
+            truncated_payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Malformed,
+        "stored payload is shorter than page.payload_len",
+    )?;
+
+    let payload_mismatch = mutate(
+        &base_value,
+        &["payload_hash"],
+        Some(Value::Bytes(vec![0x5C; 32])),
+    );
+    kv_prov_reject(
+        dir,
+        "110_payload_hash_mismatch",
+        &kv_prov_frame_value(
+            payload_mismatch,
+            &payload,
+            decoded_len,
+            content_hash,
+            limits,
+        )?,
+        ErrorClass::Corrupt,
+        "payload_hash disagrees with the frame content_hash",
+    )?;
+
+    // A minimal non-canonical WCB map: {a: u64 0} with a non-minimal varint.
+    let non_canonical = [0x08, 0x01, 0x05, 0x01, b'a', 0x03, 0x80, 0x00];
+    kv_prov_reject(
+        dir,
+        "111_descriptor_non_canonical",
+        &kv_prov_frame_bytes(&non_canonical, &payload, decoded_len, content_hash, limits)?,
+        ErrorClass::NonCanonical,
+        "the descriptor uses a non-minimal varint",
+    )?;
+
+    let mut reserved = base_frame.clone();
+    reserved[7] = 20;
+    refix_header_and_trailer(&mut reserved);
+    kv_prov_reject(
+        dir,
+        "112_reserved_mode_20",
+        &reserved,
+        ErrorClass::UnsupportedMode,
+        "mode 20 is reserved; KV_CACHE_PROV is mode 19",
     )?;
 
     Ok(())
