@@ -59,8 +59,9 @@ offset 0                      offset 4096
                                table_offset = 4096   section[0].offset
 ```
 
-Total container length is `total_len` and MUST equal the physical byte length
-of the object.
+The header is a fixed 4096-byte header. Every table row is a 56-byte section entry.
+Total container length is `total_len` and MUST equal the physical byte length of
+the object.
 
 ### 2.1 Transport header (4096 bytes)
 
@@ -92,7 +93,7 @@ bytes each. Entries are in strictly increasing `offset` order.
 |---:|---:|---|---|
 | 0 | 8 | `offset` | absolute byte offset in the container; a multiple of `alignment` |
 | 8 | 8 | `length` | exact enclosed frame length, `> 0` |
-| 16 | 4 | `alignment` | one of `512`, `4096`, `65536`; any other value is `Malformed` |
+| 16 | 4 | `alignment` | one of 512, 4096, or 65536; any other value is `Malformed` |
 | 20 | 1 | `mode` | the enclosed frame's mode byte; must equal it (`Corrupt` otherwise) |
 | 21 | 1 | `role` | `0` payload, `1` dependency, `2` metadata, `3` provenance; other values are `Malformed` |
 | 22 | 2 | reserved | MUST be zero; non-zero is `Malformed` |
