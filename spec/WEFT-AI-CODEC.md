@@ -25,17 +25,18 @@ and `decoded_len`; the domains below are the additional, mode-specific roots.
 | 17 | `FLOAT_TILED` (`float-tiled`) | `weft.ai.float_tiled.v1` | `weft/tensor/float_tile/v1` (`tile_root`), `weft/tensor/values/v1` | v1 | normative | `conformance/v1/float-tiled/001–003` + rejects |
 | 18 | `FLOAT_TILED_STREAMS` (`float-tiled-streams`) | `weft.ai.tensor_tiled_streams.v1` | `weft/tensor/float_tile_streams/v1` (`tile_root`), `weft/tensor/values/v1` | v1 | normative | `conformance/v1/float-tiled-streams/001–004` + twelve rejects |
 | 19 | `KV_CACHE_PROV` (`kv-prov`) | `weft.ai.kv_prov.v1` | `weft/kv/prov/v1` (descriptor root), `weft/kv/adapters/v1`, `weft/kv/tokenizer/v1`, `weft/chunk/v1` | v1 | normative | `conformance/v1/kv-prov/001–008` + twelve rejects |
-| 20 | — | — | — | — | **reserved** | `conformance/v1/codec/017_unknown_mode_reserved20.json` (reject only) |
+| 20 | `ENGRAM_SHARD` (`engram-shard`) | `weft.ai.engram_shard.v1` | `weft/engram/v1` (descriptor root), `weft/engram/group/v1` (`group_root`), `weft/engram/payload/v1`, `weft/tensor/values/v1` | v1 | normative | `conformance/v1/engram/001–006` + fourteen rejects |
+| 21 | — | — | — | — | **reserved** | `conformance/v1/codec/017_unknown_mode_reserved21.json` (reject only) |
 
 Modes 0–5 (RAW, ZSTD, REFERENCE, DELTA, DICTIONARY, STRUCTURED) are defined in
-`WEFTCODEC-FORMAT.md`; this document covers 6–19; 20 is reserved. A value
-above 20 is `UnsupportedMode` by the frame parser. Vector paths in the last
+`WEFTCODEC-FORMAT.md`; this document covers 6–20; 21 is reserved. A value
+above 21 is `UnsupportedMode` by the frame parser. Vector paths in the last
 column are relative to the program home; the authoritative list, with sizes and
 digests, is `conformance/manifest.json`, and `scripts/check-conformance-coverage.sh`
-enforces that every mode 0–19 has valid **and** reject vectors.
+enforces that every mode 0–20 has valid **and** reject vectors.
 
 
-**Status: PARTIALLY IMPLEMENTED.** Exactly fourteen AI-native modes are normative
+**Status: PARTIALLY IMPLEMENTED.** Exactly fifteen AI-native modes are normative
 and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 
 | Value | Name | Status | Frozen vectors |
@@ -54,6 +55,7 @@ and implemented in both Rust `weftcodec` and Go `weftcodec-go`:
 | 17 | `FLOAT_TILED` (CLI `float-tiled`) | **implemented** | `conformance/v1/float-tiled/001`–`003` + eight rejects |
 | 18 | `FLOAT_TILED_STREAMS` (CLI `float-tiled-streams`) | **implemented** | `conformance/v1/float-tiled-streams/001`–`004` + twelve rejects |
 | 19 | `KV_CACHE_PROV` (CLI `kv-prov`) | **implemented** | `conformance/v1/kv-prov/001`–`008` + twelve rejects |
+| 20 | `ENGRAM_SHARD` (CLI `engram-shard`) | **implemented** | `conformance/v1/engram/001`–`006` + fourteen rejects |
 
 Every other mode below is `specified, not implemented` and has **no allocated
 wire value**. Nothing in this document is a compression or performance claim.
@@ -2157,3 +2159,39 @@ API: Rust `weftcodec::kv_prov` (`encode_kv_prov_page`, `decode_kv_prov_page`,
 `kv_prov_metadata`, `KvProvDescriptor::root`); Go `modes`
 (`EncodeKvProvPage`, `DecodeKvProvPage`, `KvProvMetadata`). CLI
 `--mode kv-prov` with `--metadata PAGE.json --provenance PROV.json`.
+
+---
+
+## 21. Mode 20 — `ENGRAM_SHARD` (implemented)
+
+Mode 20 stores a rank-2 table as independently encoded **row groups** so a
+sparse read touches only the groups it needs and an incremental update writes
+only changed groups. The complete normative definition — descriptor key set,
+group identity, per-plane coder, reference/supersession rules, validation order,
+limits and vectors — is `WEFT-ENGRAM.md`.
+
+```text
+domain        = 0 (payload)
+mode          = 20
+flags         = 0
+dep_count     = 0
+chunk_count   = 0
+decoded_len   = rows * dim * element_size
+content_hash  = H("weft/chunk/v1", whole table bytes)
+body          = u32le(descriptor_len) || WCB(descriptor) || stored_payload
+descriptor_root = H("weft/engram/v1", WCB(descriptor))
+```
+
+A group is rooted by
+`H("weft/engram/group/v1", WCB({group_index, row_start, row_end, dtype,
+precision, values_hash}))`; a reference group is resolved by its root through a
+caller-supplied resolver and fails closed when absent. The reserved-mode reject
+moved to 21; `017_unknown_mode_reserved20` is retained and superseded.
+
+API: Rust `weftcodec::engram` (`encode_engram`, `decode_engram`,
+`decode_engram_with_resolver`, `parse_engram`, `engram_metadata`,
+`read_engram_groups`, `read_engram_region`, `engram_group_root`); Go `modes`
+(`EncodeEngram`, `DecodeEngram`, `DecodeEngramWithResolver`, `ParseEngram`,
+`EngramMetadata`, `ReadEngramGroups`, `ReadEngramRegion`, `EngramGroupRoot`).
+CLI `--mode engram-shard --dtype D --shape ROWS,DIM --group-edges A,B,...
+--hash-function ngram-blake3-v1 --vocab-size N`.
