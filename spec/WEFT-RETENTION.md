@@ -395,7 +395,9 @@ Both report:
 * `now_ns`, `budget_bytes` (optional), `grace_secs`;
 * reachable manifest and chunk counts;
 * per class (`unbound`, `volatile`, `session`, `ephemeral`, `durable`):
-  retained blob count and bytes, reclaimable blob count and bytes;
+  retained blob count and bytes, reclaimable blob count and bytes (the
+  candidates the plan would take under its budget; every candidate when no
+  budget is given);
 * every **retained-but-expired** artifact with a reason string. A reachable
   artifact is reported as `reachable from <root>`, where `<root>` is a stable
   label (`head:<commit>`, `snapshot:<commit>`, `checkpoint:<commit>`,
