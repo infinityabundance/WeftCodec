@@ -2,8 +2,10 @@
 
 **Status:** Normative for `weft.ai.kv_prov.v1` and mode 19 `KV_CACHE_PROV`.
 Implemented in Rust `weftcodec::kv_prov` and Go `modes` (see §9 for the exact
-surface). The store-side scope and capability path (§10) is implemented in the
-Rust store only; that gap is stated, not hidden.
+surface). The store-side scope and capability path (§10) is implemented in both
+the Rust and Go stores (R15); the Go surface has no KV prefix tier and verifies
+no capability-envelope signature on this path. Those gaps are stated, not
+hidden.
 
 **Depends on:** `WEFTCODEC-FORMAT.md` (framing, `H(domain,data)`, WCB, limits),
 `WEFT-AI-CODEC.md` §13 (mode 12 `KV_CACHE`, whose page payload this mode reuses

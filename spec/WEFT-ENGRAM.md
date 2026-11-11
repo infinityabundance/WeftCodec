@@ -1,7 +1,9 @@
 # WEFT-ENGRAM v1.0.0 — incrementally updateable, region-addressable row-group tables
 
 Status: **implemented** in Rust `weftcodec` and Go `weftcodec-go` (codec);
-store integration is Rust-only. Mode value **20** in `WEFT-AI-CODEC.md`.
+store integration is implemented in the Rust store (writer, region reads,
+incremental update) and in the Go store for reads, verification, and region
+reads — Go has no mode-20 writer. Mode value **20** in `WEFT-AI-CODEC.md`.
 
 ## 1. The workload this mode addresses
 
