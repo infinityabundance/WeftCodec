@@ -307,7 +307,7 @@ recomputed and must agree). `PAGE.json` is the mode-12 metadata file.
 
 ---
 
-## 10. Store scope and capability binding (Rust store)
+## 10. Store scope and capability binding (Rust and Go stores)
 
 `src/kv_capability.rs` accepts mode-19 objects through a distinct descriptor
 schema, `weft.kv.prov_capability.v1`, whose canonical WCB map is the mode-12
@@ -334,6 +334,31 @@ no decode. The object cannot be fetched "by content hash alone" into a decode
 path, because the only decode path checks the provenance-bound descriptor id
 first and emits zero bytes on any mismatch.
 
+### 10.1 Go store parity
+
+`WeftFS-Go/store/kv.go` implements the same surface for mode 12 and mode 19:
+`WriteKvPage` / `WriteKvProvPage`, `ReadKvPage` / `ReadKvProvPage`, the two
+canonical descriptor types with their strict parsers, the reserved attribute
+names, and the single denial text. The normative ordering is copied verbatim
+(object record → descriptor → derived descriptor id → capability validity →
+tenant/namespace/root grant → POSIX authorization → read). The reserved
+attributes written are the same set, and an absent `weft.kv.mode` attribute
+means mode 12, so pre-R5 pages stay readable.
+
+One API difference is stated rather than hidden: Rust's `Principal` carries an
+already-verified capability envelope, while Go has no envelope type anywhere
+and every other Go authorization path takes an `*auth.Capability` explicitly.
+`KvPrincipal{Principal, Capability}` is therefore the faithful union of those
+two fields, and a nil capability is denied exactly like an absent envelope.
+The Go store performs no Ed25519 envelope verification; that pre-existing gap
+is neither introduced nor widened here.
+
+Since R15 the Rust CLI also has a page-level writer, `kv prov-write`, so the
+cross-language court is a real writer-to-reader handoff: both languages encode
+the same geometry and provenance inputs from the same element bytes, and the
+resulting descriptor id, provenance root and frame bytes must be equal. They
+are (`WeftFS-Go/store/kv_test.go`, `TestKvProvHandoffRustThenGo`).
+
 ---
 
 ## 11. Non-claims
@@ -344,9 +369,11 @@ first and emits zero bytes on any mismatch.
   measurement. The claim is structural: a mismatched scope cannot produce bytes.
 * No timing, throughput, or fleet claim from this document.
 * No encryption, confidentiality, or access-pattern privacy; see §5.
-* Go has no store-side KV capability path (the whole KV capability surface is
-  Rust-only today), so §10 is Rust-only. The Go codec implements §3–§7 and the
-  vectors.
+* Go implements §10 for both modes but not the KV **prefix** tier
+  (`kv_prefix_put` / `kv_prefix_lookup` / `kv_prefix_get` / `kv_gc`) and never
+  verifies a capability envelope; the Go denial therefore relies on the caller
+  passing a capability value, as every other Go path already does.
+* The Python package implements the mode-19 frame, not the store path.
 * The `weft.kv.prefix.v1` record still exists and its `compatibility()` scan is
   unchanged; it is not a substitute for a mode-19 descriptor and this document
   does not claim it is.
