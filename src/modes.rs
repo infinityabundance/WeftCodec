@@ -2160,7 +2160,7 @@ impl Default for FloatTensorEncodeOptions {
     fn default() -> Self {
         Self {
             threads: 1,
-            parallel_min_bitstream_bytes: 4 << 20,
+            parallel_min_bitstream_bytes: 1 << 20,
             parallel_max_bitstream_bytes: 512 << 20,
             min_partition_elements: 1 << 16,
         }
@@ -2280,6 +2280,7 @@ pub fn encode_float_tensor_with_histogram(
     shape: &[u64],
     limits: &Limits,
     histogram: &[u64; 256],
+    options: FloatTensorEncodeOptions,
 ) -> Result<Vec<u8>> {
     let form = float_tensor_form(payload, dtype, shape, limits)?;
     let counted = histogram.iter().try_fold(0u64, |total, &count| {
@@ -2301,7 +2302,7 @@ pub fn encode_float_tensor_with_histogram(
         limits,
         histogram,
         content_hash,
-        FloatTensorEncodeOptions::default(),
+        options,
     )
 }
 

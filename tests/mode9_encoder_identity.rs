@@ -158,6 +158,7 @@ fn committed_mode9_vectors_reencode_byte_identically() {
             &meta.shape,
             &limits,
             &histogram,
+            FloatTensorEncodeOptions::sequential(),
         )
         .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(
@@ -332,9 +333,15 @@ fn shipped_encoder_matches_the_reference_across_dtypes_and_sizes() {
             );
 
             let histogram = float_tensor_exponent_histogram(&payload, dtype).expect("histogram");
-            let handoff =
-                encode_float_tensor_with_histogram(&payload, dtype, &shape, &limits, &histogram)
-                    .unwrap_or_else(|e| panic!("hand-off {} x{count}: {e}", dtype_name(dtype)));
+            let handoff = encode_float_tensor_with_histogram(
+                &payload,
+                dtype,
+                &shape,
+                &limits,
+                &histogram,
+                FloatTensorEncodeOptions::sequential(),
+            )
+            .unwrap_or_else(|e| panic!("hand-off {} x{count}: {e}", dtype_name(dtype)));
             assert_eq!(
                 handoff,
                 shipped,
