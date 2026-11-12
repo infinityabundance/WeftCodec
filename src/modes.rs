@@ -219,7 +219,6 @@ fn encode_zstd_chunks_ordered(
         let workers = threads.min(width).max(1);
         let per_worker = width.div_ceil(workers);
         let mut slots: Vec<Option<Result<(Vec<u8>, Hash32)>>> = (0..width).map(|_| None).collect();
-        let mut slots: Vec<Option<Result<(Vec<u8>, Hash32)>>> = (0..width).map(|_| None).collect();
         std::thread::scope(|scope| {
             for (worker, slot_chunk) in slots.chunks_mut(per_worker).enumerate() {
                 let base = start + worker * per_worker;
@@ -285,7 +284,6 @@ fn encode_zstd_chunks_ordered(
     }
     Ok((body, chunks))
 }
-
 
 /// Encode a REFERENCE frame. The input must equal `base` byte for byte.
 pub fn encode_reference(data: &[u8], base: &[u8], limits: &Limits) -> Result<Vec<u8>> {
@@ -2028,6 +2026,71 @@ pub fn join_float_tensor_payload(
 pub fn float_tensor_exponent_histogram(payload: &[u8], dtype: FloatDtype) -> Result<[u64; 256]> {
     let mut histogram = [0u64; 256];
     accumulate_float_tensor_histogram(&mut histogram, payload, dtype)?;
+    Ok(histogram)
+}
+
+/// The exponent histogram, accumulated on `threads` workers (R22.2).
+///
+/// The histogram is a vector of integer counts, so splitting the payload into
+/// whole-element windows, accumulating each window's counts independently and
+/// adding them is **exact**: addition is associative and commutative, so the
+/// result equals [`float_tensor_exponent_histogram`]'s bit for bit. That is
+/// what lets the analyse pass parallelise without touching the R18 exact mode-9
+/// size prediction: the same counts give the same predicted length.
+///
+/// Below `min_parallel_bytes`, or with one thread, this is the sequential
+/// function.
+pub fn float_tensor_exponent_histogram_with(
+    payload: &[u8],
+    dtype: FloatDtype,
+    threads: usize,
+    min_parallel_bytes: usize,
+) -> Result<[u64; 256]> {
+    let element_bytes = usize::try_from(dtype.element_size())
+        .map_err(|_| Error::limit_exceeded("float tensor element size does not fit usize"))?;
+    let workers = if threads <= 1 || payload.len() < min_parallel_bytes || element_bytes == 0 {
+        1
+    } else {
+        threads.min(64).max(1)
+    };
+    if element_bytes == 0 || payload.len() % element_bytes != 0 {
+        return Err(Error::malformed(format!(
+            "float tensor payload of {} bytes is not a whole number of {} elements",
+            payload.len(),
+            dtype.as_str()
+        )));
+    }
+    let elements = payload.len() / element_bytes;
+    let workers = workers.min(elements).max(1);
+    if workers == 1 {
+        return float_tensor_exponent_histogram(payload, dtype);
+    }
+    let per_worker = elements.div_ceil(workers);
+    let mut partials: Vec<[u64; 256]> = (0..workers).map(|_| [0u64; 256]).collect();
+    std::thread::scope(|scope| {
+        for (worker, counts) in partials.iter_mut().enumerate() {
+            let first = worker * per_worker;
+            let last = ((worker + 1) * per_worker).min(elements);
+            if first >= last {
+                continue;
+            }
+            let window = &payload[first * element_bytes..last * element_bytes];
+            scope.spawn(move || {
+                // Every window is a whole number of elements, checked above, so
+                // this cannot fail; it is the same accumulation the sequential
+                // function performs. It must not be wrapped in a debug assertion:
+                // that compiles the call away in a release build.
+                let result = accumulate_float_tensor_histogram(counts, window, dtype);
+                debug_assert!(result.is_ok());
+            });
+        }
+    });
+    let mut histogram = [0u64; 256];
+    for counts in &partials {
+        for symbol in 0..256usize {
+            histogram[symbol] = histogram[symbol].saturating_add(counts[symbol]);
+        }
+    }
     Ok(histogram)
 }
 
