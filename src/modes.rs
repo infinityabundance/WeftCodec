@@ -81,6 +81,212 @@ pub fn encode_zstd(
     encode_frame(&parts, limits)
 }
 
+/// Byte and thread bounds for chunk-parallel ZSTD encoding (R22).
+///
+/// A chunked ZSTD frame is a **concatenation of independent frames**, one per
+/// codec chunk (WEFTCODEC-FORMAT §3, CHUNKED). Each chunk's frame is a pure
+/// function of that chunk's bytes and the level, so encoding chunks on several
+/// threads and concatenating them in index order is byte-identical to encoding
+/// them one at a time. This type only carries the bounds of that schedule; it
+/// cannot change an emitted byte, a chunk entry or a hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZstdEncodeOptions {
+    /// Upper bound on threads used for one tensor's chunk frames. `1` is fully
+    /// sequential.
+    pub threads: usize,
+    /// Inputs smaller than this stay sequential: below it, thread start-up and
+    /// the per-batch join cost more than the overlap.
+    pub parallel_min_bytes: usize,
+    /// Decoded bytes handed to the pool per **ordered batch**. Only one batch's
+    /// compressed chunks are retained at a time, so this is the byte bound on
+    /// the pool's transient memory (plus a per-frame header slack). It is
+    /// independent of the thread count by construction.
+    pub batch_decoded_bytes: usize,
+}
+
+impl Default for ZstdEncodeOptions {
+    fn default() -> Self {
+        ZstdEncodeOptions {
+            threads: 1,
+            parallel_min_bytes: 8 * 1024 * 1024,
+            batch_decoded_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+impl ZstdEncodeOptions {
+    /// Sequential encoding: the historical path.
+    pub fn sequential() -> Self {
+        Self::default()
+    }
+
+    /// Chunk-parallel encoding with `threads` workers and the default bounds.
+    pub fn with_threads(threads: usize) -> Self {
+        ZstdEncodeOptions {
+            threads: threads.max(1),
+            ..Self::default()
+        }
+    }
+}
+
+/// Encode a ZSTD frame, using a bounded chunk-parallel schedule when
+/// `options` allows it.
+///
+/// This is [`encode_zstd`] plus a schedule: with `chunk_size = None`, a
+/// one-thread bound, an input below `parallel_min_bytes` or an empty input it
+/// calls the sequential encoder directly, so the historical path is the path.
+/// When it does parallelise, the chunk frames are produced by the *same*
+/// `compress` call as the sequential encoder and concatenated in index order,
+/// so the frame is byte-identical (proved by
+/// `tests/zstd_chunk_parallel.rs`).
+pub fn encode_zstd_with(
+    data: &[u8],
+    level: i32,
+    chunk_size: Option<usize>,
+    limits: &Limits,
+    options: &ZstdEncodeOptions,
+) -> Result<Vec<u8>> {
+    if options.batch_decoded_bytes == 0 {
+        return Err(Error::malformed(
+            "zstd chunk-parallel batch bound must be greater than zero",
+        ));
+    }
+    let chunked_parallel = match chunk_size {
+        Some(size) => {
+            options.threads > 1
+                && !data.is_empty()
+                && size > 0
+                && data.len() >= options.parallel_min_bytes
+        }
+        None => false,
+    };
+    if !chunked_parallel {
+        return encode_zstd(data, level, chunk_size, limits);
+    }
+    let size = chunk_size.expect("chunk size checked above");
+    check_len(data.len() as u64, limits.max_decoded_bytes, "decoded data")?;
+    validate_chunk_size(chunk_size)?;
+    let content_hash = hash_domain(DOMAIN_CHUNK, data);
+    let (body, chunks) = encode_zstd_chunks_ordered(
+        data,
+        size,
+        level,
+        options.threads.min(64).max(1),
+        options.batch_decoded_bytes,
+        limits,
+    )?;
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::Zstd,
+        flags: crate::frame::flags::CHUNKED,
+        level: level_to_u16(level)?,
+        decoded_len: data.len() as u64,
+        content_hash,
+        dependencies: &[],
+        chunks: &chunks,
+        body: &body,
+    };
+    encode_frame(&parts, limits)
+}
+
+/// Compress every codec chunk in ordered batches, `threads` chunks at a time.
+///
+/// The result is exactly [`maybe_chunked`]'s `(body, chunks)` for the same
+/// `size` and level: each element of `chunks` and every byte of `body` is
+/// produced by the same `compress` call the sequential encoder makes. Only the
+/// *order in which chunks are handed to the compressor* changes, and chunks
+/// share no compressor state.
+fn encode_zstd_chunks_ordered(
+    data: &[u8],
+    size: usize,
+    level: i32,
+    threads: usize,
+    batch_decoded_bytes: usize,
+    limits: &Limits,
+) -> Result<(Vec<u8>, Vec<ChunkEntry>)> {
+    let count = data.len().div_ceil(size);
+    check_len(count as u64, limits.max_chunks, "chunk count")?;
+    let per_batch = (batch_decoded_bytes / size.max(1)).max(1).min(count);
+    let mut body = Vec::new();
+    let mut chunks = Vec::with_capacity(count);
+    let mut offset: u64 = 0;
+    let mut start = 0usize;
+    while start < count {
+        let end = (start + per_batch).min(count);
+        let width = end - start;
+        let workers = threads.min(width).max(1);
+        let per_worker = width.div_ceil(workers);
+        let mut slots: Vec<Option<Result<(Vec<u8>, Hash32)>>> = (0..width).map(|_| None).collect();
+        let mut slots: Vec<Option<Result<(Vec<u8>, Hash32)>>> = (0..width).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            for (worker, slot_chunk) in slots.chunks_mut(per_worker).enumerate() {
+                let base = start + worker * per_worker;
+                scope.spawn(move || {
+                    // One zstd context per worker instead of one per chunk: the
+                    // 272 MB embedding is 4,155 chunks, so a fresh `CCtx` per
+                    // chunk is 4,155 allocations. `ZSTD_compress2` resets the
+                    // session on every call, so a reused context emits the same
+                    // bytes as a fresh one; `tests/zstd_chunk_parallel.rs`
+                    // proves it over every thread count and batch assignment.
+                    let mut compressor = match zstd::bulk::Compressor::new(level) {
+                        Ok(compressor) => compressor,
+                        Err(err) => {
+                            let message = format!("zstd compressor init failed: {err}");
+                            for slot in slot_chunk.iter_mut() {
+                                *slot = Some(Err(Error::malformed(message.clone())));
+                            }
+                            return;
+                        }
+                    };
+                    for (within, slot) in slot_chunk.iter_mut().enumerate() {
+                        let index = base + within;
+                        let begin = index * size;
+                        let finish = (begin + size).min(data.len());
+                        let chunk = &data[begin..finish];
+                        *slot = Some(match compressor.compress(chunk) {
+                            Ok(encoded) => Ok((encoded, hash_domain(DOMAIN_CHUNK, chunk))),
+                            Err(err) => {
+                                Err(Error::malformed(format!("zstd compression failed: {err}")))
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        for (within, slot) in slots.into_iter().enumerate() {
+            let index = start + within;
+            let (encoded, hash) = match slot {
+                Some(result) => result?,
+                None => {
+                    return Err(Error::corrupt(
+                        "chunk-parallel zstd worker left a chunk unencoded",
+                    ))
+                }
+            };
+            let decoded = (data.len() - index * size).min(size);
+            let encoded_len = u32::try_from(encoded.len())
+                .map_err(|_| Error::limit_exceeded("encoded chunk does not fit u32"))?;
+            let decoded_len = u32::try_from(decoded)
+                .map_err(|_| Error::limit_exceeded("decoded chunk does not fit u32"))?;
+            chunks.push(ChunkEntry {
+                encoded_off: offset,
+                encoded_len,
+                decoded_len,
+                hash,
+            });
+            offset = offset
+                .checked_add(u64::from(encoded_len))
+                .ok_or_else(|| Error::limit_exceeded("chunk offset overflow"))?;
+            body.extend_from_slice(&encoded);
+        }
+        start = end;
+    }
+    Ok((body, chunks))
+}
+
+
 /// Encode a REFERENCE frame. The input must equal `base` byte for byte.
 pub fn encode_reference(data: &[u8], base: &[u8], limits: &Limits) -> Result<Vec<u8>> {
     if data != base {
