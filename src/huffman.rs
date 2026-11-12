@@ -193,6 +193,44 @@ fn append_bits(out: &mut Vec<u8>, buffer: &mut u64, pending: &mut u32, code: u32
     }
 }
 
+/// Number of bytes [`encode`] would produce for a byte histogram, without
+/// building the bitstream.
+///
+/// Exact: it runs the same deterministic length-limiting tree and canonical
+/// assignment as [`encode`], and the bit count is the same sum of
+/// `frequency * length` the emitter writes out. A histogram with fewer than two
+/// present symbols produces the 256-byte table and no bitstream.
+pub fn encoded_len_from_weights(weights: &[u64; 256]) -> usize {
+    let lengths = build_lengths(weights);
+    let used = lengths.iter().filter(|&&length| length > 0).count();
+    if used < 2 {
+        // Empty plane or one symbol: canonical form has no bitstream.
+        return TABLE_BYTES;
+    }
+    // Element counts are bounded by `Limits::max_tensor_elements`, but this
+    // helper is also reachable with caller-supplied weights, so the sum is
+    // accumulated in u128 and saturates instead of wrapping.
+    let mut bits: u128 = 0;
+    for (symbol, &weight) in weights.iter().enumerate() {
+        bits += u128::from(weight) * u128::from(lengths[symbol]);
+    }
+    let stream = (bits + 7) / 8;
+    TABLE_BYTES + usize::try_from(stream).unwrap_or(usize::MAX)
+}
+
+/// Number of bytes [`encode`] would produce for `input`, without building them.
+///
+/// This is an exact prediction, not an estimate, so a planner can price a plane
+/// before paying to code it (WEFT-AI-CODEC §5); the frame-level wrapper is
+/// `modes::float_tensor_encoded_len`.
+pub fn encoded_len(input: &[u8]) -> usize {
+    let mut weights = [0u64; 256];
+    for &byte in input {
+        weights[byte as usize] += 1;
+    }
+    encoded_len_from_weights(&weights)
+}
+
 /// Encode a byte plane with `huffman-canonical-v1`.
 ///
 /// Never fails: the output is always the 256-byte length table plus a

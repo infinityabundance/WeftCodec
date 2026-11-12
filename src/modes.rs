@@ -1713,6 +1713,156 @@ pub fn join_float_tensor_payload(
     Ok(out)
 }
 
+/// Count the exponent field of every element in a float-tensor payload.
+///
+/// One pass, no allocation beyond the 256-slot histogram. The payload must be
+/// a whole number of elements; the element count itself is carried by the
+/// caller (shape is not needed to build a histogram).
+pub fn float_tensor_exponent_histogram(payload: &[u8], dtype: FloatDtype) -> Result<[u64; 256]> {
+    let element_bytes = usize::try_from(dtype.element_size())
+        .map_err(|_| Error::limit_exceeded("float tensor element size does not fit usize"))?;
+    if element_bytes == 0 || payload.len() % element_bytes != 0 {
+        return Err(Error::malformed(format!(
+            "float tensor payload of {} bytes is not a whole number of {} elements",
+            payload.len(),
+            dtype.as_str()
+        )));
+    }
+    let mantissa_bits = dtype.mantissa_bits();
+    let exponent_mask = (1u64 << dtype.exponent_bits()) - 1;
+    let mut histogram = [0u64; 256];
+    for chunk in payload.chunks_exact(element_bytes) {
+        let mut word = 0u64;
+        for (index, byte) in chunk.iter().enumerate() {
+            word |= u64::from(*byte) << (8 * index);
+        }
+        let exponent = ((word >> mantissa_bits) & exponent_mask) as usize;
+        histogram[exponent] = histogram[exponent].saturating_add(1);
+    }
+    Ok(histogram)
+}
+
+/// The exact length of the FLOAT_TENSOR frame [`encode_float_tensor`] would
+/// produce, computed from the exponent histogram instead of coding it.
+///
+/// Exact, not estimated: the descriptor is rebuilt with the same canonical WCB
+/// map, the exponent plane length comes from
+/// [`huffman::encoded_len_from_weights`] (the same tree and bit count the
+/// encoder emits), and the sign+mantissa plane is a fixed
+/// `ceil(element_count * (sign_bits + mantissa_bits) / 8)`. The only field that
+/// is not recomputed is `payload_hash`, whose WCB encoding is a 32-byte byte
+/// string regardless of content, so its length contribution is exact.
+///
+/// Validation mirrors [`encode_float_tensor`], so a prediction error implies
+/// the encode would have failed too.
+pub fn float_tensor_encoded_len_from_histogram(
+    dtype: FloatDtype,
+    shape: &[u64],
+    histogram: &[u64; 256],
+    limits: &Limits,
+) -> Result<u64> {
+    let element_bits = dtype.element_bits();
+    if element_bits % 8 != 0 {
+        return Err(Error::malformed(format!(
+            "float tensor dtype `{}` is not byte-aligned",
+            dtype.as_str()
+        )));
+    }
+    let element_count = float_tensor_product(shape, limits)?;
+    let decoded_bytes = element_count
+        .checked_mul(dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("float tensor decoded byte count overflows u64"))?;
+    check_len(
+        decoded_bytes,
+        limits.max_decoded_bytes,
+        "float tensor decoded bytes",
+    )?;
+    let counted = histogram.iter().try_fold(0u64, |total, &count| {
+        total
+            .checked_add(count)
+            .ok_or_else(|| Error::limit_exceeded("float tensor histogram count overflows u64"))
+    })?;
+    if counted != element_count {
+        return Err(Error::malformed(format!(
+            "float tensor exponent histogram counts {counted} elements but shape {shape:?} requires {element_count}"
+        )));
+    }
+
+    let mantissa_bit_total = element_count
+        .checked_mul(dtype.sign_bits() + dtype.mantissa_bits())
+        .ok_or_else(|| Error::limit_exceeded("float tensor mantissa bit count overflows u64"))?;
+    let mantissa_plane_len = mantissa_bit_total
+        .checked_add(7)
+        .ok_or_else(|| Error::limit_exceeded("float tensor mantissa length overflows u64"))?
+        / 8;
+    let exponent_plane_len = huffman::encoded_len_from_weights(histogram) as u64;
+
+    // A 32-byte placeholder: WCB encodes `Bytes` as a tag, a length varint and
+    // the bytes, so the descriptor length does not depend on the digest value.
+    let meta = Value::map([
+        ("schema", Value::Str(FLOAT_TENSOR_SCHEMA.to_owned())),
+        ("dtype", Value::Str(dtype.as_str().to_owned())),
+        (
+            "shape",
+            Value::Array(shape.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        ("element_count", Value::U64(element_count)),
+        ("sign_bits", Value::U64(dtype.sign_bits())),
+        ("exponent_bits", Value::U64(dtype.exponent_bits())),
+        ("mantissa_bits", Value::U64(dtype.mantissa_bits())),
+        (
+            "exponent_coder",
+            Value::Str(FLOAT_TENSOR_EXPONENT_CODER.to_owned()),
+        ),
+        ("exponent_plane_len", Value::U64(exponent_plane_len)),
+        ("mantissa_plane_len", Value::U64(mantissa_plane_len)),
+        ("payload_hash", Value::Bytes(vec![0u8; 32])),
+    ]);
+    let descriptor_len = wcb::encode(&meta, limits)?.len() as u64;
+    let body_len = 4u64
+        .checked_add(descriptor_len)
+        .and_then(|value| value.checked_add(exponent_plane_len))
+        .and_then(|value| value.checked_add(mantissa_plane_len))
+        .ok_or_else(|| Error::limit_exceeded("float tensor body length overflows u64"))?;
+    let total = (crate::frame::HEADER_LEN as u64)
+        .checked_add(body_len)
+        .and_then(|value| value.checked_add(crate::frame::TRAILER_LEN as u64))
+        .ok_or_else(|| Error::limit_exceeded("float tensor frame length overflows u64"))?;
+    check_len(total, limits.max_frame_bytes, "frame")?;
+    Ok(total)
+}
+
+/// The exact length of the FLOAT_TENSOR frame [`encode_float_tensor`] would
+/// produce for `payload`, without encoding it.
+pub fn float_tensor_encoded_len(
+    payload: &[u8],
+    dtype: FloatDtype,
+    shape: &[u64],
+    limits: &Limits,
+) -> Result<u64> {
+    let element_bits = dtype.element_bits();
+    if element_bits % 8 != 0 {
+        return Err(Error::malformed(format!(
+            "float tensor dtype `{}` is not byte-aligned",
+            dtype.as_str()
+        )));
+    }
+    let element_count = float_tensor_product(shape, limits)?;
+    let decoded_bytes = element_count
+        .checked_mul(dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("float tensor decoded byte count overflows u64"))?;
+    if decoded_bytes != payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "float tensor payload is {} bytes but shape {:?} x {} is {decoded_bytes} bytes",
+            payload.len(),
+            shape,
+            dtype.as_str()
+        )));
+    }
+    let histogram = float_tensor_exponent_histogram(payload, dtype)?;
+    float_tensor_encoded_len_from_histogram(dtype, shape, &histogram, limits)
+}
+
 /// Encode a FLOAT_TENSOR frame (WEFT-AI-CODEC §5).
 ///
 /// The exponent plane is encoded with the canonical `huffman-canonical-v1`
