@@ -10,14 +10,15 @@ use std::collections::{BTreeMap, HashMap};
 use crate::dependency::Resolver;
 use crate::error::{Error, Result};
 use crate::frame::{
-    encode_frame, ChunkEntry, Dependency, Frame, FrameParts, Mode, DEP_DOMAIN_DICTIONARY,
-    DEP_DOMAIN_PAYLOAD, DOMAIN_PAYLOAD, DOMAIN_STRUCTURED, FORMAT_MAJOR, FORMAT_MINOR,
+    encode_frame, encode_frame_with_body, ChunkEntry, Dependency, Frame, FrameParts, Mode,
+    DEP_DOMAIN_DICTIONARY, DEP_DOMAIN_PAYLOAD, DOMAIN_PAYLOAD, DOMAIN_STRUCTURED, FORMAT_MAJOR,
+    FORMAT_MINOR,
 };
 use crate::hash::{
-    hash_domain, Hash32, DOMAIN_CHUNK, DOMAIN_FLOAT_TENSOR_PAYLOAD,
+    hash_domain, DomainHasher, Hash32, DOMAIN_CHUNK, DOMAIN_FLOAT_TENSOR_PAYLOAD,
     DOMAIN_QUANTIZED_TENSOR_PAYLOAD, DOMAIN_TENSOR_PAYLOAD, DOMAIN_TOKENS_PAYLOAD,
 };
-use crate::huffman;
+use crate::huffman::{self, TABLE_BYTES};
 use crate::limits::{check_len, Limits};
 use crate::varint;
 use crate::wcb::{self, Value};
@@ -1546,14 +1547,110 @@ pub fn split_float_tensor_payload(
     dtype: FloatDtype,
     element_count: u64,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    let (exponent_plane, mantissa_plane) =
-        split_float_tensor_planes(payload, dtype, element_count)?;
-    Ok((huffman::encode(&exponent_plane), mantissa_plane))
+    match dtype {
+        FloatDtype::Bf16 => {
+            let count = check_float_payload(payload, dtype, element_count)?;
+            // One pass produces both planes *and* the exponent histogram the
+            // coder needs, so the encoder never re-counts the plane it just
+            // built. The bytes are identical to the reference splitter plus
+            // `huffman::encode`; `tests/mode9_encoder_identity.rs` proves it.
+            let mut exponent_plane = vec![0u8; count];
+            let mut mantissa_plane = vec![0u8; count];
+            let histogram = split_bf16_planes(payload, &mut exponent_plane, &mut mantissa_plane);
+            let coded = huffman::encode_with_weights(&exponent_plane, &histogram);
+            Ok((coded, mantissa_plane))
+        }
+        _ => {
+            let (exponent_plane, mantissa_plane) =
+                split_float_tensor_planes_reference(payload, dtype, element_count)?;
+            Ok((huffman::encode(&exponent_plane), mantissa_plane))
+        }
+    }
 }
 
 /// Split float element bytes into the raw exponent byte plane and the packed
 /// sign+mantissa plane, without coding either plane.
-fn split_float_tensor_planes(
+///
+/// BF16 uses the specialised kernel; every other dtype keeps the generic
+/// word loop, which is the reference oracle.
+pub fn split_float_tensor_planes(
+    payload: &[u8],
+    dtype: FloatDtype,
+    element_count: u64,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    match dtype {
+        FloatDtype::Bf16 => {
+            let count = check_float_payload(payload, dtype, element_count)?;
+            let mut exponent_plane = vec![0u8; count];
+            let mut mantissa_plane = vec![0u8; count];
+            split_bf16_planes(payload, &mut exponent_plane, &mut mantissa_plane);
+            Ok((exponent_plane, mantissa_plane))
+        }
+        _ => split_float_tensor_planes_reference(payload, dtype, element_count),
+    }
+}
+
+/// Validate the payload length against the descriptor before any allocation.
+fn check_float_payload(payload: &[u8], dtype: FloatDtype, element_count: u64) -> Result<usize> {
+    let expected_bytes = element_count
+        .checked_mul(dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("float tensor decoded byte count overflows u64"))?;
+    if payload.len() as u64 != expected_bytes {
+        return Err(Error::malformed(format!(
+            "float tensor payload is {} bytes but the descriptor requires {expected_bytes}",
+            payload.len()
+        )));
+    }
+    usize::try_from(element_count)
+        .map_err(|_| Error::limit_exceeded("float tensor element count does not fit usize"))
+}
+
+/// BF16 plane split: `exponent = bits 7..15`, `sign|mantissa = sign bit then the
+/// low seven bits`, one byte per element on both planes.
+///
+/// Returns the exponent histogram (four interleaved banks, folded at the end)
+/// so the caller can build the canonical table without a second traversal.
+pub(crate) fn split_bf16_planes(
+    payload: &[u8],
+    exponent_plane: &mut [u8],
+    mantissa_plane: &mut [u8],
+) -> [u64; 256] {
+    debug_assert_eq!(mantissa_plane.len() * 2, payload.len());
+    debug_assert_eq!(exponent_plane.len(), mantissa_plane.len());
+    let mut lanes = [[0u64; 256]; 4];
+    let mut chunks = payload.chunks_exact(8);
+    let mut out = 0usize;
+    for chunk in &mut chunks {
+        for (lane, word) in chunk.chunks_exact(2).enumerate() {
+            let word = u16::from_le_bytes([word[0], word[1]]);
+            let exponent = (word >> 7) as u8;
+            exponent_plane[out + lane] = exponent;
+            mantissa_plane[out + lane] = ((word >> 8) as u8 & 0x80) | (word as u8 & 0x7f);
+            lanes[lane][exponent as usize] += 1;
+        }
+        out += 4;
+    }
+    for (lane, word) in chunks.remainder().chunks_exact(2).enumerate() {
+        let word = u16::from_le_bytes([word[0], word[1]]);
+        let exponent = (word >> 7) as u8;
+        exponent_plane[out + lane] = exponent;
+        mantissa_plane[out + lane] = ((word >> 8) as u8 & 0x80) | (word as u8 & 0x7f);
+        lanes[lane][exponent as usize] += 1;
+    }
+    let mut histogram = [0u64; 256];
+    for symbol in 0..256usize {
+        histogram[symbol] =
+            lanes[0][symbol] + lanes[1][symbol] + lanes[2][symbol] + lanes[3][symbol];
+    }
+    histogram
+}
+
+/// Split float element bytes into the raw exponent byte plane and the packed
+/// sign+mantissa plane, without coding either plane.
+///
+/// The generic, dtype-parametric word loop. It is the reference oracle for the
+/// specialised BF16 kernel and the only splitter for FP16, FP32 and FP8.
+pub fn split_float_tensor_planes_reference(
     payload: &[u8],
     dtype: FloatDtype,
     element_count: u64,
@@ -1717,8 +1814,27 @@ pub fn join_float_tensor_payload(
 ///
 /// One pass, no allocation beyond the 256-slot histogram. The payload must be
 /// a whole number of elements; the element count itself is carried by the
-/// caller (shape is not needed to build a histogram).
+/// caller (shape is not needed to build a histogram). BF16 uses a specialised
+/// four-bank kernel: the exponent is bits 7..15 of the 16-bit word, and the
+/// four banks break the store-to-load chain that a single counter bank has on
+/// the heavily skewed exponent distributions real weights produce. The result is
+/// an exact count either way.
 pub fn float_tensor_exponent_histogram(payload: &[u8], dtype: FloatDtype) -> Result<[u64; 256]> {
+    let mut histogram = [0u64; 256];
+    accumulate_float_tensor_histogram(&mut histogram, payload, dtype)?;
+    Ok(histogram)
+}
+
+/// Add the exponent multiplicities of `payload` into `counts`.
+///
+/// `counts` must be the running total of everything already accumulated into
+/// it; callers either start from zero or fold consecutive windows of one
+/// payload. Every window must be a whole number of elements.
+pub fn accumulate_float_tensor_histogram(
+    counts: &mut [u64; 256],
+    payload: &[u8],
+    dtype: FloatDtype,
+) -> Result<()> {
     let element_bytes = usize::try_from(dtype.element_size())
         .map_err(|_| Error::limit_exceeded("float tensor element size does not fit usize"))?;
     if element_bytes == 0 || payload.len() % element_bytes != 0 {
@@ -1728,18 +1844,41 @@ pub fn float_tensor_exponent_histogram(payload: &[u8], dtype: FloatDtype) -> Res
             dtype.as_str()
         )));
     }
-    let mantissa_bits = dtype.mantissa_bits();
-    let exponent_mask = (1u64 << dtype.exponent_bits()) - 1;
-    let mut histogram = [0u64; 256];
-    for chunk in payload.chunks_exact(element_bytes) {
-        let mut word = 0u64;
-        for (index, byte) in chunk.iter().enumerate() {
-            word |= u64::from(*byte) << (8 * index);
+    match dtype {
+        FloatDtype::Bf16 => accumulate_bf16_histogram(counts, payload),
+        _ => {
+            let mantissa_bits = dtype.mantissa_bits();
+            let exponent_mask = (1u64 << dtype.exponent_bits()) - 1;
+            for chunk in payload.chunks_exact(element_bytes) {
+                let mut word = 0u64;
+                for (index, byte) in chunk.iter().enumerate() {
+                    word |= u64::from(*byte) << (8 * index);
+                }
+                let exponent = ((word >> mantissa_bits) & exponent_mask) as usize;
+                counts[exponent] = counts[exponent].saturating_add(1);
+            }
         }
-        let exponent = ((word >> mantissa_bits) & exponent_mask) as usize;
-        histogram[exponent] = histogram[exponent].saturating_add(1);
     }
-    Ok(histogram)
+    Ok(())
+}
+
+/// Four-bank BF16 exponent histogram; the sum is exact.
+fn accumulate_bf16_histogram(counts: &mut [u64; 256], payload: &[u8]) {
+    let mut lanes = [[0u64; 256]; 4];
+    let mut chunks = payload.chunks_exact(8);
+    for chunk in &mut chunks {
+        for (lane, word) in chunk.chunks_exact(2).enumerate() {
+            let word = u16::from_le_bytes([word[0], word[1]]);
+            lanes[lane][((word >> 7) & 0xff) as usize] += 1;
+        }
+    }
+    for (lane, word) in chunks.remainder().chunks_exact(2).enumerate() {
+        let word = u16::from_le_bytes([word[0], word[1]]);
+        lanes[lane][((word >> 7) & 0xff) as usize] += 1;
+    }
+    for symbol in 0..256usize {
+        counts[symbol] += lanes[0][symbol] + lanes[1][symbol] + lanes[2][symbol] + lanes[3][symbol];
+    }
 }
 
 /// The exact length of the FLOAT_TENSOR frame [`encode_float_tensor`] would
@@ -1868,7 +2007,37 @@ pub fn float_tensor_encoded_len(
 /// The exponent plane is encoded with the canonical `huffman-canonical-v1`
 /// coder; the sign+mantissa plane is stored raw. Every element bit pattern
 /// round-trips, including NaN payloads.
+///
+/// This is the shipped encoder: one fused histogram+content-hash pass over the
+/// payload, then one split+emit pass that writes both planes straight into the
+/// frame buffer, then the stored-plane hash and the trailer CRC. The emitted
+/// bytes are identical to [`encode_float_tensor_reference`], which is the
+/// pre-R19 pipeline kept as the byte-identity oracle.
 pub fn encode_float_tensor(
+    payload: &[u8],
+    dtype: FloatDtype,
+    shape: &[u64],
+    limits: &Limits,
+) -> Result<Vec<u8>> {
+    encode_float_tensor_with(
+        payload,
+        dtype,
+        shape,
+        limits,
+        FloatTensorEncodeOptions::default(),
+    )
+}
+
+/// The pre-R19 mode-9 encoder, kept as the byte-identity oracle.
+///
+/// This is the plain word-at-a-time implementation: it materialises both
+/// planes, concatenates them, builds the body and lets [`encode_frame`] copy it
+/// into the frame. Its output is the normative one; the shipped encoder must
+/// reproduce it byte for byte, which `tests/mode9_encoder_identity.rs` and the
+/// `mode9_encoder_bench` harness check on randomised inputs and on every
+/// measured tensor.
+#[doc(hidden)]
+pub fn encode_float_tensor_reference(
     payload: &[u8],
     dtype: FloatDtype,
     shape: &[u64],
@@ -1904,8 +2073,14 @@ pub fn encode_float_tensor(
         )));
     }
 
-    let (exponent_plane, mantissa_plane) =
-        split_float_tensor_payload(payload, dtype, element_count)?;
+    // The reference encoder deliberately uses the generic splitter and the
+    // byte-at-a-time `huffman::encode`, i.e. the pre-R19 pipeline, so the bench
+    // can measure the old and the new path in one session. The bytes are the
+    // same either way; `tests/mode9_encoder_identity.rs` proves it.
+    let (raw_exponent_plane, mantissa_plane) =
+        split_float_tensor_planes_reference(payload, dtype, element_count)?;
+    let exponent_plane = huffman::encode(&raw_exponent_plane);
+    drop(raw_exponent_plane);
     let mut stored = Vec::with_capacity(exponent_plane.len() + mantissa_plane.len());
     stored.extend_from_slice(&exponent_plane);
     stored.extend_from_slice(&mantissa_plane);
@@ -1957,6 +2132,576 @@ pub fn encode_float_tensor(
         body: &body,
     };
     encode_frame(&parts, limits)
+}
+
+/// Tuning for [`encode_float_tensor_with`].
+///
+/// Nothing here can change an emitted byte: the exponent table, the symbol
+/// order, the canonical codes and the padding are fixed by the histogram alone.
+/// The options only choose how much of the same work runs at once, so a
+/// one-threaded and a many-threaded encode produce identical frames.
+#[derive(Clone, Copy, Debug)]
+pub struct FloatTensorEncodeOptions {
+    /// Upper bound on threads used for the split/emission pass. `1` is fully
+    /// sequential.
+    pub threads: usize,
+    /// Parallel emission is only used when the exponent bitstream is at least
+    /// this large; below it, thread start-up costs more than it saves.
+    pub parallel_min_bitstream_bytes: usize,
+    /// Hard cap on the bitstream size that may be parallelised. Above it the
+    /// encode stays sequential, so the encoder never introduces a large
+    /// transient allocation on a memory-constrained court.
+    pub parallel_max_bitstream_bytes: usize,
+    /// Smallest element range a parallel partition may cover.
+    pub min_partition_elements: usize,
+}
+
+impl Default for FloatTensorEncodeOptions {
+    fn default() -> Self {
+        Self {
+            threads: 1,
+            parallel_min_bitstream_bytes: 4 << 20,
+            parallel_max_bitstream_bytes: 512 << 20,
+            min_partition_elements: 1 << 16,
+        }
+    }
+}
+
+impl FloatTensorEncodeOptions {
+    /// Sequential emission.
+    pub fn sequential() -> Self {
+        Self::default()
+    }
+
+    /// Bounded parallel emission with `threads` workers.
+    pub fn with_threads(threads: usize) -> Self {
+        Self {
+            threads: threads.max(1),
+            ..Self::default()
+        }
+    }
+}
+
+/// Shape and payload facts shared by every mode-9 entry point.
+struct FloatTensorForm {
+    element_count: u64,
+    decoded_bytes: u64,
+    count: usize,
+    element_bytes: usize,
+}
+
+fn float_tensor_form(
+    payload: &[u8],
+    dtype: FloatDtype,
+    shape: &[u64],
+    limits: &Limits,
+) -> Result<FloatTensorForm> {
+    check_len(
+        payload.len() as u64,
+        limits.max_decoded_bytes,
+        "float tensor payload",
+    )?;
+    if dtype.element_bits() % 8 != 0 {
+        return Err(Error::malformed(format!(
+            "float tensor dtype `{}` is not byte-aligned",
+            dtype.as_str()
+        )));
+    }
+    let element_count = float_tensor_product(shape, limits)?;
+    let decoded_bytes = element_count
+        .checked_mul(dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("float tensor decoded byte count overflows u64"))?;
+    check_len(
+        decoded_bytes,
+        limits.max_decoded_bytes,
+        "float tensor decoded bytes",
+    )?;
+    if decoded_bytes != payload.len() as u64 {
+        return Err(Error::malformed(format!(
+            "float tensor payload is {} bytes but shape {:?} x {} is {decoded_bytes} bytes",
+            payload.len(),
+            shape,
+            dtype.as_str()
+        )));
+    }
+    Ok(FloatTensorForm {
+        element_count,
+        decoded_bytes,
+        count: usize::try_from(element_count)
+            .map_err(|_| Error::limit_exceeded("float tensor element count does not fit usize"))?,
+        element_bytes: usize::try_from(dtype.element_size())
+            .map_err(|_| Error::limit_exceeded("float tensor element size does not fit usize"))?,
+    })
+}
+
+/// The FLOAT_TENSOR descriptor map. One builder for the encoder, the length
+/// predictor and the fast encoder keeps the three from drifting.
+fn float_tensor_meta(
+    dtype: FloatDtype,
+    shape: &[u64],
+    element_count: u64,
+    exponent_plane_len: u64,
+    mantissa_plane_len: u64,
+    payload_hash: &[u8; 32],
+) -> Value {
+    Value::map([
+        ("schema", Value::Str(FLOAT_TENSOR_SCHEMA.to_owned())),
+        ("dtype", Value::Str(dtype.as_str().to_owned())),
+        (
+            "shape",
+            Value::Array(shape.iter().map(|dim| Value::U64(*dim)).collect()),
+        ),
+        ("element_count", Value::U64(element_count)),
+        ("sign_bits", Value::U64(dtype.sign_bits())),
+        ("exponent_bits", Value::U64(dtype.exponent_bits())),
+        ("mantissa_bits", Value::U64(dtype.mantissa_bits())),
+        (
+            "exponent_coder",
+            Value::Str(FLOAT_TENSOR_EXPONENT_CODER.to_owned()),
+        ),
+        ("exponent_plane_len", Value::U64(exponent_plane_len)),
+        ("mantissa_plane_len", Value::U64(mantissa_plane_len)),
+        ("payload_hash", Value::Bytes(payload_hash.to_vec())),
+    ])
+}
+
+/// Encode a FLOAT_TENSOR frame with a caller-supplied histogram.
+///
+/// The histogram must describe **this** payload: it is what the canonical table
+/// (and therefore every emitted bit) is derived from. The store obtains it from
+/// the analyse stage, which computes it over the same byte slice in the same
+/// call, so the plan's exact length prediction and the encoded frame are
+/// cross-checked by construction. A wrong histogram yields a frame that still
+/// decodes to the payload but whose bytes differ from [`encode_float_tensor`],
+/// which is why this entry point is documented rather than guessed at.
+pub fn encode_float_tensor_with_histogram(
+    payload: &[u8],
+    dtype: FloatDtype,
+    shape: &[u64],
+    limits: &Limits,
+    histogram: &[u64; 256],
+) -> Result<Vec<u8>> {
+    let form = float_tensor_form(payload, dtype, shape, limits)?;
+    let counted = histogram.iter().try_fold(0u64, |total, &count| {
+        total
+            .checked_add(count)
+            .ok_or_else(|| Error::limit_exceeded("float tensor histogram count overflows u64"))
+    })?;
+    if counted != form.element_count {
+        return Err(Error::malformed(format!(
+            "float tensor histogram counts {counted} elements but shape {shape:?} requires {}",
+            form.element_count
+        )));
+    }
+    let content_hash = hash_domain(DOMAIN_CHUNK, payload);
+    encode_float_tensor_planned(
+        payload,
+        dtype,
+        shape,
+        limits,
+        histogram,
+        content_hash,
+        FloatTensorEncodeOptions::default(),
+    )
+}
+
+/// Encode a FLOAT_TENSOR frame with explicit encoder tuning.
+///
+/// Byte-identical to [`encode_float_tensor`] for every option value.
+pub fn encode_float_tensor_with(
+    payload: &[u8],
+    dtype: FloatDtype,
+    shape: &[u64],
+    limits: &Limits,
+    options: FloatTensorEncodeOptions,
+) -> Result<Vec<u8>> {
+    float_tensor_form(payload, dtype, shape, limits)?;
+    // One fused pass: the exponent histogram the coder needs and the plaintext
+    // content hash the header needs. Windows keep both hot in cache, so this
+    // costs one read of the payload rather than two.
+    let mut histogram = [0u64; 256];
+    let mut hasher = DomainHasher::new(DOMAIN_CHUNK);
+    for window in payload.chunks(1 << 16) {
+        accumulate_float_tensor_histogram(&mut histogram, window, dtype)?;
+        hasher.update(window);
+    }
+    let content_hash = hasher.finalize();
+    encode_float_tensor_planned(
+        payload,
+        dtype,
+        shape,
+        limits,
+        &histogram,
+        content_hash,
+        options,
+    )
+}
+
+/// The shared second half: plan the exact frame, then write the descriptor and
+/// both planes into one buffer with no intermediate copies.
+fn encode_float_tensor_planned(
+    payload: &[u8],
+    dtype: FloatDtype,
+    shape: &[u64],
+    limits: &Limits,
+    histogram: &[u64; 256],
+    content_hash: Hash32,
+    options: FloatTensorEncodeOptions,
+) -> Result<Vec<u8>> {
+    let form = float_tensor_form(payload, dtype, shape, limits)?;
+    let table = huffman::EncoderTable::from_weights(histogram);
+    let exponent_bits = table.bits_from_counts(histogram);
+    let exponent_plane_len = TABLE_BYTES as u64 + huffman::bytes_for_bits(exponent_bits);
+    let mantissa_bit_total = form
+        .element_count
+        .checked_mul(dtype.sign_bits() + dtype.mantissa_bits())
+        .ok_or_else(|| Error::limit_exceeded("float tensor mantissa bit count overflows u64"))?;
+    let mantissa_plane_len = huffman::bytes_for_bits(mantissa_bit_total);
+    let stored_len = exponent_plane_len
+        .checked_add(mantissa_plane_len)
+        .ok_or_else(|| Error::limit_exceeded("float tensor stored plane length overflows u64"))?;
+    // The descriptor length does not depend on the digest value, so a placeholder
+    // gives the exact final length and therefore the exact final offsets.
+    let placeholder = float_tensor_meta(
+        dtype,
+        shape,
+        form.element_count,
+        exponent_plane_len,
+        mantissa_plane_len,
+        &[0u8; 32],
+    );
+    let descriptor_len = wcb::encode(&placeholder, limits)?.len() as u64;
+    let body_len = 4u64
+        .checked_add(descriptor_len)
+        .and_then(|value| value.checked_add(stored_len))
+        .ok_or_else(|| Error::limit_exceeded("float tensor body length overflows u64"))?;
+
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::FloatTensor,
+        flags: 0,
+        level: FLOAT_TENSOR_LEVEL,
+        decoded_len: form.decoded_bytes,
+        content_hash,
+        dependencies: &[],
+        chunks: &[],
+        body: &[],
+    };
+    let descriptor_len_usize = usize::try_from(descriptor_len)
+        .map_err(|_| Error::limit_exceeded("float tensor descriptor does not fit usize"))?;
+    let stored_len_usize = usize::try_from(stored_len)
+        .map_err(|_| Error::limit_exceeded("float tensor stored plane does not fit usize"))?;
+    let exponent_plane_len_usize = usize::try_from(exponent_plane_len)
+        .map_err(|_| Error::limit_exceeded("float tensor exponent plane does not fit usize"))?;
+    encode_frame_with_body(&parts, body_len, limits, |body| {
+        body[..4].copy_from_slice(&(descriptor_len as u32).to_le_bytes());
+        let stored_at = 4 + descriptor_len_usize;
+        let (exponent_region, mantissa_region) =
+            body[stored_at..stored_at + stored_len_usize].split_at_mut(exponent_plane_len_usize);
+        exponent_region[..TABLE_BYTES].copy_from_slice(table.lengths());
+        emit_float_tensor_planes(
+            payload,
+            dtype,
+            &form,
+            &table,
+            &mut exponent_region[TABLE_BYTES..],
+            mantissa_region,
+            &options,
+        )?;
+        let payload_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &body[stored_at..]);
+        let meta = float_tensor_meta(
+            dtype,
+            shape,
+            form.element_count,
+            exponent_plane_len,
+            mantissa_plane_len,
+            payload_hash.as_bytes(),
+        );
+        let meta_bytes = wcb::encode(&meta, limits)?;
+        if meta_bytes.len() != descriptor_len_usize {
+            return Err(Error::corrupt(format!(
+                "float tensor descriptor length {} differs from the planned {descriptor_len_usize}",
+                meta_bytes.len()
+            )));
+        }
+        body[4..stored_at].copy_from_slice(&meta_bytes);
+        Ok(())
+    })
+}
+
+/// Write the exponent bitstream and the sign+mantissa plane into the frame.
+fn emit_float_tensor_planes(
+    payload: &[u8],
+    dtype: FloatDtype,
+    form: &FloatTensorForm,
+    table: &huffman::EncoderTable,
+    stream: &mut [u8],
+    mantissa: &mut [u8],
+    options: &FloatTensorEncodeOptions,
+) -> Result<()> {
+    if dtype == FloatDtype::Bf16 {
+        return emit_bf16_planes(payload, form.count, table, stream, mantissa, options);
+    }
+    let sign_bits = dtype.sign_bits();
+    let exponent_bits = dtype.exponent_bits();
+    let mantissa_bits = dtype.mantissa_bits();
+    let mantissa_mask = (1u64 << mantissa_bits) - 1;
+    let exponent_mask = (1u64 << exponent_bits) - 1;
+    let width = (sign_bits + mantissa_bits) as u32;
+    let mut stream_writer = huffman::BitStream::new(stream);
+    let mut mantissa_writer = huffman::BitStream::new(mantissa);
+    for chunk in payload.chunks_exact(form.element_bytes) {
+        let mut word = 0u64;
+        for (index, byte) in chunk.iter().enumerate() {
+            word |= u64::from(*byte) << (8 * index);
+        }
+        let exponent = ((word >> mantissa_bits) & exponent_mask) as u8;
+        let sign = (word >> (exponent_bits + mantissa_bits)) & 1;
+        let sign_mantissa = (sign << mantissa_bits) | (word & mantissa_mask);
+        if table.has_bitstream() {
+            table.push(&mut stream_writer, exponent);
+        }
+        mantissa_writer.push_packed((u64::from(width) << 32) | sign_mantissa);
+    }
+    if stream_writer.finish() != stream.len() {
+        return Err(Error::corrupt(
+            "float tensor exponent bitstream length differs from the predicted length",
+        ));
+    }
+    if mantissa_writer.finish() != mantissa.len() {
+        return Err(Error::corrupt(
+            "float tensor mantissa plane length differs from the predicted length",
+        ));
+    }
+    Ok(())
+}
+
+/// BF16 split plus emission. One pass over the payload writes the mantissa plane
+/// and the exponent bitstream; nothing else is materialised.
+fn emit_bf16_planes(
+    payload: &[u8],
+    count: usize,
+    table: &huffman::EncoderTable,
+    stream: &mut [u8],
+    mantissa: &mut [u8],
+    options: &FloatTensorEncodeOptions,
+) -> Result<()> {
+    debug_assert_eq!(mantissa.len(), count);
+    let partitions = bf16_partitions(count, stream.len(), options);
+    if partitions <= 1 || !table.has_bitstream() {
+        let mut writer = huffman::BitStream::new(stream);
+        for (index, chunk) in payload.chunks_exact(2).enumerate() {
+            let word = u16::from_le_bytes([chunk[0], chunk[1]]);
+            mantissa[index] = ((word >> 8) as u8 & 0x80) | (word as u8 & 0x7f);
+            if table.has_bitstream() {
+                table.push(&mut writer, (word >> 7) as u8);
+            }
+        }
+        let written = writer.finish();
+        if written != stream.len() {
+            return Err(Error::corrupt(
+                "float tensor exponent bitstream length differs from the predicted length",
+            ));
+        }
+        return Ok(());
+    }
+    emit_bf16_parallel(payload, count, table, stream, mantissa, partitions)
+}
+
+/// How many partitions the bounded parallel emitter may use.
+fn bf16_partitions(count: usize, stream_len: usize, options: &FloatTensorEncodeOptions) -> usize {
+    if options.threads <= 1
+        || stream_len < options.parallel_min_bitstream_bytes
+        || stream_len > options.parallel_max_bitstream_bytes
+    {
+        return 1;
+    }
+    let by_elements = count / options.min_partition_elements.max(1);
+    options.threads.min(by_elements).max(1).min(64)
+}
+
+/// Deterministic parallel BF16 emission.
+///
+/// The element range is split into `partitions` contiguous ranges. Each worker
+/// emits its own range into its own byte range of the final bitstream, starting
+/// at the bit offset its range begins at, and spills at most one byte (the byte
+/// it shares with the next partition) into a one-byte scratch slot. A short
+/// serial pass then ORs each saved scratch byte into the byte the next worker
+/// already wrote there. Both writers only ever own disjoint bits of that byte,
+/// so the result is exactly the sequential bitstream, byte for byte, and the
+/// only memory beyond the frame is one byte per partition.
+fn emit_bf16_parallel(
+    payload: &[u8],
+    count: usize,
+    table: &huffman::EncoderTable,
+    stream: &mut [u8],
+    mantissa: &mut [u8],
+    partitions: usize,
+) -> Result<()> {
+    let ranges = split_range(count, partitions);
+    let parts = ranges.len();
+
+    // Pass 1: exact bit length of every partition, in parallel. This is the only
+    // extra traversal; it allocates one `u64` per partition and writes nothing.
+    let mut bits = vec![0u64; parts];
+    {
+        let payload_slices: Vec<&[u8]> = ranges
+            .iter()
+            .map(|(start, end)| &payload[start * 2..end * 2])
+            .collect();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(parts);
+            for (slice, slot) in payload_slices.into_iter().zip(bits.iter_mut()) {
+                let table = &*table;
+                handles.push(scope.spawn(move || {
+                    let mut total = 0u64;
+                    for chunk in slice.chunks_exact(2) {
+                        let word = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        total += table.bits_of_byte((word >> 7) as u8);
+                    }
+                    *slot = total;
+                }));
+            }
+            for handle in handles {
+                let _ = handle.join();
+            }
+        });
+    }
+
+    // Prefix sums: `starts[j]` is the global bit offset partition `j` begins at.
+    let mut starts = vec![0u64; parts];
+    let mut accumulated = 0u64;
+    for (index, value) in bits.iter().enumerate() {
+        starts[index] = accumulated;
+        accumulated += *value;
+    }
+    if huffman::bytes_for_bits(accumulated) != stream.len() as u64 {
+        return Err(Error::corrupt(
+            "float tensor exponent bitstream length differs from the predicted length",
+        ));
+    }
+
+    // Disjoint byte slices: partition `j` owns the bytes of `stream` whose bits
+    // lie wholly inside its bit range, and its own `mantissa` element range.
+    let mut bounds: Vec<Bf16Partition> = Vec::with_capacity(parts);
+    for (index, (start, end)) in ranges.iter().enumerate() {
+        let first = (starts[index] / 8) as usize;
+        let end_byte = ((starts[index] + bits[index]) / 8) as usize;
+        bounds.push(Bf16Partition {
+            first,
+            complete: end_byte - first,
+            offset: (starts[index] % 8) as u32,
+            partial: (starts[index] + bits[index]) % 8 != 0,
+            start: *start,
+            end: *end,
+        });
+    }
+    let mut stream_slices: Vec<&mut [u8]> = Vec::with_capacity(parts);
+    {
+        let mut rest = &mut stream[..];
+        let mut pos = 0usize;
+        for partition in &bounds {
+            let (_skipped, after) = rest.split_at_mut(partition.first - pos);
+            let (mine, after) = after.split_at_mut(partition.complete);
+            pos = partition.first + partition.complete;
+            rest = after;
+            stream_slices.push(mine);
+        }
+    }
+    let mut mantissa_slices: Vec<&mut [u8]> = Vec::with_capacity(parts);
+    {
+        let mut rest = &mut mantissa[..];
+        let mut pos = 0usize;
+        for partition in &bounds {
+            let (_skipped, after) = rest.split_at_mut(partition.start - pos);
+            let (mine, after) = after.split_at_mut(partition.end - partition.start);
+            pos = partition.end;
+            rest = after;
+            mantissa_slices.push(mine);
+        }
+    }
+    let mut scratch = vec![0u8; parts];
+
+    // Pass 2: emit. Each worker starts at its own bit offset and spills the one
+    // byte it shares with the next partition into its scratch slot.
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(parts);
+        for (((stream_slice, mantissa_slice), slot), partition) in stream_slices
+            .into_iter()
+            .zip(mantissa_slices)
+            .zip(scratch.iter_mut())
+            .zip(bounds.iter())
+        {
+            let table = &*table;
+            let payload_slice = &payload[partition.start * 2..partition.end * 2];
+            let offset = partition.offset;
+            handles.push(scope.spawn(move || {
+                let mut writer = huffman::BitStream::with_scratch(stream_slice, slot, offset);
+                for (index, chunk) in payload_slice.chunks_exact(2).enumerate() {
+                    let word = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    mantissa_slice[index] = ((word >> 8) as u8 & 0x80) | (word as u8 & 0x7f);
+                    table.push(&mut writer, (word >> 7) as u8);
+                }
+                writer.finish()
+            }));
+        }
+        for (handle, partition) in handles.into_iter().zip(bounds.iter()) {
+            let written = handle
+                .join()
+                .map_err(|_| Error::corrupt("parallel float tensor emission worker panicked"))?;
+            let expected = partition.complete + usize::from(partition.partial);
+            if written != expected {
+                return Err(Error::corrupt(format!(
+                    "parallel float tensor emission wrote {written} bytes, expected {expected}"
+                )));
+            }
+        }
+        Ok(())
+    })?;
+
+    // Stitch: each shared byte was written by exactly one worker with only its
+    // own bits set, so OR-ing the other worker's saved byte completes it.
+    for (index, partition) in bounds.iter().enumerate() {
+        if partition.offset != 0 {
+            stream[partition.first] |= scratch[index - 1];
+        }
+    }
+    if bounds[parts - 1].partial {
+        let last = parts - 1;
+        let tail_at = ((starts[last] + bits[last]) / 8) as usize;
+        stream[tail_at] |= scratch[last];
+    }
+    Ok(())
+}
+
+/// One worker's byte range in the parallel BF16 emitter.
+struct Bf16Partition {
+    /// First byte of `stream` the partition owns.
+    first: usize,
+    /// Number of whole bytes it writes into `stream`.
+    complete: usize,
+    /// Bit offset its stream starts at inside `stream[first]`.
+    offset: u32,
+    /// Whether the bit range ends mid-byte (so its last byte spills to scratch).
+    partial: bool,
+    /// First and one-past-last element index in the payload.
+    start: usize,
+    end: usize,
+}
+
+fn split_range(count: usize, partitions: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(partitions);
+    let base = count / partitions;
+    let extra = count % partitions;
+    let mut at = 0usize;
+    for index in 0..partitions {
+        let take = base + usize::from(index < extra);
+        out.push((at, at + take));
+        at += take;
+    }
+    out
 }
 
 /// Validate and decode a FLOAT_TENSOR frame, returning the reconstructed

@@ -179,18 +179,277 @@ fn canonical_codes(lengths: &[u8; 256]) -> [u32; 256] {
     codes
 }
 
-fn append_bits(out: &mut Vec<u8>, buffer: &mut u64, pending: &mut u32, code: u32, length: u32) {
-    *buffer = (*buffer << length) | u64::from(code);
-    *pending += length;
-    while *pending >= 8 {
-        *pending -= 8;
-        out.push((*buffer >> *pending) as u8);
+/// Byte multiplicities of `input`.
+///
+/// Four interleaved counter banks break the store-to-load dependency chain that
+/// a single 256-slot histogram has on skewed data (the same exponent repeated
+/// many times in a row), and the banks are few enough to stay in L1. The result
+/// is the exact count of every byte value, so nothing about the code or the
+/// emitted stream depends on which version ran.
+pub fn histogram(input: &[u8]) -> [u64; 256] {
+    let mut out = [0u64; 256];
+    accumulate_histogram(&mut out, input);
+    out
+}
+
+/// Add the byte multiplicities of `input` into `counts`.
+///
+/// `counts` must be the exact running total of everything accumulated into it;
+/// every caller either starts at zero or folds whole windows of one payload.
+pub fn accumulate_histogram(counts: &mut [u64; 256], input: &[u8]) {
+    let mut lanes = [[0u64; 256]; 4];
+    let mut chunks = input.chunks_exact(4);
+    for chunk in &mut chunks {
+        lanes[0][chunk[0] as usize] += 1;
+        lanes[1][chunk[1] as usize] += 1;
+        lanes[2][chunk[2] as usize] += 1;
+        lanes[3][chunk[3] as usize] += 1;
     }
-    if *pending == 0 {
-        *buffer = 0;
-    } else {
-        *buffer &= (1u64 << *pending) - 1;
+    for (index, &byte) in chunks.remainder().iter().enumerate() {
+        lanes[index][byte as usize] += 1;
     }
+    for symbol in 0..256usize {
+        counts[symbol] += lanes[0][symbol] + lanes[1][symbol] + lanes[2][symbol] + lanes[3][symbol];
+    }
+}
+
+/// A canonical `huffman-canonical-v1` encoder table.
+///
+/// Built from a byte histogram with exactly the tree, the length limiting and
+/// the canonical assignment of [`encode`], so reusing one table across passes or
+/// across independent partitions cannot change a single emitted bit. Each symbol
+/// carries its canonical code and code length packed into one `u64`
+/// (`length << 32 | code`) so the emitter needs one table load per symbol.
+#[derive(Clone)]
+pub(crate) struct EncoderTable {
+    packed: [u64; 256],
+    lengths: [u8; 256],
+    emitted: bool,
+}
+
+impl EncoderTable {
+    /// Build the table for a histogram. Deterministic and total.
+    pub(crate) fn from_weights(weights: &[u64; 256]) -> Self {
+        let lengths = build_lengths(weights);
+        let used = lengths.iter().filter(|&&length| length > 0).count();
+        if used < 2 {
+            // Empty plane or one symbol: the canonical form carries the table
+            // and no bitstream, so no code is ever emitted.
+            return Self {
+                packed: [0u64; 256],
+                lengths,
+                emitted: false,
+            };
+        }
+        let codes = canonical_codes(&lengths);
+        let mut packed = [0u64; 256];
+        for symbol in 0..256usize {
+            let length = u64::from(lengths[symbol]);
+            packed[symbol] = (length << 32) | u64::from(codes[symbol]);
+        }
+        Self {
+            packed,
+            lengths,
+            emitted: true,
+        }
+    }
+
+    /// The 256 serialized code-length bytes.
+    pub(crate) fn lengths(&self) -> &[u8; 256] {
+        &self.lengths
+    }
+
+    /// False when the plane has fewer than two distinct symbols, in which case
+    /// the canonical form is the table alone.
+    pub(crate) fn has_bitstream(&self) -> bool {
+        self.emitted
+    }
+
+    /// Exact bit length of coding `counts` with this table.
+    pub(crate) fn bits_from_counts(&self, counts: &[u64; 256]) -> u64 {
+        if !self.emitted {
+            return 0;
+        }
+        let mut total = 0u64;
+        for symbol in 0..256usize {
+            total += counts[symbol] * (self.packed[symbol] >> 32);
+        }
+        total
+    }
+
+    /// Exact bit length of coding `input` with this table.
+    #[cfg(test)]
+    pub(crate) fn bits(&self, input: &[u8]) -> u64 {
+        if !self.emitted {
+            return 0;
+        }
+        let mut total = 0u64;
+        for &symbol in input {
+            total += self.packed[symbol as usize] >> 32;
+        }
+        total
+    }
+
+    /// Code length of one symbol, in bits (0 for an absent symbol).
+    #[inline]
+    pub(crate) fn bits_of_byte(&self, symbol: u8) -> u64 {
+        self.packed[symbol as usize] >> 32
+    }
+
+    /// Append one symbol's canonical code.
+    #[inline]
+    pub(crate) fn push(&self, writer: &mut BitStream<'_>, symbol: u8) {
+        writer.push_packed(self.packed[symbol as usize]);
+    }
+
+    /// Emit the whole plane into `out`, which must be exactly
+    /// `(bits + 7) / 8` bytes. Returns the bytes written.
+    pub(crate) fn emit(&self, input: &[u8], out: &mut [u8]) -> usize {
+        if !self.emitted {
+            return 0;
+        }
+        let mut writer = BitStream::new(out);
+        for &symbol in input {
+            writer.push_packed(self.packed[symbol as usize]);
+        }
+        writer.finish()
+    }
+}
+
+/// Number of bytes the canonical bitstream for `bits` bits occupies.
+pub(crate) fn bytes_for_bits(bits: u64) -> u64 {
+    (bits + 7) / 8
+}
+
+/// MSB-first bit sink over a caller-sized byte slice.
+///
+/// Codes accumulate in a 64-bit register and are flushed four bytes at a time,
+/// so the hot loop has one table load, one shift/or and one predictable branch
+/// per symbol instead of the byte-at-a-time `push` of the reference emitter.
+/// `push` therefore accepts codes of at most [`MAX_CODE_BITS`] (24) bits: the
+/// register always holds `pending < 32` leftover bits, and
+/// `pending + 24 <= 55 < 64`.
+///
+/// The total number of bytes written is exactly `ceil(bits / 8)`, where `bits`
+/// is the sum of the pushed code lengths, so the caller sizes the slice once and
+/// the emitter never reallocates. [`BitStream::with_scratch`] lets a partition
+/// begin at a bit offset inside a byte and spill at most one byte past its
+/// slice, which is what makes parallel emission byte-identical.
+pub(crate) struct BitStream<'a> {
+    out: &'a mut [u8],
+    scratch: Option<&'a mut u8>,
+    spilled: bool,
+    pos: usize,
+    acc: u64,
+    pending: u32,
+}
+
+impl<'a> BitStream<'a> {
+    pub(crate) fn new(out: &'a mut [u8]) -> Self {
+        Self {
+            out,
+            scratch: None,
+            spilled: false,
+            pos: 0,
+            acc: 0,
+            pending: 0,
+        }
+    }
+
+    /// The byte that would land past the end
+    /// of `out` is written to `scratch` instead. Used for the last byte of a
+    /// partition that shares a byte with the next partition's first byte.
+    pub(crate) fn with_scratch(out: &'a mut [u8], scratch: &'a mut u8, pending: u32) -> Self {
+        debug_assert!(pending < 8);
+        Self {
+            out,
+            scratch: Some(scratch),
+            spilled: false,
+            pos: 0,
+            acc: 0,
+            pending,
+        }
+    }
+
+    /// Append a packed `(length << 32 | code)` table entry.
+    #[inline]
+    pub(crate) fn push_packed(&mut self, packed: u64) {
+        let length = (packed >> 32) as u32;
+        debug_assert!(length > 0 && length as usize <= MAX_CODE_BITS);
+        self.acc = (self.acc << length) | (packed & 0xffff_ffff);
+        self.pending += length;
+        if self.pending >= 32 {
+            self.flush_word();
+        }
+    }
+
+    #[inline]
+    fn flush_word(&mut self) {
+        self.pending -= 32;
+        let word = (self.acc >> self.pending) as u32;
+        self.put4(word.to_be_bytes());
+        self.acc &= (1u64 << self.pending) - 1;
+    }
+
+    #[inline]
+    fn put4(&mut self, bytes: [u8; 4]) {
+        let end = self.pos + 4;
+        if end <= self.out.len() {
+            self.out[self.pos..end].copy_from_slice(&bytes);
+            self.pos = end;
+        } else {
+            for byte in bytes {
+                self.put_byte(byte);
+            }
+        }
+    }
+
+    #[inline]
+    fn put_byte(&mut self, byte: u8) {
+        if self.pos < self.out.len() {
+            self.out[self.pos] = byte;
+        } else if let Some(scratch) = self.scratch.as_deref_mut() {
+            // At most one byte can be spilled: the slice always covers every
+            // byte whose bits are wholly inside the partition.
+            debug_assert!(!self.spilled, "bitstream spilled more than one byte");
+            *scratch = byte;
+            self.spilled = true;
+        } else {
+            debug_assert!(false, "bitstream overflowed its slice");
+        }
+        self.pos += 1;
+    }
+
+    /// Flush the tail and return the number of bytes written (the total bit
+    /// length rounded up to a byte boundary).
+    pub(crate) fn finish(mut self) -> usize {
+        while self.pending >= 8 {
+            self.pending -= 8;
+            let byte = (self.acc >> self.pending) as u8;
+            self.put_byte(byte);
+        }
+        if self.pending > 0 {
+            let byte = (self.acc << (8 - self.pending)) as u8;
+            self.put_byte(byte);
+        }
+        self.pos
+    }
+}
+
+/// Encode a plane with a histogram over exactly that plane.
+///
+/// The output is the 256-byte canonical table followed by the bitstream, byte
+/// for byte what [`encode`] produces. The caller must pass the histogram of
+/// `input` itself; [`histogram`] computes it.
+pub fn encode_with_weights(input: &[u8], weights: &[u64; 256]) -> Vec<u8> {
+    let table = EncoderTable::from_weights(weights);
+    let stream_len =
+        usize::try_from(bytes_for_bits(table.bits_from_counts(weights))).unwrap_or(usize::MAX);
+    let mut out = vec![0u8; TABLE_BYTES + stream_len];
+    out[..TABLE_BYTES].copy_from_slice(table.lengths());
+    let written = table.emit(input, &mut out[TABLE_BYTES..]);
+    debug_assert_eq!(written, stream_len);
+    out
 }
 
 /// Number of bytes [`encode`] would produce for a byte histogram, without
@@ -236,36 +495,8 @@ pub fn encoded_len(input: &[u8]) -> usize {
 /// Never fails: the output is always the 256-byte length table plus a
 /// zero-padded canonical bitstream.
 pub fn encode(input: &[u8]) -> Vec<u8> {
-    let mut weights = [0u64; 256];
-    for &byte in input {
-        weights[byte as usize] += 1;
-    }
-    let lengths = build_lengths(&weights);
-    let used = lengths.iter().filter(|&&length| length > 0).count();
-    let mut out = Vec::with_capacity(TABLE_BYTES + input.len());
-    out.extend_from_slice(&lengths);
-    if used < 2 {
-        // Empty plane or one symbol: canonical form has no bitstream.
-        return out;
-    }
-    let codes = canonical_codes(&lengths);
-    let mut buffer = 0u64;
-    let mut pending = 0u32;
-    for &byte in input {
-        let length = u32::from(lengths[byte as usize]);
-        debug_assert!(length > 0);
-        append_bits(
-            &mut out,
-            &mut buffer,
-            &mut pending,
-            codes[byte as usize],
-            length,
-        );
-    }
-    if pending > 0 {
-        out.push((buffer << (8 - pending)) as u8);
-    }
-    out
+    let weights = histogram(input);
+    encode_with_weights(input, &weights)
 }
 
 /// Decode a `huffman-canonical-v1` stream into exactly `expected_len` bytes.
@@ -894,6 +1125,252 @@ mod tests {
         let input = b"canonical huffman determinism";
         assert_eq!(encode(input), encode(input));
         roundtrip(input);
+    }
+
+    // ------------------------------------------------------------------
+    // Test-only reference encoder.
+    //
+    // A verbatim copy of the byte-at-a-time emitter that shipped before R19
+    // (histogram, lengths, codes, `append_bits`, then the padded tail). The
+    // shipped fast emitter must produce these bytes exactly; the widths are
+    // chosen to cover the accumulator boundaries (codes of 1, 2, 3, 8, 16 and
+    // 24 bits, planes shorter and longer than one flush word).
+    // ------------------------------------------------------------------
+
+    fn append_bits_reference(
+        out: &mut Vec<u8>,
+        buffer: &mut u64,
+        pending: &mut u32,
+        code: u32,
+        length: u32,
+    ) {
+        *buffer = (*buffer << length) | u64::from(code);
+        *pending += length;
+        while *pending >= 8 {
+            *pending -= 8;
+            out.push((*buffer >> *pending) as u8);
+        }
+        if *pending == 0 {
+            *buffer = 0;
+        } else {
+            *buffer &= (1u64 << *pending) - 1;
+        }
+    }
+
+    fn encode_reference(input: &[u8]) -> Vec<u8> {
+        let mut weights = [0u64; 256];
+        for &byte in input {
+            weights[byte as usize] += 1;
+        }
+        let lengths = build_lengths(&weights);
+        let used = lengths.iter().filter(|&&length| length > 0).count();
+        let mut out = Vec::with_capacity(TABLE_BYTES + input.len());
+        out.extend_from_slice(&lengths);
+        if used < 2 {
+            return out;
+        }
+        let codes = canonical_codes(&lengths);
+        let mut buffer = 0u64;
+        let mut pending = 0u32;
+        for &byte in input {
+            append_bits_reference(
+                &mut out,
+                &mut buffer,
+                &mut pending,
+                codes[byte as usize],
+                u32::from(lengths[byte as usize]),
+            );
+        }
+        if pending > 0 {
+            out.push((buffer << (8 - pending)) as u8);
+        }
+        out
+    }
+
+    fn skewed(len: usize, dominant: u8, share: usize, seed: u64) -> Vec<u8> {
+        let mut out = pattern(len, seed);
+        for (index, byte) in out.iter_mut().enumerate() {
+            if index % share == 0 {
+                *byte = dominant;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fast_emitter_matches_the_byte_at_a_time_reference() {
+        let mut cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0u8],
+            vec![0xffu8; 1],
+            vec![0x5au8; 4096],
+            (0..=255u8).collect(),
+            (0..=255u8).rev().collect(),
+            pattern(1, 0x1234),
+            pattern(7, 0x9999),
+            pattern(31, 0x5555),
+            pattern(32, 0x7777),
+            pattern(33, 0xdead),
+            pattern(65_537, 0xbeef),
+        ];
+        for share in [1usize, 2, 3, 5, 17, 251] {
+            cases.push(skewed(65_536, 0x7f, share, 0xabc0 ^ share as u64));
+        }
+        // Two symbols and three symbols give 1-bit and mixed-length codes.
+        let mut two = vec![0u8; 10_000];
+        for (index, byte) in two.iter_mut().enumerate() {
+            *byte = if index % 3 == 0 { 1 } else { 0 };
+        }
+        cases.push(two);
+        let mut three = vec![0u8; 10_000];
+        for (index, byte) in three.iter_mut().enumerate() {
+            *byte = match index % 7 {
+                0 => 1,
+                1..=2 => 2,
+                _ => 0,
+            };
+        }
+        cases.push(three);
+        // Fibonacci weights force the 24-bit length limit, so codes at the
+        // accumulator's maximum width are exercised.
+        let mut fib = [0u64; 32];
+        fib[0] = 1;
+        fib[1] = 1;
+        for index in 2..fib.len() {
+            fib[index] = fib[index - 1] + fib[index - 2];
+        }
+        let mut limited = Vec::new();
+        for (symbol, &count) in fib.iter().enumerate() {
+            limited.extend(std::iter::repeat(symbol as u8).take(count as usize));
+        }
+        cases.push(limited);
+
+        let mut checked = 0usize;
+        for case in &cases {
+            let reference = encode_reference(case);
+            assert_eq!(
+                encode(case),
+                reference,
+                "fast emitter differs from the reference on {} bytes",
+                case.len()
+            );
+            assert_eq!(
+                encode_with_weights(case, &histogram(case)),
+                reference,
+                "pre-sized emitter differs from the reference on {} bytes",
+                case.len()
+            );
+            checked += 1;
+        }
+        assert!(checked >= 20);
+    }
+
+    #[test]
+    fn histogram_matches_a_plain_count() {
+        for (len, seed) in [
+            (0usize, 1u64),
+            (1, 2),
+            (3, 3),
+            (4095, 4),
+            (4096, 5),
+            (1_000_003, 6),
+        ] {
+            let input = skewed(len.max(1), 0x11, 3, seed);
+            let input = &input[..len];
+            let mut plain = [0u64; 256];
+            for &byte in input {
+                plain[byte as usize] += 1;
+            }
+            assert_eq!(histogram(input), plain, "histogram mismatch at {len} bytes");
+            let mut folded = [0u64; 256];
+            for window in input.chunks(1024) {
+                accumulate_histogram(&mut folded, window);
+            }
+            assert_eq!(folded, plain, "windowed histogram mismatch at {len} bytes");
+        }
+    }
+
+    #[test]
+    fn table_bit_lengths_are_exact() {
+        for (len, seed) in [(1usize, 7u64), (2, 8), (1024, 9), (65_537, 10)] {
+            let input = skewed(len, 0x22, 4, seed);
+            let weights = histogram(&input);
+            let table = EncoderTable::from_weights(&weights);
+            assert_eq!(table.bits(&input), table.bits_from_counts(&weights));
+            let reference = encode_reference(&input);
+            let stream = table.bits(&input) as usize;
+            assert_eq!(reference.len(), TABLE_BYTES + (stream + 7) / 8);
+        }
+    }
+
+    /// Two partitions, each emitting at its own bit offset, must stitch into
+    /// exactly the single-pass bytes. This is the rule the mode-9 parallel
+    /// emitter relies on, checked here on a plain symbol stream so a failure
+    /// points at the bit arithmetic rather than at the tensor code.
+    #[test]
+    fn partitioned_emission_stitches_to_the_single_stream() {
+        let input: Vec<u8> = (0..3000u32)
+            .map(|value| if value % 11 == 0 { 7 } else { (value % 5) as u8 })
+            .collect();
+        let weights = histogram(&input);
+        let table = EncoderTable::from_weights(&weights);
+        let reference = encode_reference(&input);
+        let expected = &reference[TABLE_BYTES..];
+        assert!(!expected.is_empty());
+
+        for split_point in [1usize, 2, 3, 5, 8, 17, 999, 1500, 2999] {
+            let (head, tail) = input.split_at(split_point);
+            let head_bits = table.bits(head);
+            let tail_bits = table.bits(tail);
+            assert_eq!(head_bits + tail_bits, table.bits(&input));
+            let mut out = vec![0u8; expected.len()];
+            let mut scratch = [0u8; 2];
+
+            // Head: starts at bit 0, owns the whole bytes of its range, spills
+            // the byte it shares with the tail.
+            let head_complete = (head_bits / 8) as usize;
+            let mut writer =
+                BitStream::with_scratch(&mut out[..head_complete], &mut scratch[0], 0);
+            for &symbol in head {
+                table.push(&mut writer, symbol);
+            }
+            let written = writer.finish();
+            assert!(
+                written == head_complete || written == head_complete + 1,
+                "head wrote {written} bytes, complete is {head_complete}"
+            );
+
+            // Tail: starts at the head's end bit offset inside `out[first]`.
+            let offset = (head_bits % 8) as u32;
+            let first = (head_bits / 8) as usize;
+            let tail_complete = ((head_bits + tail_bits) / 8) as usize - first;
+            let mut writer = BitStream::with_scratch(
+                &mut out[first..first + tail_complete],
+                &mut scratch[1],
+                offset,
+            );
+            for &symbol in tail {
+                table.push(&mut writer, symbol);
+            }
+            let written = writer.finish();
+            assert!(
+                written == tail_complete || written == tail_complete + 1,
+                "tail wrote {written} bytes, complete is {tail_complete}"
+            );
+
+            // Stitch: each shared byte receives the other writer's saved byte.
+            if offset != 0 {
+                out[first] |= scratch[0];
+            }
+            if (head_bits + tail_bits) % 8 != 0 {
+                out[((head_bits + tail_bits) / 8) as usize] |= scratch[1];
+            }
+            assert_eq!(
+                &out[..],
+                expected,
+                "partition at {split_point} does not stitch to the single stream"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
