@@ -469,7 +469,8 @@ exact.
 | MW1 single committer | yes, default | yes, default | all pre-R4 suites |
 | MW2 explicit transaction API on `local`/`object`/`3fs` | yes | yes on `local`/`object` (no `3fs` in Go) | `tests/multiwriter.rs`, `store/mw2_test.go` |
 | MW2 on `s3` (MinIO) | yes | no (R4) | `scripts/bench_multiwriter.sh` MinIO row; receipt cited in `bench/RESULTS-multiwriter.md` |
-| MW2 on `gcs`/`azure` | **refused** `UnsupportedVersion` | **refused** for `azure` (no GCS plane in Go) | not claimed |
+| MW2 on `azure` (Azurite) | yes (R14d) | yes (R14d) | `tests/azure_backend.rs` (`two_optimistic_committers_publish_disjoint_files_on_azure`), `store/azure_integration_test.go` (`TestAzureOptimisticTwoDisjointCommitters`) |
+| MW2 on `gcs` | **refused** `UnsupportedVersion` | refused (no GCS plane in Go's MW2 gate) | not claimed |
 | MW2 for FUSE file mutations | **not implemented** | **not implemented** | FUSE remains MW1 |
 | MW2 for checkpoint publish | **not implemented as a generic path**; a tensor/shard set can be expressed as a transaction | no | not claimed |
 | mixed Rust/Go concurrent writers | yes | yes | `scripts/multiwriter_court.sh`, receipt `multiwriter-court-20261109T143346Z` (parity commit file and superblock byte-identical; 160/160 disjoint; 1/80 contended winner; finite history check) |

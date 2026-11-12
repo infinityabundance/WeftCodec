@@ -331,6 +331,60 @@ pub struct Frame<'a> {
 /// invalid combination of mode/flags/tables is rejected here as well as on
 /// decode.
 pub fn encode_frame(parts: &FrameParts<'_>, limits: &Limits) -> Result<Vec<u8>> {
+    let body = parts.body;
+    let out = encode_frame_inner(parts, body.len() as u64, limits, |target| {
+        target.copy_from_slice(body);
+        Ok(())
+    })?;
+    // Self-validate the layout (but not the content hash, which requires the
+    // plaintext).
+    Frame::parse(&out, limits)?;
+    Ok(out)
+}
+
+/// Encode a frame whose body the caller writes directly into the frame buffer.
+///
+/// Byte-identical to [`encode_frame`] for the same header fields and body
+/// length: the header, the trailer CRC and the layout validation are the same
+/// code. It exists so an encoder that already produced its payload in one
+/// buffer does not have to copy it through an intermediate `body` vector.
+/// `parts.body` is ignored, and must be empty.
+pub fn encode_frame_with_body<F>(
+    parts: &FrameParts<'_>,
+    body_len: u64,
+    limits: &Limits,
+    write_body: F,
+) -> Result<Vec<u8>>
+where
+    F: FnOnce(&mut [u8]) -> Result<()>,
+{
+    if !parts.body.is_empty() {
+        return Err(Error::malformed(
+            "encode_frame_with_body called with a non-empty parts.body",
+        ));
+    }
+    if body_len == 0 {
+        return Err(Error::malformed(
+            "encode_frame_with_body requires a non-empty body",
+        ));
+    }
+    let out = encode_frame_inner(parts, body_len, limits, write_body)?;
+    // The trailer CRC was just computed over exactly these bytes by
+    // `encode_frame_inner`, so re-reading them adds nothing; the header, the
+    // table rules and the mode/flag rules are still validated in full.
+    Frame::parse_without_trailer_check(&out, limits)?;
+    Ok(out)
+}
+
+fn encode_frame_inner<F>(
+    parts: &FrameParts<'_>,
+    body_len: u64,
+    limits: &Limits,
+    write_body: F,
+) -> Result<Vec<u8>>
+where
+    F: FnOnce(&mut [u8]) -> Result<()>,
+{
     let dep_count = u32::try_from(parts.dependencies.len())
         .map_err(|_| Error::limit_exceeded("dependency count does not fit u32"))?;
     let chunk_count = u32::try_from(parts.chunks.len())
@@ -343,7 +397,6 @@ pub fn encode_frame(parts: &FrameParts<'_>, limits: &Limits) -> Result<Vec<u8>> 
                 .and_then(|c| v.checked_add(c))
         })
         .ok_or_else(|| Error::limit_exceeded("table length overflow"))?;
-    let body_len = parts.body.len() as u64;
 
     let mut features: u16 = 0;
     if !parts.dependencies.is_empty() {
@@ -389,29 +442,33 @@ pub fn encode_frame(parts: &FrameParts<'_>, limits: &Limits) -> Result<Vec<u8>> 
 
     let capacity = usize::try_from(total)
         .map_err(|_| Error::limit_exceeded("frame length does not fit usize"))?;
-    let mut out = Vec::with_capacity(capacity);
-    out.extend_from_slice(&header);
+    // `vec![0u8; n]` is an `alloc_zeroed` request, so the buffer is not memset
+    // before the caller fills it; every byte is written below.
+    let mut out = vec![0u8; capacity];
+    out[..HEADER_LEN].copy_from_slice(&header);
+    let mut at = HEADER_LEN;
     for dep in parts.dependencies {
-        out.extend_from_slice(dep.hash.as_bytes());
-        out.extend_from_slice(&dep.decoded_len.to_le_bytes());
-        out.push(dep.dep_domain);
-        out.push(dep.dep_flags);
-        out.extend_from_slice(&[0u8, 0u8]);
-        out.extend_from_slice(&dep.codec_hint.to_le_bytes());
+        out[at..at + 32].copy_from_slice(dep.hash.as_bytes());
+        out[at + 32..at + 40].copy_from_slice(&dep.decoded_len.to_le_bytes());
+        out[at + 40] = dep.dep_domain;
+        out[at + 41] = dep.dep_flags;
+        // 42..44 reserved zero
+        out[at + 44..at + 48].copy_from_slice(&dep.codec_hint.to_le_bytes());
+        at += DEP_ENTRY_LEN;
     }
     for chunk in parts.chunks {
-        out.extend_from_slice(&chunk.encoded_off.to_le_bytes());
-        out.extend_from_slice(&chunk.encoded_len.to_le_bytes());
-        out.extend_from_slice(&chunk.decoded_len.to_le_bytes());
-        out.extend_from_slice(chunk.hash.as_bytes());
+        out[at..at + 8].copy_from_slice(&chunk.encoded_off.to_le_bytes());
+        out[at + 8..at + 12].copy_from_slice(&chunk.encoded_len.to_le_bytes());
+        out[at + 12..at + 16].copy_from_slice(&chunk.decoded_len.to_le_bytes());
+        out[at + 16..at + 48].copy_from_slice(chunk.hash.as_bytes());
+        at += CHUNK_ENTRY_LEN;
     }
-    out.extend_from_slice(parts.body);
-    let trailer = crc32c::crc32c(&out);
-    out.extend_from_slice(&trailer.to_le_bytes());
-
-    // Self-validate the layout (but not the content hash, which requires the
-    // plaintext).
-    Frame::parse(&out, limits)?;
+    let body_len_usize = usize::try_from(body_len)
+        .map_err(|_| Error::limit_exceeded("body length does not fit usize"))?;
+    write_body(&mut out[at..at + body_len_usize])?;
+    let trailer_at = capacity - TRAILER_LEN;
+    let trailer = crc32c::crc32c(&out[..trailer_at]);
+    out[trailer_at..].copy_from_slice(&trailer.to_le_bytes());
     Ok(out)
 }
 
@@ -465,6 +522,21 @@ impl<'a> Frame<'a> {
 
     /// Parse and fully validate a frame.
     pub fn parse(bytes: &'a [u8], limits: &Limits) -> Result<Self> {
+        Self::parse_impl(bytes, limits, true)
+    }
+
+    /// Parse and validate everything except the trailer CRC.
+    ///
+    /// Only for an encoder that has just computed that CRC over exactly these
+    /// bytes: re-reading a multi-hundred-megabyte frame to check a value the
+    /// same code path wrote is pure cost. The header CRC, the tables, the
+    /// length agreement and the mode/flag rules are all still validated.
+    #[doc(hidden)]
+    pub fn parse_without_trailer_check(bytes: &'a [u8], limits: &Limits) -> Result<Self> {
+        Self::parse_impl(bytes, limits, false)
+    }
+
+    fn parse_impl(bytes: &'a [u8], limits: &Limits, verify_trailer: bool) -> Result<Self> {
         if bytes.len() < HEADER_LEN + TRAILER_LEN {
             return Err(Error::malformed(format!(
                 "frame length {} is below the minimum {}",
@@ -523,7 +595,7 @@ impl<'a> Frame<'a> {
 
         let trailer_at = bytes.len() - TRAILER_LEN;
         let stored_trailer_crc = le_u32(bytes, trailer_at);
-        if crc32c::crc32c(&bytes[..trailer_at]) != stored_trailer_crc {
+        if verify_trailer && crc32c::crc32c(&bytes[..trailer_at]) != stored_trailer_crc {
             return Err(Error::corrupt("frame trailer CRC32C mismatch"));
         }
 
