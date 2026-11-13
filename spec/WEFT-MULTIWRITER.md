@@ -127,7 +127,7 @@ Primitive per backend:
 | `local`, `object`, `3fs` | read–verify–write under a short publication lock on `LOCK.publish` (`fcntl` OFD + compatibility `flock`), then one 4 KiB slot write | store acquires the publication lock for the critical section only | the publication lock serialises only the head critical section; prepare and encode run outside it |
 | `s3` | `GET` + `PUT` with `If-Match: <ETag>` on `superblock` | native conditional write | the object store's conditional PUT |
 | `gcs` *(backend implemented in Rust and Go; MW2 refused — §12)* | metadata+media read, then upload with `ifGenerationMatch=<observed>` | native conditional write | the object store's generation precondition |
-| `azure` *(backend implemented in Rust (R21) and Go (R14); MW2 refused — §12)* | `Get Blob` + `Put Blob` with `If-Match: <ETag>` | native conditional write | the object store's conditional PUT |
+| `azure` *(backend implemented in Rust (R21) and Go (R14); MW2 implemented in both — §12)* | `Get Blob` + `Put Blob` with `If-Match: <ETag>` | native conditional write | the object store's conditional PUT |
 
 `LOCK.publish` is **not** the single-writer `LOCK`. It is created lazily only
 by an optimistic store, is never read for correctness, and carries no bytes
