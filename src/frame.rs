@@ -385,6 +385,51 @@ fn encode_frame_inner<F>(
 where
     F: FnOnce(&mut [u8]) -> Result<()>,
 {
+    let (header, table) = header_and_tables(parts, body_len, limits)?;
+    let table_len = table.len() as u64;
+    let total = (HEADER_LEN as u64)
+        .checked_add(table_len)
+        .and_then(|v| v.checked_add(body_len))
+        .and_then(|v| v.checked_add(TRAILER_LEN as u64))
+        .ok_or_else(|| Error::limit_exceeded("frame length overflow"))?;
+    let capacity = usize::try_from(total)
+        .map_err(|_| Error::limit_exceeded("frame length does not fit usize"))?;
+    // `vec![0u8; n]` is an `alloc_zeroed` request, so the buffer is not memset
+    // before the caller fills it; every byte is written below.
+    let mut out = vec![0u8; capacity];
+    out[..HEADER_LEN].copy_from_slice(&header);
+    let body_at = HEADER_LEN + table.len();
+    out[HEADER_LEN..body_at].copy_from_slice(&table);
+    let body_len_usize = usize::try_from(body_len)
+        .map_err(|_| Error::limit_exceeded("body length does not fit usize"))?;
+    write_body(&mut out[body_at..body_at + body_len_usize])?;
+    let trailer_at = capacity - TRAILER_LEN;
+    let trailer = crc32c::crc32c(&out[..trailer_at]);
+    out[trailer_at..].copy_from_slice(&trailer.to_le_bytes());
+    Ok(out)
+}
+
+/// Serialize the frame header and its dependency/chunk tables.
+///
+/// The returned bytes are exactly the prefix [`encode_frame`] writes for the
+/// same `parts` and `body_len`, so an encoder that fills the body itself (a
+/// streaming encoder that cannot know the compressed body length up front)
+/// shares the header, table and validation code instead of re-implementing it.
+/// The trailer is not included: it is a CRC over the finished frame.
+pub fn encode_preamble(parts: &FrameParts<'_>, body_len: u64, limits: &Limits) -> Result<Vec<u8>> {
+    let (header, table) = header_and_tables(parts, body_len, limits)?;
+    let mut out = Vec::with_capacity(HEADER_LEN + table.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&table);
+    Ok(out)
+}
+
+/// The header and tables `encode_frame` writes ahead of the body.
+fn header_and_tables(
+    parts: &FrameParts<'_>,
+    body_len: u64,
+    limits: &Limits,
+) -> Result<([u8; HEADER_LEN], Vec<u8>)> {
     let dep_count = u32::try_from(parts.dependencies.len())
         .map_err(|_| Error::limit_exceeded("dependency count does not fit u32"))?;
     let chunk_count = u32::try_from(parts.chunks.len())
@@ -440,36 +485,23 @@ where
     let header_crc = crc32c::crc32c(&crc_input);
     header[72..76].copy_from_slice(&header_crc.to_le_bytes());
 
-    let capacity = usize::try_from(total)
-        .map_err(|_| Error::limit_exceeded("frame length does not fit usize"))?;
-    // `vec![0u8; n]` is an `alloc_zeroed` request, so the buffer is not memset
-    // before the caller fills it; every byte is written below.
-    let mut out = vec![0u8; capacity];
-    out[..HEADER_LEN].copy_from_slice(&header);
-    let mut at = HEADER_LEN;
+    let mut table = Vec::with_capacity(table_len as usize);
     for dep in parts.dependencies {
-        out[at..at + 32].copy_from_slice(dep.hash.as_bytes());
-        out[at + 32..at + 40].copy_from_slice(&dep.decoded_len.to_le_bytes());
-        out[at + 40] = dep.dep_domain;
-        out[at + 41] = dep.dep_flags;
+        table.extend_from_slice(dep.hash.as_bytes());
+        table.extend_from_slice(&dep.decoded_len.to_le_bytes());
+        table.push(dep.dep_domain);
+        table.push(dep.dep_flags);
         // 42..44 reserved zero
-        out[at + 44..at + 48].copy_from_slice(&dep.codec_hint.to_le_bytes());
-        at += DEP_ENTRY_LEN;
+        table.extend_from_slice(&[0u8; 2]);
+        table.extend_from_slice(&dep.codec_hint.to_le_bytes());
     }
     for chunk in parts.chunks {
-        out[at..at + 8].copy_from_slice(&chunk.encoded_off.to_le_bytes());
-        out[at + 8..at + 12].copy_from_slice(&chunk.encoded_len.to_le_bytes());
-        out[at + 12..at + 16].copy_from_slice(&chunk.decoded_len.to_le_bytes());
-        out[at + 16..at + 48].copy_from_slice(chunk.hash.as_bytes());
-        at += CHUNK_ENTRY_LEN;
+        table.extend_from_slice(&chunk.encoded_off.to_le_bytes());
+        table.extend_from_slice(&chunk.encoded_len.to_le_bytes());
+        table.extend_from_slice(&chunk.decoded_len.to_le_bytes());
+        table.extend_from_slice(chunk.hash.as_bytes());
     }
-    let body_len_usize = usize::try_from(body_len)
-        .map_err(|_| Error::limit_exceeded("body length does not fit usize"))?;
-    write_body(&mut out[at..at + body_len_usize])?;
-    let trailer_at = capacity - TRAILER_LEN;
-    let trailer = crc32c::crc32c(&out[..trailer_at]);
-    out[trailer_at..].copy_from_slice(&trailer.to_le_bytes());
-    Ok(out)
+    Ok((header, table))
 }
 
 /// Input to [`encode_frame`].

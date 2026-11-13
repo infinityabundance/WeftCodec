@@ -191,6 +191,138 @@ pub fn encode_zstd_with(
     encode_frame(&parts, limits)
 }
 
+/// Encode a **chunked** ZSTD frame from a bounded source.
+///
+/// Byte-identical to [`encode_zstd`] / [`encode_zstd_with`] for the same level
+/// and chunk size: each codec chunk is compressed by the same `compress` call
+/// and concatenated in index order, and the header, chunk table and trailer
+/// come from the shared frame preamble.
+///
+/// Only chunked frames can be streamed. An unchunked ZSTD frame is a single
+/// zstd stream whose internal flush decisions are not part of the wire format,
+/// so a bounded source cannot reproduce the one-shot bytes with certainty; a
+/// `chunk_size` of `None` is refused rather than silently differing.
+///
+/// The frame is assembled in **one** buffer: the header and the chunk table are
+/// reserved, chunk bodies are appended in place, and the preamble is written
+/// once the body length is known. `body_capacity_hint` sizes that buffer (the
+/// caller usually has an upper estimate); the real bound is
+/// `max_stream_bytes`, which fails closed before the buffer can exceed it.
+pub fn encode_zstd_stream<S: ByteSource + ?Sized>(
+    source: &mut S,
+    level: i32,
+    chunk_size: Option<usize>,
+    limits: &Limits,
+    max_stream_bytes: u64,
+    body_capacity_hint: u64,
+) -> Result<Vec<u8>> {
+    let size = chunk_size.ok_or_else(|| {
+        Error::unsupported_mode(
+            "a streaming ZSTD encode requires chunking; an unchunked frame is one zstd stream \
+             and a bounded source cannot reproduce it byte for byte",
+        )
+    })?;
+    validate_chunk_size(chunk_size)?;
+    let total_len = source.len();
+    if total_len == 0 {
+        return Err(Error::malformed(
+            "a streaming ZSTD frame requires a non-empty source",
+        ));
+    }
+    check_len(total_len, limits.max_decoded_bytes, "decoded data")?;
+    let count = total_len.div_ceil(size as u64);
+    check_len(count, limits.max_chunks, "chunk count")?;
+    let preamble_len = (crate::frame::HEADER_LEN as u64)
+        .checked_add(
+            count
+                .checked_mul(crate::frame::CHUNK_ENTRY_LEN as u64)
+                .ok_or_else(|| Error::limit_exceeded("chunk table length overflow"))?,
+        )
+        .ok_or_else(|| Error::limit_exceeded("frame preamble length overflow"))?;
+    let max_body = max_stream_bytes
+        .saturating_sub(preamble_len)
+        .saturating_sub(crate::frame::TRAILER_LEN as u64);
+    if max_body == 0 {
+        return Err(Error::limit_exceeded(format!(
+            "streaming ZSTD frame bound {max_stream_bytes} is below the {preamble_len}-byte \
+             preamble for {count} chunks"
+        )));
+    }
+    let capacity = preamble_len
+        .saturating_add(body_capacity_hint.min(max_body))
+        .saturating_add(crate::frame::TRAILER_LEN as u64);
+    let capacity = usize::try_from(capacity)
+        .map_err(|_| Error::limit_exceeded("streaming ZSTD capacity does not fit usize"))?;
+    let preamble_len_usize = usize::try_from(preamble_len)
+        .map_err(|_| Error::limit_exceeded("frame preamble length does not fit usize"))?;
+
+    let mut out: Vec<u8> = Vec::with_capacity(capacity);
+    out.resize(preamble_len_usize, 0);
+    let mut chunks: Vec<ChunkEntry> = Vec::with_capacity(count as usize);
+    let mut hasher = DomainHasher::new(DOMAIN_CHUNK);
+    let mut compressor = zstd::bulk::Compressor::new(level)
+        .map_err(|err| Error::malformed(format!("zstd compressor init failed: {err}")))?;
+    let mut buffer = vec![0u8; size];
+    let mut offset: u64 = 0;
+    let mut body_len: u64 = 0;
+    for _ in 0..count {
+        let chunk_len = (total_len - offset).min(size as u64) as usize;
+        let window = &mut buffer[..chunk_len];
+        source.read_at(offset, window)?;
+        hasher.update(window);
+        let encoded = compressor
+            .compress(window)
+            .map_err(|err| Error::malformed(format!("zstd compression failed: {err}")))?;
+        let encoded_len = u32::try_from(encoded.len())
+            .map_err(|_| Error::limit_exceeded("encoded chunk does not fit u32"))?;
+        let body_end = body_len
+            .checked_add(u64::from(encoded_len))
+            .ok_or_else(|| Error::limit_exceeded("ZSTD body length overflow"))?;
+        if body_end > max_body {
+            return Err(Error::limit_exceeded(format!(
+                "streaming ZSTD body would be {body_end} bytes, above the {max_body}-byte \
+                 budget left by the declared {max_stream_bytes}-byte frame bound"
+            )));
+        }
+        chunks.push(ChunkEntry {
+            encoded_off: body_len,
+            encoded_len,
+            decoded_len: u32::try_from(chunk_len)
+                .map_err(|_| Error::limit_exceeded("decoded chunk does not fit u32"))?,
+            hash: hash_domain(DOMAIN_CHUNK, window),
+        });
+        out.extend_from_slice(&encoded);
+        body_len = body_end;
+        offset = offset
+            .checked_add(chunk_len as u64)
+            .ok_or_else(|| Error::limit_exceeded("ZSTD chunk offset overflow"))?;
+    }
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::Zstd,
+        flags: crate::frame::flags::CHUNKED,
+        level: level_to_u16(level)?,
+        decoded_len: total_len,
+        content_hash: hasher.finalize(),
+        dependencies: &[],
+        chunks: &chunks,
+        body: &[],
+    };
+    let preamble = crate::frame::encode_preamble(&parts, body_len, limits)?;
+    if preamble.len() != preamble_len_usize {
+        return Err(Error::corrupt(format!(
+            "streaming ZSTD preamble is {} bytes but the plan reserved {preamble_len_usize}",
+            preamble.len()
+        )));
+    }
+    out[..preamble_len_usize].copy_from_slice(&preamble);
+    let trailer = crc32c::crc32c(&out);
+    out.extend_from_slice(&trailer.to_le_bytes());
+    Ok(out)
+}
+
 /// Compress every codec chunk in ordered batches, `threads` chunks at a time.
 ///
 /// The result is exactly [`maybe_chunked`]'s `(body, chunks)` for the same
@@ -2972,6 +3104,451 @@ fn split_range(count: usize, partitions: usize) -> Vec<(usize, usize)> {
         at += take;
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Streaming FLOAT_TENSOR encode (subphase X04)
+// ---------------------------------------------------------------------------
+
+/// A bounded, random-access source of tensor bytes.
+///
+/// The encoder never asks for more than its own window at a time, so a source
+/// backed by a file, a mapped shard or a network range read never has to
+/// materialise the tensor. Both passes read the same logical bytes; a source
+/// must therefore be stable for the lifetime of one encode.
+pub trait ByteSource {
+    /// Total number of bytes the source holds.
+    fn len(&self) -> u64;
+    /// True when the source holds no bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Fill `out` with exactly `out.len()` bytes starting at logical `offset`.
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> Result<()>;
+}
+
+impl ByteSource for [u8] {
+    fn len(&self) -> u64 {
+        <[u8]>::len(self) as u64
+    }
+
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> Result<()> {
+        slice_read_at(self, offset, out)
+    }
+}
+
+impl ByteSource for &[u8] {
+    fn len(&self) -> u64 {
+        <[u8]>::len(self) as u64
+    }
+
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> Result<()> {
+        slice_read_at(self, offset, out)
+    }
+}
+
+fn slice_read_at(slice: &[u8], offset: u64, out: &mut [u8]) -> Result<()> {
+    let start = usize::try_from(offset)
+        .map_err(|_| Error::limit_exceeded("float tensor read offset does not fit usize"))?;
+    let end = start
+        .checked_add(out.len())
+        .ok_or_else(|| Error::limit_exceeded("float tensor read range overflows usize"))?;
+    if end > slice.len() {
+        return Err(Error::malformed(format!(
+            "float tensor source is {} bytes but the read ends at {end}",
+            slice.len()
+        )));
+    }
+    out.copy_from_slice(&slice[start..end]);
+    Ok(())
+}
+
+/// Bounds for the streaming mode-9 encoder.
+#[derive(Clone, Copy, Debug)]
+pub struct FloatTensorStreamOptions {
+    /// Bytes read from the source per window. Trimmed down to a whole number of
+    /// elements; it cannot change an emitted byte.
+    pub window_bytes: usize,
+    /// Hard bound on the frame the encoder may allocate. A tensor whose exact
+    /// frame is larger fails closed with `LimitExceeded` and nothing is
+    /// allocated. Values above `Limits::max_frame_bytes` are clamped down.
+    pub max_stream_bytes: u64,
+}
+
+impl Default for FloatTensorStreamOptions {
+    fn default() -> Self {
+        Self {
+            window_bytes: 1 << 20,
+            max_stream_bytes: Limits::default().max_frame_bytes,
+        }
+    }
+}
+
+impl FloatTensorStreamOptions {
+    /// Validate the bounds. A zero window would make no progress.
+    pub fn validate(&self) -> Result<()> {
+        if self.window_bytes == 0 {
+            return Err(Error::malformed(
+                "streaming window_bytes must be greater than zero",
+            ));
+        }
+        if self.max_stream_bytes == 0 {
+            return Err(Error::malformed(
+                "streaming max_stream_bytes must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What one bounded pass over a source learns about a mode-9 frame.
+///
+/// `histogram` is the exact exponent multiplicity vector, so `frame_bytes` is
+/// the exact length [`encode_float_tensor_stream`] will produce — not an
+/// estimate. A caller that already has an analysis may pass it back to the
+/// encoder to avoid the second counting pass.
+#[derive(Clone, Debug)]
+pub struct FloatTensorStreamAnalysis {
+    pub element_count: u64,
+    pub decoded_bytes: u64,
+    pub histogram: [u64; 256],
+    pub content_hash: Hash32,
+    pub exponent_plane_len: u64,
+    pub mantissa_plane_len: u64,
+    pub frame_bytes: u64,
+}
+
+impl FloatTensorStreamAnalysis {
+    /// Build an analysis from an already-computed histogram and content hash.
+    ///
+    /// The store's analyse stage produces both in its own bounded pass, so this
+    /// is how it hands them back without a third traversal. The frame length is
+    /// recomputed from the histogram by the same exact function the predictor
+    /// uses, and the histogram is checked against the shape, so a mismatched
+    /// analysis is refused rather than trusted.
+    pub fn from_histogram(
+        dtype: FloatDtype,
+        shape: &[u64],
+        histogram: [u64; 256],
+        content_hash: Hash32,
+        limits: &Limits,
+    ) -> Result<Self> {
+        let frame_bytes =
+            float_tensor_encoded_len_from_histogram(dtype, shape, &histogram, limits)?;
+        let element_count = float_tensor_product(shape, limits)?;
+        let decoded_bytes = element_count
+            .checked_mul(dtype.element_size())
+            .ok_or_else(|| {
+                Error::limit_exceeded("float tensor decoded byte count overflows u64")
+            })?;
+        let table = huffman::EncoderTable::from_weights(&histogram);
+        let exponent_plane_len =
+            TABLE_BYTES as u64 + huffman::bytes_for_bits(table.bits_from_counts(&histogram));
+        let mantissa_plane_len = element_count
+            .checked_mul(dtype.sign_bits() + dtype.mantissa_bits())
+            .ok_or_else(|| Error::limit_exceeded("float tensor mantissa bit count overflows u64"))?
+            .div_ceil(8);
+        Ok(FloatTensorStreamAnalysis {
+            element_count,
+            decoded_bytes,
+            histogram,
+            content_hash,
+            exponent_plane_len,
+            mantissa_plane_len,
+            frame_bytes,
+        })
+    }
+}
+
+/// Validate the shape/dtype/source-length contract shared by both phases.
+fn float_tensor_stream_form<S: ByteSource + ?Sized>(
+    source: &S,
+    dtype: FloatDtype,
+    shape: &[u64],
+    limits: &Limits,
+) -> Result<(u64, u64, usize)> {
+    if dtype.element_bits() % 8 != 0 {
+        return Err(Error::malformed(format!(
+            "float tensor dtype `{}` is not byte-aligned",
+            dtype.as_str()
+        )));
+    }
+    let element_count = float_tensor_product(shape, limits)?;
+    let decoded_bytes = element_count
+        .checked_mul(dtype.element_size())
+        .ok_or_else(|| Error::limit_exceeded("float tensor decoded byte count overflows u64"))?;
+    check_len(
+        decoded_bytes,
+        limits.max_decoded_bytes,
+        "float tensor decoded bytes",
+    )?;
+    let available = source.len();
+    if available != decoded_bytes {
+        return Err(Error::malformed(format!(
+            "float tensor source is {available} bytes but shape {shape:?} x {} is {decoded_bytes} bytes",
+            dtype.as_str()
+        )));
+    }
+    let element_bytes = usize::try_from(dtype.element_size())
+        .map_err(|_| Error::limit_exceeded("float tensor element size does not fit usize"))?;
+    Ok((element_count, decoded_bytes, element_bytes))
+}
+
+/// One bounded pass: exponent histogram, plaintext content hash and the exact
+/// frame length.
+///
+/// Reads the source in element-aligned windows and materialises nothing. The
+/// histogram and the hash are folded window by window, so the result is
+/// identical to [`float_tensor_exponent_histogram`] and
+/// `hash_domain(DOMAIN_CHUNK, ..)` over the whole payload.
+pub fn analyse_float_tensor_stream<S: ByteSource + ?Sized>(
+    source: &mut S,
+    dtype: FloatDtype,
+    shape: &[u64],
+    limits: &Limits,
+    options: &FloatTensorStreamOptions,
+) -> Result<FloatTensorStreamAnalysis> {
+    options.validate()?;
+    let (element_count, decoded_bytes, element_bytes) =
+        float_tensor_stream_form(source, dtype, shape, limits)?;
+    let window = stream_window(options.window_bytes, element_bytes);
+    let mut buffer = vec![0u8; window];
+    let mut histogram = [0u64; 256];
+    let mut hasher = DomainHasher::new(DOMAIN_CHUNK);
+    let mut done: u64 = 0;
+    while done < element_count {
+        let remaining = (element_count - done) as usize;
+        let elements = remaining.min(window / element_bytes);
+        let bytes = elements * element_bytes;
+        let offset = done * element_bytes as u64;
+        source.read_at(offset, &mut buffer[..bytes])?;
+        accumulate_float_tensor_histogram(&mut histogram, &buffer[..bytes], dtype)?;
+        hasher.update(&buffer[..bytes]);
+        done += elements as u64;
+    }
+    let content_hash = hasher.finalize();
+    let frame_bytes = float_tensor_encoded_len_from_histogram(dtype, shape, &histogram, limits)?;
+    let exponent_plane_len = TABLE_BYTES as u64
+        + huffman::bytes_for_bits(
+            huffman::EncoderTable::from_weights(&histogram).bits_from_counts(&histogram),
+        );
+    let mantissa_plane_len = element_count
+        .checked_mul(dtype.sign_bits() + dtype.mantissa_bits())
+        .ok_or_else(|| Error::limit_exceeded("float tensor mantissa bit count overflows u64"))?
+        .div_ceil(8);
+    Ok(FloatTensorStreamAnalysis {
+        element_count,
+        decoded_bytes,
+        histogram,
+        content_hash,
+        exponent_plane_len,
+        mantissa_plane_len,
+        frame_bytes,
+    })
+}
+
+/// Window size trimmed to a whole number of elements (at least one element).
+fn stream_window(window_bytes: usize, element_bytes: usize) -> usize {
+    let elements = (window_bytes / element_bytes).max(1);
+    // Bounded so a caller-supplied window cannot request an unbounded buffer.
+    elements.min(1 << 24) * element_bytes
+}
+
+/// Encode a FLOAT_TENSOR frame from a bounded source.
+///
+/// The emitted bytes are **identical** to [`encode_float_tensor_with`] (and to
+/// [`encode_float_tensor`], whose default is sequential emission): the same
+/// canonical table, the same symbol order, the same bit packing and the same
+/// padding. The source is read twice and never materialised: one bounded pass
+/// for the histogram and the content hash, one bounded pass that writes the
+/// exponent bitstream and the sign+mantissa plane straight into the frame
+/// buffer.
+///
+/// Memory is exactly one frame buffer (whose size is known before allocating)
+/// plus one window. A frame above `options.max_stream_bytes` fails closed.
+pub fn encode_float_tensor_stream<S: ByteSource + ?Sized>(
+    source: &mut S,
+    dtype: FloatDtype,
+    shape: &[u64],
+    limits: &Limits,
+    options: &FloatTensorStreamOptions,
+    analysis: Option<&FloatTensorStreamAnalysis>,
+) -> Result<Vec<u8>> {
+    options.validate()?;
+    let (element_count, decoded_bytes, element_bytes) =
+        float_tensor_stream_form(source, dtype, shape, limits)?;
+    let analysis = match analysis {
+        Some(analysis) => {
+            let counted = analysis
+                .histogram
+                .iter()
+                .try_fold(0u64, |total, &count| total.checked_add(count))
+                .ok_or_else(|| {
+                    Error::limit_exceeded("float tensor histogram count overflows u64")
+                })?;
+            if counted != element_count || analysis.decoded_bytes != decoded_bytes {
+                return Err(Error::malformed(format!(
+                    "float tensor analysis describes {counted} elements / {} bytes but the source requires {element_count} elements / {decoded_bytes} bytes",
+                    analysis.decoded_bytes
+                )));
+            }
+            analysis
+        }
+        None => &analyse_float_tensor_stream(source, dtype, shape, limits, options)?,
+    };
+    let bound = options.max_stream_bytes.min(limits.max_frame_bytes);
+    check_len(analysis.frame_bytes, bound, "streaming float tensor frame")?;
+    let window = stream_window(options.window_bytes, element_bytes);
+    let table = huffman::EncoderTable::from_weights(&analysis.histogram);
+    let exponent_plane_len = analysis.exponent_plane_len;
+    let mantissa_plane_len = analysis.mantissa_plane_len;
+    let stored_len = exponent_plane_len
+        .checked_add(mantissa_plane_len)
+        .ok_or_else(|| Error::limit_exceeded("float tensor stored plane length overflows u64"))?;
+    let placeholder = float_tensor_meta(
+        dtype,
+        shape,
+        element_count,
+        exponent_plane_len,
+        mantissa_plane_len,
+        &[0u8; 32],
+    );
+    let descriptor_len = wcb::encode(&placeholder, limits)?.len() as u64;
+    let body_len = 4u64
+        .checked_add(descriptor_len)
+        .and_then(|value| value.checked_add(stored_len))
+        .ok_or_else(|| Error::limit_exceeded("float tensor body length overflows u64"))?;
+    let descriptor_len_usize = usize::try_from(descriptor_len)
+        .map_err(|_| Error::limit_exceeded("float tensor descriptor does not fit usize"))?;
+    let stored_len_usize = usize::try_from(stored_len)
+        .map_err(|_| Error::limit_exceeded("float tensor stored plane does not fit usize"))?;
+    let exponent_plane_len_usize = usize::try_from(exponent_plane_len)
+        .map_err(|_| Error::limit_exceeded("float tensor exponent plane does not fit usize"))?;
+
+    let parts = FrameParts {
+        format_major: FORMAT_MAJOR,
+        format_minor: FORMAT_MINOR,
+        domain: DOMAIN_PAYLOAD,
+        mode: Mode::FloatTensor,
+        flags: 0,
+        level: FLOAT_TENSOR_LEVEL,
+        decoded_len: decoded_bytes,
+        content_hash: analysis.content_hash,
+        dependencies: &[],
+        chunks: &[],
+        body: &[],
+    };
+    encode_frame_with_body(&parts, body_len, limits, |body| {
+        body[..4].copy_from_slice(&(descriptor_len as u32).to_le_bytes());
+        let stored_at = 4 + descriptor_len_usize;
+        let (exponent_region, mantissa_region) =
+            body[stored_at..stored_at + stored_len_usize].split_at_mut(exponent_plane_len_usize);
+        exponent_region[..TABLE_BYTES].copy_from_slice(table.lengths());
+        emit_float_tensor_planes_streamed(
+            source,
+            dtype,
+            element_count,
+            window,
+            &table,
+            &mut exponent_region[TABLE_BYTES..],
+            mantissa_region,
+        )?;
+        let payload_hash = hash_domain(DOMAIN_FLOAT_TENSOR_PAYLOAD, &body[stored_at..]);
+        let meta = float_tensor_meta(
+            dtype,
+            shape,
+            element_count,
+            exponent_plane_len,
+            mantissa_plane_len,
+            payload_hash.as_bytes(),
+        );
+        let meta_bytes = wcb::encode(&meta, limits)?;
+        if meta_bytes.len() != descriptor_len_usize {
+            return Err(Error::corrupt(format!(
+                "float tensor descriptor length {} differs from the planned {descriptor_len_usize}",
+                meta_bytes.len()
+            )));
+        }
+        body[4..stored_at].copy_from_slice(&meta_bytes);
+        Ok(())
+    })
+}
+
+/// Second bounded pass: fill both planes from element-aligned source windows.
+///
+/// This is the sequential emitter of [`emit_float_tensor_planes`] with the
+/// payload read window by window, so it cannot differ from it by a bit. The
+/// parallel BF16 emitter is a schedule over the same push sequence
+/// (`emit_bf16_parallel`), so streaming also matches a many-threaded one-shot
+/// encode.
+#[allow(clippy::too_many_arguments)]
+fn emit_float_tensor_planes_streamed<S: ByteSource + ?Sized>(
+    source: &mut S,
+    dtype: FloatDtype,
+    element_count: u64,
+    window: usize,
+    table: &huffman::EncoderTable,
+    stream: &mut [u8],
+    mantissa: &mut [u8],
+) -> Result<()> {
+    let element_bytes = usize::try_from(dtype.element_size())
+        .map_err(|_| Error::limit_exceeded("float tensor element size does not fit usize"))?;
+    let mut buffer = vec![0u8; window];
+    let mut stream_writer = huffman::BitStream::new(stream);
+    let mut mantissa_writer = huffman::BitStream::new(mantissa);
+    let sign_bits = dtype.sign_bits();
+    let exponent_bits = dtype.exponent_bits();
+    let mantissa_bits = dtype.mantissa_bits();
+    let mantissa_mask = (1u64 << mantissa_bits) - 1;
+    let exponent_mask = (1u64 << exponent_bits) - 1;
+    let width = (sign_bits + mantissa_bits) as u32;
+    let mut done: u64 = 0;
+    while done < element_count {
+        let remaining = (element_count - done) as usize;
+        let elements = remaining.min(window / element_bytes);
+        let bytes = elements * element_bytes;
+        let offset = done * element_bytes as u64;
+        source.read_at(offset, &mut buffer[..bytes])?;
+        if dtype == FloatDtype::Bf16 {
+            for chunk in buffer[..bytes].chunks_exact(2) {
+                let word = u16::from_le_bytes([chunk[0], chunk[1]]);
+                if table.has_bitstream() {
+                    table.push(&mut stream_writer, (word >> 7) as u8);
+                }
+                // The BF16 sign+mantissa plane is exactly one byte per element,
+                // so pushing it as an 8-bit code writes the identical bytes the
+                // one-shot splitter writes directly.
+                let byte = ((word >> 8) as u8 & 0x80) | (word as u8 & 0x7f);
+                mantissa_writer.push_packed((8u64 << 32) | u64::from(byte));
+            }
+        } else {
+            for chunk in buffer[..bytes].chunks_exact(element_bytes) {
+                let mut word = 0u64;
+                for (index, byte) in chunk.iter().enumerate() {
+                    word |= u64::from(*byte) << (8 * index);
+                }
+                let exponent = ((word >> mantissa_bits) & exponent_mask) as u8;
+                let sign = (word >> (exponent_bits + mantissa_bits)) & 1;
+                let sign_mantissa = (sign << mantissa_bits) | (word & mantissa_mask);
+                if table.has_bitstream() {
+                    table.push(&mut stream_writer, exponent);
+                }
+                mantissa_writer.push_packed((u64::from(width) << 32) | sign_mantissa);
+            }
+        }
+        done += elements as u64;
+    }
+    if stream_writer.finish() != stream.len() {
+        return Err(Error::corrupt(
+            "float tensor exponent bitstream length differs from the predicted length",
+        ));
+    }
+    if mantissa_writer.finish() != mantissa.len() {
+        return Err(Error::corrupt(
+            "float tensor mantissa plane length differs from the predicted length",
+        ));
+    }
+    Ok(())
 }
 
 /// Validate and decode a FLOAT_TENSOR frame, returning the reconstructed
