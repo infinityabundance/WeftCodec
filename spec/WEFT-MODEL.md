@@ -37,7 +37,7 @@ generation 1.
 
 ```
 FORMAT                         text: "weftfs-store 1\n"
-LOCK                           empty; flock(LOCK_EX) for writers
+LOCK                           empty marker; exclusive writer lock (see §8)
 superblock                     8192 bytes = two 4096-byte slots
 commits/<generation>.commit    immutable commit records
 objects/<ab>/<hash>            immutable raw chunks (64 KiB boundaries in v1)
@@ -613,7 +613,8 @@ a reader MUST validate the named commit by replay. Names are UTF-8 without
 - `resolve(selector, snapshot, principal)`: read-only; evaluates against the
   pinned commit state.
 
-**Isolation:** v1 is single-writer (flock). A reader pins one superblock
+**Isolation:** v1 is single-writer: one exclusive writer lock on `LOCK` per
+store (§8). A reader pins one superblock
 generation; every referenced object is immutable; therefore readers see exactly
 the state of that commit, never a partial one. This is snapshot isolation with
 no write conflicts because writes serialize. Multi-writer concurrency is out of
@@ -872,7 +873,19 @@ artifact exists and is named in `CLAIM_LEDGER`.
 ## 8. Recovery contract
 
 On open (writer):
-1. `flock` the LOCK file exclusively; non-blocking attempts return `Busy`.
+1. Take the exclusive writer lock on `LOCK`: `flock(2)` `LOCK_EX` (the
+   mixed-version compatibility lock) and, where the kernel and filesystem
+   support it, `fcntl(2)` `F_OFD_SETLK` `F_WRLCK` over the whole file (the
+   primary ownership lock). Non-blocking attempts return class `Busy`. OFD and
+   `flock` occupy separate lock namespaces on Linux and do not conflict, so
+   both are taken: an OFD-only writer would share a store with an older
+   `flock`-only binary. `flock(2)` alone is the fallback when `F_OFD_SETLK` is
+   unsupported (`EINVAL`, Linux < 3.15 or a filesystem without OFD support).
+   Both mechanisms MUST be released explicitly before the descriptor is
+   closed, so a forked-but-not-yet-`exec`'d child cannot keep the store
+   locked. The file is an empty marker; its bytes are not part of the format
+   and are never read or written by the lock. The object and remote planes
+   use the fenced `LOCK` record protocol instead of this POSIX lock.
 2. Validate `FORMAT`.
 3. Read both superblock slots; validate magic, version, CRC, and generation.
 4. Verify the selected commit record's CRC and hash; verify referenced object

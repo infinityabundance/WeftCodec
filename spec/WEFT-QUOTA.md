@@ -59,7 +59,10 @@ commit are unreferenced and reclaimable by GC.
 
 Denial text is **non-disclosing**: it names neither the current usage, nor the
 limit, nor the principal, nor any other principal's data. `quota show` returns
-only the caller's own counters and own limits.
+only the caller's own counters and own limits: the caller is the invoking
+process's real `(uid, gid)`, and an explicit `--uid`/`--gid` (or `--tenant`)
+selects that principal instead. A principal with no configured budget is
+unconstrained; budgets are per-principal and opt-in.
 
 ### 1.3 Committed usage (`set_quota_usage`)
 
@@ -152,7 +155,8 @@ the policy is unknown (unusable legacy/record), rebuild is refused
 (`Corrupt`); re-supply `--quota` instead. `quota reset` publishes one reset op
 and zeroes usage; both are explicit admin operations and are the only ways
 usage changes other than an admitted commit. `quota show` returns only the
-caller's own counters and own limits.
+caller's own counters and own limits (the caller's real `(uid, gid)` unless
+`--uid`/`--gid`/`--tenant` names another principal).
 
 ## 2. Branching time travel
 
