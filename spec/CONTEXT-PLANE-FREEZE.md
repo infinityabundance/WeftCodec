@@ -77,7 +77,7 @@ re-exported byte-for-byte.
 
 ---
 
-## 2. Freeze matrix — identity-bearing canonical records
+## 2. Freeze matrix — 24 identity-bearing canonical records
 
 Legend: **Rust** = `WeftCodec` and/or `WeftFS`; **Go** = `WeftCodec-Go` and/or
 `WeftFS-Go`; **Py** = the independent reader in `python/weftcodec`;
@@ -194,7 +194,8 @@ pub fn tokenizer_root(scheme: &str, vocab_size: u64) -> Result<Hash32> {
 ```
 
 `WeftCodec-Go/modes/kv_prov.go` defines the same constant and the same
-`{scheme, vocab_size}` input. The descriptor validator recomputes the root and
+`{scheme, vocab_size}` input. **Confirmed:** `tokenizer_root` hashes only
+`{scheme, vocab_size}`. The descriptor validator recomputes the root and
 refuses a mismatch (`kv-prov/106_tokenizer_mismatch.json`), so the record is
 internally consistent. It does **not** bind:
 
