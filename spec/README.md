@@ -14,7 +14,9 @@ mirror `spec/` only; the normative text is identical there.
 
 | You want to… | Read |
 |---|---|
+| Start from nothing | [`../docs/IMPLEMENTER-WALKTHROUGH.md`](../docs/IMPLEMENTER-WALKTHROUGH.md): reading order, vectors, the clean-room verifier as an oracle, and what you may not conclude |
 | Implement a decoder | [`../docs/WRITE-YOUR-OWN-DECODER.md`](../docs/WRITE-YOUR-OWN-DECODER.md), then `WEFTCODEC-FORMAT.md` and `WEFT-AI-CODEC.md` |
+| Write a backend or transport adapter | [`../docs/DRIVER-BOUNDARY.md`](../docs/DRIVER-BOUNDARY.md) and `ERROR-CLASSES.md` |
 | Run the conformance corpus | [`../docs/CONFORMANCE.md`](../docs/CONFORMANCE.md) and `scripts/run-conformance.sh` |
 | Find the status, version, modes, and vectors for every document | [`../docs/RFC.md`](../docs/RFC.md) |
 | Evaluate the design and its measurements | [`../docs/PAPER.md`](../docs/PAPER.md) |
@@ -40,6 +42,7 @@ mirror `spec/` only; the normative text is identical there.
 - [`WEFT-ENGRAM.md`](WEFT-ENGRAM.md) — mode 20 row-group tables.
 - [`WEFT-RETENTION.md`](WEFT-RETENTION.md) — retention bindings and class-aware GC.
 - [`WEFT-MULTIWRITER.md`](WEFT-MULTIWRITER.md) — MW0–MW3 writer contracts (MW3: conflict domains and independent heads).
+- [`ERROR-CLASSES.md`](ERROR-CLASSES.md) — the shipped class registry (Rust and Go) and the RFC §13 reconciliation: which proposed classes map onto shipped ones, which stay proposed, and why.
 
 ## Status in one line
 
