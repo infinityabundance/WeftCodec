@@ -131,6 +131,15 @@ A reader MUST reject:
 
 ## 3. Modes
 
+> **Authority for the mode registry.** `WEFT-AI-CODEC.md` §0 is the normative
+> registry for mode values 6–20 and for the reserved/experimental ranges. The
+> table below is a derived summary kept for a reader who is already in the
+> framing document. If the two ever disagree, `WEFT-AI-CODEC.md` §0 wins and
+> this table MUST be corrected in the same change. This paragraph and the
+> two added rows below (19 and 20) are an editorial reconciliation: they
+> change no frame byte, no mode number, no hash domain and no conformance
+> vector.
+
 | Value | Name | Body interpretation |
 |---:|---|---|
 | 0 | `RAW` | body is the plaintext, byte for byte |
@@ -152,7 +161,9 @@ A reader MUST reject:
 | 16 | `SPARSE_DELTA` | body is `u32le(meta_len) || WCB(meta) || u32le(run_count) || zero-run records`; one dependency; WEFT-AI-CODEC §17 |
 | 17 | `FLOAT_TILED` | body is `u32le(meta_len) || WCB(meta) || tile payload`; WEFT-AI-CODEC §18 |
 | 18 | `FLOAT_TILED_STREAMS` | body is `u32le(meta_len) || WCB(meta) || per-tile interleaved stream payload`; WEFT-AI-CODEC §19 |
-| 19..127 | — | reserved; `UnsupportedMode` |
+| 19 | `KV_CACHE_PROV` | body is `u32le(meta_len) || WCB(meta) || mode-12 payload`; provenance-bound KV page; WEFT-AI-CODEC §20, WEFT-KV-PROVENANCE |
+| 20 | `ENGRAM_SHARD` | body is `u32le(meta_len) || WCB(meta) || row-group payload`; independently rooted groups; WEFT-AI-CODEC §21, WEFT-ENGRAM |
+| 21..127 | — | reserved; `UnsupportedMode` |
 | 128..255 | — | experimental; MUST be rejected for persistence |
 
 Global mode rules:
@@ -169,19 +180,19 @@ Global mode rules:
   body decodes with the dependency bytes as a raw content dictionary.
 - `STRUCTURED`: `domain == 1`, `mode == 5`, `body_len == decoded_len`; body is
   canonical WCB; `dep_count` MUST be `0` in v1; `chunk_count` MUST be `0`.
-- AI modes 6–17: `domain == 0`, `chunk_count == 0`, `flags.DICT_RAW` clear,
+- AI modes 6–20: `domain == 0`, `chunk_count == 0`, `flags.DICT_RAW` clear,
   `body_len >= 4`. The frame's `decoded_len` is the reconstructed payload
   length and `content_hash` is `H("weft/chunk/v1", reconstructed payload)`.
-  Modes 6, 7, 8, 9, 10, 12, 13, and 15 have `dep_count == 0`; modes 11, 14, and
-  16 have `dep_count == 1` naming the base tensor. The body is exactly
-  `u32le(meta_len) || WCB(meta) || payload`, where the WCB descriptor is
-  canonical and binds the payload with the mode-specific domain from §1.1.
-  Every entropy-coded plane uses `huffman-canonical-v1` (WEFT-AI-CODEC
-  §5.3.1), never a library zstd frame, so these modes are deterministic and
-  Rust and Go MUST emit byte-identical frames. Mode 16 is not entropy-coded at
-  all: its payload is a varint run stream (WEFT-AI-CODEC §17.3). Full
-  descriptor, payload, and validation rules are normative in
-  `WEFT-AI-CODEC.md` §2–§17. A decoder that does not implement one of these
+  Modes 6, 7, 8, 9, 10, 12, 13, 15, 17, 18, 19, and 20 have `dep_count == 0`;
+  modes 11, 14, and 16 have `dep_count == 1` naming the base tensor. The body
+  is exactly `u32le(meta_len) || WCB(meta) || payload`, where the WCB
+  descriptor is canonical and binds the payload with the mode-specific domain
+  from §1.1. Every entropy-coded plane uses `huffman-canonical-v1`
+  (WEFT-AI-CODEC §5.3.1), never a library zstd frame, so these modes are
+  deterministic and Rust and Go MUST emit byte-identical frames. Mode 16 is
+  not entropy-coded at all: its payload is a varint run stream (WEFT-AI-CODEC
+  §17.3). Full descriptor, payload, and validation rules are normative in
+  `WEFT-AI-CODEC.md` §2–§21. A decoder that does not implement one of these
   modes MUST reject it as `UnsupportedMode`; it MUST NOT treat the payload as
   opaque bytes.
 
@@ -431,12 +442,17 @@ compressed or descriptor bytes.
 - Allocating a previously reserved mode value is an additive extension that
   old readers must reject as `UnsupportedMode` (fail closed). `TENSOR` (6),
   `TOKEN_SEQUENCE` (7), `QUANTIZED_TENSOR` (8), `FLOAT_TENSOR` (9),
-  `TENSOR_TILED` (15), `SPARSE_DELTA` (16), `FLOAT_TILED` (17), and
-  `FLOAT_TILED_STREAMS` (18) were allocated this way;
-  `WEFT-AI-CODEC.md` is normative for their bodies. Historical vector
-  `017_unknown_mode` asserted that value 6 was unknown; it is retained
-  byte-for-byte and marked `superseded_by` the current reserved-value vector
-  `017_unknown_mode_reserved19`.
+  `TENSOR_SHARDED` (10), `WEIGHT_DELTA` (11), `KV_CACHE` (12),
+  `ACTIVATION_STREAM` (13), `SEMANTIC_DELTA` (14), `TENSOR_TILED` (15),
+  `SPARSE_DELTA` (16), `FLOAT_TILED` (17), `FLOAT_TILED_STREAMS` (18),
+  `KV_CACHE_PROV` (19), and `ENGRAM_SHARD` (20) were allocated this way;
+  `WEFT-AI-CODEC.md` §0 is the authoritative registry and is normative for
+  their bodies. Historical vector `017_unknown_mode` asserted that value 6 was
+  unknown; it is retained byte-for-byte and marked `superseded_by` the current
+  reserved-value vector `017_unknown_mode_reserved21`. Each earlier
+  reserved-value vector in that chain (`017_unknown_mode_reserved19`,
+  `..._reserved20`) is likewise retained with `superseded_by` and is not
+  edited.
 - Unknown critical flags/features/modes fail closed.
 - Frozen v1 vectors are append-only; they are never regenerated to hide a
   change.
