@@ -598,8 +598,28 @@ domains.root    # canonical WCB, schema weft.domains.v1
 
 schema  = "weft.domains.v1"
 epoch   = u64                         # monotonic, increases on every change
-domains = [ { id, name, kind, scope, first_generation } ... ]  # sorted by id
+domains = [ { id, name, kind, scope, head_key, first_generation } ... ]  # sorted by id
 ```
+
+`head_key` is the derived address `domains/<DomainId hex>/superblock` of the
+domain's head object, checked on decode against the entry's own `id`. The
+record therefore **maps each domain to its head**: the mapping names the object
+that holds the head, never a cached copy of the head value. The head at that key
+is authoritative; the record is not.
+
+The **discovery operation** resolves the mapping: `Store::discover_heads` (CLI
+`weftfs mw3 list`) reads every registered domain's head key once and returns
+`(domain, head_key, generation, head)` for each, reporting `None` for a
+domain whose head image is absent rather than dropping the row. Three
+properties follow, and each is tested:
+
+* a record that names a `head_key` other than the derived one is rejected
+  `NonCanonical` at decode, so a tampered mapping fails closed;
+* a head is resolved live, so a reader never reports a stale head from the
+  record;
+* a domain whose head exists but which is missing from the record is still
+  readable by `DomainId`, because the head key is derived and the head is
+  authoritative.
 
 Rules:
 
@@ -621,8 +641,9 @@ global discovery CAS per publication.** A single global discovery CAS on every
 commit would serialise all domains through one conditional write — the exact
 defect MW3 exists to remove (one head, one CAS, a measured 0.0045 efficiency at
 N=32). The cost of the choice is that discovery is eventually complete rather
-than instant: a fully fledged reader may need one retry or a directory listing to
-see a domain registered concurrently. §15.4 states what a view may conclude.
+than instant: a reader may need one retry or a directory listing to see a domain
+registered concurrently, and the `head_key` it resolves is read fresh, never
+cached. §15.4 states what a view may conclude.
 
 ### 15.4 Read views — explicitly not one global linearizable point
 
@@ -674,25 +695,39 @@ class `CrossDomain` (`spec` text: `Class::CrossDomain`, string
 implemented; this document does not specify one, because a correct one needs a
 coordinated recovery record and a fleet court that does not exist here.
 
-**(c) Split or superseded domain.** The protocol performs **no merge**. A domain
-that is split or superseded keeps its head and its whole chain. A successor is a
-new domain (new `DomainId`), and the relationship is recorded as an append-only
-`weft.domain.link.v1` record in the successor's blob namespace:
+**(c) Split, superseded, or merged domain.** The protocol performs **no data
+merge**. A domain that is split or superseded keeps its head and its whole
+chain. A successor is a new domain (new `DomainId`), and the relationship is
+recorded as an append-only `weft.domain.link.v1` record published **create-once
+under the successor's key** `domains/<successor>/link`:
 
 ```
-schema    = "weft.domain.link.v1"
-predecessor = DomainId
-successor   = DomainId
-at_generation = u64          # the predecessor generation the successor was split from
-kind        = "split" | "supersede" | "merge"
-provenance  = <provenance id or "-">
+schema       = "weft.domain.link.v1"
+successor    = DomainId
+predecessors = [DomainId ...]      # sorted, unique, 1..=64, successor excluded
+at_generation = [u64 ...]          # one per predecessor, aligned
+kind         = "split" | "supersede" | "merge"
+provenance   = <provenance id or "-">
+
+LinkId = H("weft/domain/link/v1", WCB(record))
 ```
+
+* a `split` or `supersede` names exactly one predecessor;
+* a `merge` names two or more, which is how a merge is expressed: the operator
+  republishes the chosen state into the successor by explicit ops **and**
+  records every predecessor. The protocol never selects or copies data on its
+  own;
+* a successor has exactly one link record. Writing the identical record again is
+  idempotent; a different record for the same successor is `Conflict`; a
+  successor with no head is `NotFound`. Ancestry can therefore be added once and
+  is never rewritten;
+* the record is not consulted for reads and does not change any head, any
+  generation, or any blob. It is lineage, not authority.
 
 There is no automatic promotion, no last-writer-wins, and no silent choice
 between two heads. An operator who wants one domain to be authoritative after a
 split publishes that decision as an explicit op (a snapshot/pointer record) in
-the chosen successor, where it is visible and auditable. `weft.domain.link.v1`
-is **specified, not implemented** in T020.
+the chosen successor, where it is visible and auditable.
 
 ### 15.6 Refusal semantics
 
@@ -708,6 +743,8 @@ with a typed error class. Nothing degrades silently.
 | a `sharded` handle on a `single`/`optimistic` store | `UnsupportedVersion` | same rule in the other direction |
 | a read-only open of a `sharded` store without `--domain` | `UnsupportedVersion` | the global head is undefined; returning an empty store would be a silent lie |
 | a domain that does not exist | `NotFound` | names the `DomainId` |
+| a link record for a successor with no head | `NotFound` | register the successor first (§15.5(c)) |
+| a second, different link record for one successor | `Conflict` | a successor has exactly one immutable link |
 | a view pair whose generation exceeds the domain head | `Conflict` | the capture is stale; re-capture, do not clamp |
 | a domain write whose touched keys changed since the observation | the MW2 conflict class (§7) | MW3 reuses the MW2 conflict table inside a domain |
 | GC on a sharded store | `UnsupportedVersion` | coordinated cross-domain GC is not implemented (§15.9) |
@@ -766,11 +803,11 @@ limitation of the T020 prototype and is stated wherever the prototype is cited.
 |---|---|---|---|
 | domain identity and canonical encoding | yes | no | `tests/mw3.rs`; spec vectors in §15.1 |
 | per-domain head and commit chain (opt-in `sharded`) | yes, `local` | no | `tests/mw3.rs`, `scripts/mw3_court.sh` |
-| discovery record with monotonic epoch | yes | no | `tests/mw3.rs`; single CAS on registration only |
+| discovery record mapping domain → head key, resolved live | yes | no | `tests/mw3.rs`, CLI `mw3 list` |
 | declared read view | yes | no | `tests/mw3.rs`, CLI `mw3 view` |
 | cross-domain view pin (record only) | yes | no | `tests/mw3.rs` |
 | cross-domain atomic transaction/checkpoint | **refused** `CrossDomain` | n/a | `tests/mw3.rs` |
-| domain split/merge (`weft.domain.link.v1`) | **specified, not implemented** | no | not claimed |
+| domain split/supersede/merge lineage (`weft.domain.link.v1`) | yes: create-once lineage only | no | `tests/mw3.rs`, CLI `mw3 link` |
 | coordinated multi-writer GC | **not implemented; GC refused** | no | not claimed |
 | MW1 reader on a sharded store | refuses `UnsupportedVersion` | n/a | `tests/mw3.rs` |
 | cross-domain isolation | none (per-domain only) | n/a | §15.4 |
@@ -781,7 +818,9 @@ limitation of the T020 prototype and is stated wherever the prototype is cited.
 * No consensus, quorum, leader election, membership service, or clock service.
 * No single global linearizable view and no cross-domain snapshot isolation.
 * No cross-domain atomicity, and no two-phase commit.
-* No automatic merge, branch, or promotion of a split domain.
+* No automatic merge, branch, or promotion of a split domain. A merge is an
+explicit republish plus lineage (`weft.domain.link.v1`); it is never a data
+movement performed by the protocol.
 * No coordinated GC, no multi-node GC, no physical power-loss claim.
 * No claim that the sharded mode is faster for one writer, or that it removes
   the cost of the single-writer path; MW1 is unchanged and remains the default.
