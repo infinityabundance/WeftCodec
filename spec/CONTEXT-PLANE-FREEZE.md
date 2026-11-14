@@ -225,18 +225,15 @@ Commands run at parent `f8f352b` with the codec submodules at
 each CLI inside its Docker court (`rust` and `go` courts; 3 GiB / 4 CPU /
 1024 pids, limits not raised) and running the host-only reference runner:
 
+<!-- BEGIN GENERATED:freeze-conformance (scripts/perf_numbers.py) -->
 | Adapter | Receipt | Total | Pass | Fail | Skip | Result |
 |---|---|---:|---:|---:|---:|---|
 | Rust `weftcodec` | `bench/receipts/conformance-rust-20261114T062338Z.json` | 420 | 288 | 0 | 132 | pass |
 | Go `weftcodec` | `bench/receipts/conformance-go-20261114T062338Z.json` | 420 | 288 | 0 | 132 | pass |
 | Python reader | `bench/receipts/conformance-python-20261114T062338Z.json` | 420 | 229 | 0 | 191 | pass |
 
-All three receipts name the same manifest aggregate:
-
-```
-conformance/manifest.json vector_count = 420
-aggregate_sha256 = 6287b817b94d2cc805abe23561d3d4270cd46b3c2e4f4e598fa673dfe48dfbe8
-```
+All three receipts name the same manifest aggregate: `conformance/manifest.json` holds **420** vectors with aggregate `6287b817b94d2cc805abe23561d3d4270cd46b3c2e4f4e598fa673dfe48dfbe8`.
+<!-- END GENERATED:freeze-conformance -->
 
 Skips are explicit and reasoned by the runner (for example, `kind
 'checkpoint' has no adapter`, `context subkind 'causal_versions' has no
