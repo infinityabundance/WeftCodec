@@ -443,34 +443,99 @@ Rules:
 
 ---
 
-## 11. GC, retention, and in-flight transactions
+## 11. GC, retention, and concurrent publication
 
-GC marks from:
+### 11.1 The pass is epoch-fenced, and the order is normative
+
+A GC pass is an **epoch-fenced administration pass**. On `apply` it performs
+three steps, in this order, and none may be skipped or reordered:
+
+1. **Epoch acquisition.** One compare-and-swap on `gc/epoch`
+   (`weft.gc.epoch.v1`) increments the epoch. That CAS is the pass's
+   linearization point and its **cut**.
+2. **Reservation read.** Every `gc/reservations/<digest>` record
+   (`weft.tx.reservation.v1`) taken at or before the acquired epoch is read
+   **before** the head. The earliest live `started_ns`, minus `CLOCK_SLACK_NS`
+   (1 s), is the pass's **floor**. Reservations registered after the CAS are
+   newer than the cut and neither pin nor protect.
+3. **Root read, then sweep.** Only after 1 and 2 does the pass read the
+   published head (and every MW3 domain head), mark, and sweep.
+
+The order is what makes the cross-writer case safe. A writer registers its
+reservation *before* it publishes its first blob and releases it only *after*
+its commit is durable. So for any blob a writer has published and not lost:
+
+* a reservation read before the head catches the writer, and its floor protects
+  the blob even though the blob is not yet in any state; or
+* the reservation was already released, so the commit landed before the head
+  was read and the head names the blob; or
+* the reservation was taken after the epoch CAS, so the blob is newer than the
+  cut and is not a candidate.
+
+A GC started by writer B therefore cannot reclaim a blob published by a
+prepared transaction of writer A: B's pass either sees A's reservation or A's
+commit.
+
+### 11.2 Roots a pass must observe
+
+Before it may reclaim anything, a pass marks from:
 
 1. the current head and every named snapshot;
 2. every checkpoint generation reachable from those roots;
-3. every capability, context-root, provenance, and retention root recorded in
-   committed state;
+3. every **MW3 domain head**, its snapshot commits and its checkpoint manifests,
+   whether or not `domains.root` names the head (§15.3);
 4. every **live prepared transaction** recorded under `txs/<id>`, bounded by
-   `gc_transaction_grace_secs` (default 300 s) and a hard bound on the number
-   of live records.
+   `gc_transaction_grace_secs` (default 300 s) and a hard bound on the number of
+   live records — the prepared transaction's `pins` are marked;
+5. every capability, context-root, provenance and retention root recorded in
+   committed state, including provenance inputs and receipt blobs while an
+   output is retained;
+6. pack catalogs, catalog segments and every member a catalog or a pending
+   catalog flushes names;
+7. advisory index segments named by a retained commit (head, snapshot or
+   checkpoint); an index never pins data, and a missing index is rebuilt.
 
-A prepared transaction pins only the blobs its ops name, not the whole store.
-GC is an **exclusive administration pass**. In R4 it does **not** run
-concurrently with an optimistic publisher: a caller that wants to run GC on an
-optimistic store must quiesce its committers first. The `pins` field is what
-makes the interleaving *prepared → GC → publish* exact; true concurrent
-GC/publication is not claimed in R4. The `local`/`object` GC pass does not take
-the publication lock, because it also republishes logical state for orphan
-removal; making that path transaction-aware is future work. A prepared
-transaction older than the grace is treated as abandoned: GC may reclaim its
-unreferenced blobs and the record is deleted. This is safe because an abandoned
-prepared transaction has no commit naming it.
+### 11.3 Reclamation rule
 
-GC never deletes a blob named by a committed head or by a live (unexpired)
-prepared transaction. A test must demonstrate that a GC pass racing an
-in-flight prepared transaction leaves the eventual publication readable and
-exact.
+An unmarked blob is a candidate only when its modification time is strictly
+older than both the pass's cut and its floor:
+
+* in `optimistic` and `sharded` modes the cut is `acquired_ns - 1 s`, because a
+  publisher that registered just before the CAS can carry an mtime truncated
+  below the acquisition instant;
+* in `single` mode the exact acquisition instant is the cut: the pass holds the
+  exclusive writer lock, so no publication can be in flight, and a blob
+  unlinked a moment ago is reclaimable immediately;
+* a live reservation's floor protects everything it could have published.
+
+Expired reservations are treated as abandoned and their records are removed
+after the sweep. Prepared transactions older than the grace are abandoned the
+same way. Each applied pass writes one `gc/runs/<id>` audit record
+(`weft.gc.run.v1`) and closes its epoch; neither record is a root.
+
+### 11.4 Publishers must check their reservation before committing
+
+A transaction helper (`txn_create_file`, `txn_overwrite_file`, …) re-reads its
+reservation immediately before the commit and **refuses with `Busy`** when the
+record is gone or its deadline has passed. A pass that treated the reservation
+as abandoned may already have swept the publisher's uncommitted blobs, so
+publishing would name deleted content. The publisher retries with a fresh
+reservation.
+
+### 11.5 Residual risk, stated
+
+The protection is bounded by the reservation lifetime
+(`gc_reservation_secs`, default 300 s). A publisher that stalls longer than its
+reservation and then publishes **without the helper check** — for example a
+caller using `begin_transaction` directly and never taking a reservation — is
+outside the protocol. The pass may have reclaimed the blobs it wrote before
+its commit; the commit would then name missing content and `verify` would
+report it. This is not claimed safe. The helpers and the FUSE mutation path
+(§17) do take the check; a direct caller must do the same.
+
+The pass is still an administration operation on one store, not a distributed
+barrier. Physical power loss, host cache loss, and a fleet-wide GC are out of
+scope.
 
 ---
 
@@ -484,7 +549,8 @@ exact.
 | MW2 on `s3` (MinIO) | yes | no (R4) | `scripts/bench_multiwriter.sh` MinIO row; receipt cited in `bench/RESULTS-multiwriter.md` |
 | MW2 on `azure` (Azurite) | yes (R14d) | yes (R14d) | `tests/azure_backend.rs` (`two_optimistic_committers_publish_disjoint_files_on_azure`), `store/azure_integration_test.go` (`TestAzureOptimisticTwoDisjointCommitters`) |
 | MW2 on `gcs` | **refused** `UnsupportedVersion` | refused (no GCS plane in Go's MW2 gate) | not claimed |
-| MW2 for FUSE file mutations | **not implemented** | **not implemented** | FUSE remains MW1 |
+| MW2 for FUSE file mutations | **opt-in** `--writer-mode optimistic` (T029, §17); MW1 is the default | **not implemented** | `tests/fuse_mw2.rs`, `scripts/fuse_mw2_court.sh` |
+| explicit writer-mode migration | yes (§16); all downgrades refused | no | `tests/mode_migration.rs`, `scripts/mode_migration_court.sh` |
 | MW2 for checkpoint publish | **not implemented as a generic path**; a tensor/shard set can be expressed as a transaction | no | not claimed |
 | mixed Rust/Go concurrent writers | yes | yes | `scripts/multiwriter_court.sh`, receipt `multiwriter-court-20261109T143346Z` (parity commit file and superblock byte-identical; 160/160 disjoint; 1/80 contended winner; finite history check) |
 | model-checked multi-committer invariants | bounded TLA+ | n/a | `verification/tla/WeftMultiWriter.tla` |
@@ -784,18 +850,20 @@ created_ns = i64
   This is a limitation of the frozen `weft.tx.v1` record, not of the domain
   split.
 
-### 15.9 GC, retention, and in-flight transactions in MW3
+### 15.9 GC, retention, and concurrent publication in MW3
 
-**Specified; not implemented in T020.** The intended rule is: GC marks from
-*every* registered domain head, every snapshot/checkpoint root in every domain,
-every live prepared transaction record, and every capability/context/provenance/
-retention root. A blob referenced by any domain is retained. A prepared
-transaction in domain D pins only its own blobs and never pins another domain's
-head.
+A **global sharded handle** (no `--domain`) runs a coordinated pass: it acquires
+one epoch and marks every registered domain head, every snapshot/checkpoint
+inside each domain, and every live prepared transaction. A blob referenced by
+any domain is retained. Unlinked-object-record removal is not published by a
+coordinated pass, because there is no global head to publish it to; the pass
+reports that as a `problems` entry.
 
-A sharded store **refuses** a GC request (`UnsupportedVersion`) rather than run a
-single-domain sweep that would reclaim another domain's data. This is a real
-limitation of the T020 prototype and is stated wherever the prototype is cited.
+A **domain-bound handle refuses** a GC request (`UnsupportedVersion`): a
+single-domain sweep cannot prove that another domain does not reference the
+same blob, and the protocol never runs a partial sweep. Reservation handling,
+the cut, the floor and the publisher's pre-commit liveness check are exactly as
+in §11.
 
 ### 15.10 What MW3 implements, honestly
 
@@ -808,7 +876,7 @@ limitation of the T020 prototype and is stated wherever the prototype is cited.
 | cross-domain view pin (record only) | yes | no | `tests/mw3.rs` |
 | cross-domain atomic transaction/checkpoint | **refused** `CrossDomain` | n/a | `tests/mw3.rs` |
 | domain split/supersede/merge lineage (`weft.domain.link.v1`) | yes: create-once lineage only | no | `tests/mw3.rs`, CLI `mw3 link` |
-| coordinated multi-writer GC | **not implemented; GC refused** | no | not claimed |
+| coordinated multi-writer GC | yes: a global sharded handle marks every domain head; a domain-bound handle refuses | no | `tests/mw3.rs`, `tests/multi_writer_gc.rs`, `scripts/mw_gc_court.sh` |
 | MW1 reader on a sharded store | refuses `UnsupportedVersion` | n/a | `tests/mw3.rs` |
 | cross-domain isolation | none (per-domain only) | n/a | §15.4 |
 | multi-node / fleet | **no** | no | single host, 4 vCPUs |
@@ -821,8 +889,113 @@ limitation of the T020 prototype and is stated wherever the prototype is cited.
 * No automatic merge, branch, or promotion of a split domain. A merge is an
 explicit republish plus lineage (`weft.domain.link.v1`); it is never a data
 movement performed by the protocol.
-* No coordinated GC, no multi-node GC, no physical power-loss claim.
+* No coordinated GC across a fleet, no multi-node GC, no physical power-loss claim.
+  A single-store coordinated pass is implemented (15.9); it is not a distributed
+  barrier.
 * No claim that the sharded mode is faster for one writer, or that it removes
   the cost of the single-writer path; MW1 is unchanged and remains the default.
 * The domain count, the number of commits replayed on open, the discovery
   record size, and the read-view size are all bounded and fail closed.
+
+---
+
+## 16. Explicit writer-mode migration
+
+### 16.1 The record
+
+The store's writer mode is one canonical record at `writers`
+(`weft.writers.v1`: `schema`, `mode`, `min_reader`, `created_ns`). An absent
+record means `single` (MW1). `weftfs mode show` reports the effective mode and
+whether the record is present.
+
+### 16.2 Transition table
+
+| from | to | verdict | why |
+|---|---|---|---|
+| `single` | `optimistic` | **allowed** | the same state a first optimistic open creates, made explicit |
+| `optimistic` | `sharded` | **allowed, with quiescence** | adds conflict domains; a live prepared transaction blocks it (`Busy`) and the published head must be unchanged across the window |
+| `single` | `sharded` | **refused** `UnsupportedVersion` | a global head cannot be promoted into a domain automatically; register a domain and publish an explicit link |
+| `optimistic` | `single` | **refused** `UnsupportedVersion` | downgrade: a reader or writer of the recorded mode could still be live |
+| `sharded` | `optimistic` | **refused** `UnsupportedVersion` | downgrade: domain heads are not a global chain |
+| `sharded` | `single` | **refused** `UnsupportedVersion` | downgrade |
+
+A migration that names a mode the store does not record is refused too: the
+caller must name what is actually there. `quiesce` (`--quiesce-ms`) samples the
+published head for the whole window; it is a **one-host heuristic**, not a
+distributed barrier. A writer that is idle for the entire window and publishes
+afterwards is not detected, and is outside the claim.
+
+### 16.3 No dual authority
+
+The migration is **one compare-and-swap** on the `writers` record. Before the
+CAS the store records `from`; after it, `to`; there is no instant with both. Every
+writable open reads the record and refuses a mode it does not permit **before it
+takes the exclusive writer lock**, so a refused open cannot briefly be
+authoritative. A software-fault injection at each side of the CAS leaves the old
+or the new record, never a mixture.
+
+Two conforming writers can therefore never both believe they are authoritative:
+a `from` writer that lost the CAS is refused on its next open, and a `to` writer
+cannot open before the CAS. The court proves this over the whole matrix.
+
+### 16.4 Outside the protocol
+
+A **pre-release binary** that predates the record cannot be bound by it: it does
+not read `writers` and will write to a store whose mode it would not be admitted
+to. The court measures this with the v0.9.0 binary (old reader and old writer)
+and labels it as the residual hazard, not as safety. The forward mechanism is
+`min_reader`: a future store can refuse older readers outright. It is a field in
+the record and is not enforced by this revision.
+
+### 16.5 Format evolution
+
+The record is versioned by its schema string. A reader that does not know the
+schema refuses (`UnsupportedVersion`) rather than guessing. Frozen v1 commit
+records remain readable; the mode record is additive and is never consulted by a
+read-only open.
+
+---
+
+## 17. FUSE file mutations under MW2 (opt-in)
+
+### 17.1 When the path is active
+
+A mount takes the transaction path only when the store's writer mode is
+`optimistic`. `--writer-mode optimistic` on a store with no recorded mode makes
+that mode explicit (16.2). MW1 remains the default and is unaffected; the
+optimistic mount refuses `--write-back` and `--group-commit`, because both
+publish outside the per-operation transaction.
+
+### 17.2 Supported operations and their transaction semantics
+
+| operation | transaction | notes |
+|---|---|---|
+| create | object record + directory entry, precondition `Absent` | a concurrent create of the same name is retried; the loser becomes an ordinary open unless `O_EXCL`, which is `EEXIST` |
+| overwrite / write | whole-file read-modify-write; the observed version is the precondition | bounded at 8 MiB (`E2BIG` above); a lost race re-reads and retries (bounded, then `EBUSY`) |
+| unlink | entry removal plus object and outgoing-relation removal when the last name goes | one commit; open handles keep their pinned object |
+| rmdir | same, only for an empty directory | `ENOTEMPTY` otherwise |
+| rename | source entry, target entry and a replaced unreferenced object in one commit | POSIX replacement rules enforced before publish; `RENAME_NOREPLACE` honoured |
+| link | one new directory entry | directories refused; a taken name is `EEXIST` |
+| read | an open handle reads the version it opened | snapshot isolation per handle; `stat` reports the current version |
+
+A write sequence is **not** one transaction: each `write(2)` is one transaction,
+and `open(O_TRUNC)` is its own truncate transaction followed by the writes. A
+crash between them leaves the truncated version. This is stated, not hidden.
+
+### 17.3 Refused operations
+
+`EOPNOTSUPP`: `mkdir`, `mknod` (all types), `symlink`, `chmod`/`chown`/`utimes`,
+`truncate(2)`, `setxattr`/`removexattr`, `fallocate`, `copy_file_range`, and
+`RENAME_EXCHANGE`. The refusal is a typed error, never a silent fallback.
+`fuse_mw2` (T029) tests every one of these.
+
+The kernel must deliver `O_TRUNC` in `open` for the truncate to be one
+transaction, so an optimistic mount requests `FUSE_ATOMIC_O_TRUNC`. Without it
+the kernel would send an indistinguishable `SETATTR(size=0)` first, which this
+mode refuses as a bare `truncate(2)`.
+
+### 17.4 What is not claimed
+
+No byte-range write transaction (the whole file is rewritten), no transactional
+equivalence for unsupported operations, no multi-node mount, no physical
+power-loss claim, and no Go filesystem parity for optimistic FUSE mutations.
