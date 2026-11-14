@@ -5,8 +5,8 @@ surfaces specified and prototyped in subphase T020.** The single-committer
 surfaces documented here are already implemented and frozen; the
 optimistic-committer surfaces are implemented in Rust for the `local`,
 `object`, `3fs`, and `s3` commit planes and in Go for `local` and `object`.
-MW3 (§15) is **opt-in and Rust-only** for the `local` and `object` planes; it
-is additive and changes no MW1 or MW2 byte. Everything not listed as
+MW3 (§15) is **opt-in and Rust-only** for the `local` commit plane; it is
+additive and changes no MW1 or MW2 byte. Everything not listed as
 implemented in §12 or §15.10 is specified design, not a claim.
 
 Version: `weft.multiwriter/v2`. The MW2 text (§1–§14) is unchanged from
@@ -73,9 +73,9 @@ is stated in §4.
 
 ### MW3 — causal conflict domains and independent heads
 
-**Specified in §15; prototyped and measured in Rust for the `local` and `object`
-planes (opt-in `--writer-mode sharded`). Not implemented in Go. Not a fleet or
-multi-node claim.**
+**Specified in §15; prototyped and measured in Rust for the `local` commit
+plane (opt-in `--writer-mode sharded`). Not implemented in Go or on any remote
+plane. Not a fleet or multi-node claim.**
 
 MW3 partitions publication into **conflict domains**. Each domain has its own
 head, generation counter, and commit chain, so two writers in different domains
@@ -529,8 +529,8 @@ transaction API.
 ## 15. MW3 — causal conflict domains and independent heads
 
 Status: **normative.** The protocol below is implemented in Rust for the
-`local` and `object` planes as an opt-in writer mode (`--writer-mode sharded`).
-Go implements no MW3 surface. MW1 remains the default everywhere. Nothing in
+`local` commit plane as an opt-in writer mode (`--writer-mode sharded`). Go
+implements no MW3 surface. MW1 remains the default everywhere. Nothing in
 this section changes an MW1 or MW2 byte, a frozen commit record, a manifest, or
 a blob identity.
 
@@ -703,7 +703,7 @@ with a typed error class. Nothing degrades silently.
 |---|---|---|
 | a transaction whose ops target more than one domain | `CrossDomain` | MW3 has no cross-domain commit; the caller must split it or use one domain |
 | an atomic checkpoint spanning domains | `CrossDomain` | §15.5(b) |
-| a `sharded` domain handle on a plane without per-domain conditional heads | `UnsupportedVersion` | only `local` and `object` are implemented; `s3`/`gcs`/`azure`/`3fs`/split planes refuse |
+| a `sharded` domain handle on a plane without per-domain conditional heads | `UnsupportedVersion` | only `local` is implemented; `object`, `s3`, `gcs`, `azure`, `3fs`, and split planes refuse |
 | a `single` or `optimistic` handle on a `sharded` store | `UnsupportedVersion` | mode identity, §15.8; writer modes are never mixed |
 | a `sharded` handle on a `single`/`optimistic` store | `UnsupportedVersion` | same rule in the other direction |
 | a read-only open of a `sharded` store without `--domain` | `UnsupportedVersion` | the global head is undefined; returning an empty store would be a silent lie |
@@ -740,6 +740,12 @@ created_ns = i64
   chain. This is the MW1-reader rule: an MW1 reader does not silently observe an
   empty namespace, it refuses with a typed error.
 * An absent record means `single`, as before.
+* Transaction ids (`txs/<id>`) remain **store-global** in an MW3 store. The same
+  id used in two domains is one logical transaction id: the second use with a
+  different op set is `Conflict(TransactionIdReused)`. Callers that need
+  per-domain ids must namespace them (for example by prefixing the DomainId).
+  This is a limitation of the frozen `weft.tx.v1` record, not of the domain
+  split.
 
 ### 15.9 GC, retention, and in-flight transactions in MW3
 
@@ -759,7 +765,7 @@ limitation of the T020 prototype and is stated wherever the prototype is cited.
 | surface | Rust | Go | evidence |
 |---|---|---|---|
 | domain identity and canonical encoding | yes | no | `tests/mw3.rs`; spec vectors in §15.1 |
-| per-domain head and commit chain (opt-in `sharded`) | yes, `local` and `object` | no | `tests/mw3.rs`, `scripts/mw3_court.sh` |
+| per-domain head and commit chain (opt-in `sharded`) | yes, `local` | no | `tests/mw3.rs`, `scripts/mw3_court.sh` |
 | discovery record with monotonic epoch | yes | no | `tests/mw3.rs`; single CAS on registration only |
 | declared read view | yes | no | `tests/mw3.rs`, CLI `mw3 view` |
 | cross-domain view pin (record only) | yes | no | `tests/mw3.rs` |
