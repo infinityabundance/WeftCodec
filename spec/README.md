@@ -39,7 +39,7 @@ mirror `spec/` only; the normative text is identical there.
 - [`WEFT-KV-PROVENANCE.md`](WEFT-KV-PROVENANCE.md) — mode 19 provenance-bound KV pages.
 - [`WEFT-ENGRAM.md`](WEFT-ENGRAM.md) — mode 20 row-group tables.
 - [`WEFT-RETENTION.md`](WEFT-RETENTION.md) — retention bindings and class-aware GC.
-- [`WEFT-MULTIWRITER.md`](WEFT-MULTIWRITER.md) — MW0–MW2 writer contracts.
+- [`WEFT-MULTIWRITER.md`](WEFT-MULTIWRITER.md) — MW0–MW3 writer contracts (MW3: conflict domains and independent heads).
 
 ## Status in one line
 

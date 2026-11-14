@@ -1,12 +1,16 @@
 # WEFT-MULTIWRITER — writer capability levels and the multi-writer contract
 
-Status: **normative for the MW2 surfaces implemented in subphase R4.** The
-single-committer surfaces documented here are already implemented and frozen;
-the optimistic-committer surfaces are implemented in Rust for the `local`,
+Status: **normative for the MW2 surfaces implemented in subphase R4 and the MW3
+surfaces specified and prototyped in subphase T020.** The single-committer
+surfaces documented here are already implemented and frozen; the
+optimistic-committer surfaces are implemented in Rust for the `local`,
 `object`, `3fs`, and `s3` commit planes and in Go for `local` and `object`.
-Everything not listed as implemented in §12 is specified design, not a claim.
+MW3 (§15) is **opt-in and Rust-only** for the `local` and `object` planes; it
+is additive and changes no MW1 or MW2 byte. Everything not listed as
+implemented in §12 or §15.10 is specified design, not a claim.
 
-Version: `weft.multiwriter/v1`.
+Version: `weft.multiwriter/v2`. The MW2 text (§1–§14) is unchanged from
+`weft.multiwriter/v1`; §15 is the MW3 addition.
 
 This document is the authority for:
 
@@ -67,14 +71,23 @@ MW2 guarantees linearizable publication **of the authoritative head sequence**
 snapshot isolation across an entire workload. What is guaranteed per operation
 is stated in §4.
 
-### MW3 — distributed scalable publication
+### MW3 — causal conflict domains and independent heads
 
-**Not implemented. Not claimed.**
+**Specified in §15; prototyped and measured in Rust for the `local` and `object`
+planes (opt-in `--writer-mode sharded`). Not implemented in Go. Not a fleet or
+multi-node claim.**
 
-MW3 would require conflict domains, bounded cross-node contention, a
-coordinated multi-writer GC, and fleet evidence. Nothing in this document or
-in the R4 courts supports it. Every R4 court runs on one host against one
-local namespace or one MinIO/Azurite endpoint.
+MW3 partitions publication into **conflict domains**. Each domain has its own
+head, generation counter, and commit chain, so two writers in different domains
+never contend. A discovery record maps domain to head for readers that did not
+name the domains. Cross-domain atomicity is **refused**, not approximated. §15
+is normative for the domain identity, the head keys, the read view, the
+cross-domain rules, the refusal classes, and the isolation sentence.
+
+MW3 does **not** claim distributed consensus, a quorum, a fleet protocol, a
+single global linearizable view, cross-domain snapshot isolation, cross-domain
+atomic publication, or a coordinated online multi-writer GC. It is one host,
+one namespace, four vCPUs in the courts. See §15.10 and §15.11.
 
 ---
 
@@ -506,7 +519,265 @@ transaction API.
 * `docs/PLANES.md` — blob/commit plane contracts.
 * `docs/FENCING.md` — the MW1 fenced lease; **not** an MW2 protocol.
 * `docs/AI-STORAGE-AUGMENTATION.md` §4 — capability levels.
-* `docs/MULTIWRITER-ARCHITECTURE.md` — R4 design and backend tradeoffs.
+* `docs/MULTIWRITER-ARCHITECTURE.md` — R4 design and backend tradeoffs, plus the MW3 design.
 * `bench/CONTRACTS-multiwriter.md` — frozen benchmark contract.
-* `bench/RESULTS-multiwriter.md` — R4 measurements and every loss.
+* `bench/RESULTS-multiwriter.md` — R4 and T020/T021 measurements and every loss.
 * `verification/tla/WeftMultiWriter.tla` — bounded model-checked invariants.
+
+---
+
+## 15. MW3 — causal conflict domains and independent heads
+
+Status: **normative.** The protocol below is implemented in Rust for the
+`local` and `object` planes as an opt-in writer mode (`--writer-mode sharded`).
+Go implements no MW3 surface. MW1 remains the default everywhere. Nothing in
+this section changes an MW1 or MW2 byte, a frozen commit record, a manifest, or
+a blob identity.
+
+### 15.1 A domain is the unit of independent publication
+
+A domain is a canonical record `weft.domain.v1`:
+
+```
+schema = "weft.domain.v1"
+name   = <UTF-8, 1..=255 bytes, no NUL>
+kind   = "checkpoint_family" | "model_branch" | "namespace" | "root"
+scope  = <UTF-8, 0..=255 bytes>      # e.g. the model branch or namespace key
+```
+
+```
+DomainId = H("weft/domain/v1", WCB(weft.domain.v1 record))
+```
+
+The identity is derived, stable, and independent of any head, any generation,
+and any writer. A domain **cannot be renamed**: a rename is a new `DomainId`,
+and the old domain remains readable forever. Two records that differ in any
+field are different domains even when their `name` is equal, so an operator
+must declare the `scope` explicitly rather than rely on a display name.
+
+The reserved domain `kind = "root"`, `name = "weft.root"`, `scope = ""` is the
+implicit domain a *global* (MW1/MW2) store corresponds to. It is specified so a
+migration tool can name the global head; it is not created automatically and it
+is not the discovery record.
+
+**Why an explicit domain and not a key prefix.** A prefix would make the
+conflict set depend on a naming convention that a caller can change between two
+writes; a domain is an identity a commit can be checked against. The write
+refuses a transaction whose ops and whose target domain disagree.
+
+### 15.2 Independent heads
+
+Each domain owns:
+
+```
+domains/<DomainId hex>/superblock          # two 4096-byte slots, MW1 format
+ domains/<DomainId hex>/commits/<g>.commit # create-once, per-domain generation
+```
+
+The domain superblock uses **exactly** the MW1 slot encoding: `WFSB` magic, the
+store format major/minor, generation, commit id, commit length, timestamp,
+CRC32C, zero padding (`format.rs`, `SuperblockSlot`). The two-slot rule, the
+highest-valid-generation rule, and the rule that a corrupt higher slot is not a
+head are unchanged. The only difference from MW1 is the **key** the slot lives
+under.
+
+Commit records are the frozen `weftfs.commit.v1/v2/v3` encodings. A commit's
+`generation` is a **per-domain** generation. A commit's `parent` is the previous
+commit **in the same domain**. There is no global generation in an MW3 store and
+the global `superblock` is never written.
+
+Blobs (`objects/`, `manifests/`, packs, advisory index segments) are **shared
+and global**. They are content-addressed and immutable, so sharing is safe and
+is what makes a cross-domain read possible at all. No blob is domain-scoped; a
+blob named by a commit in two domains is stored once.
+
+### 15.3 Discovery record and the registration rule
+
+```
+domains.root    # canonical WCB, schema weft.domains.v1
+
+schema  = "weft.domains.v1"
+epoch   = u64                         # monotonic, increases on every change
+domains = [ { id, name, kind, scope, first_generation } ... ]  # sorted by id
+```
+
+Rules:
+
+1. `domains.root` changes **only when a new domain is first registered**. The
+   change is one compare-and-swap requiring the observed epoch. A lost race
+   re-reads and retries; two registrations of the same domain with the same
+   record are idempotent, and a different record under the same `DomainId` is
+   `Conflict`.
+2. A publication that advances an **existing** domain head never touches
+   `domains.root`.
+3. The record is a **discovery aid, not a source of truth**. A reader that knows
+   its domains reads the domain heads directly. A reader that lost the record
+   can rebuild it by listing `domains/`; the rebuilt record takes a new epoch
+   and the same domain set. A domain head is authoritative even when absent
+   from `domains.root`.
+
+**Chosen mechanism: per-domain registration with a monotonic epoch, not one
+global discovery CAS per publication.** A single global discovery CAS on every
+commit would serialise all domains through one conditional write — the exact
+defect MW3 exists to remove (one head, one CAS, a measured 0.0045 efficiency at
+N=32). The cost of the choice is that discovery is eventually complete rather
+than instant: a fully fledged reader may need one retry or a directory listing to
+see a domain registered concurrently. §15.4 states what a view may conclude.
+
+### 15.4 Read views — explicitly not one global linearizable point
+
+A **read view** is a vector of `(domain, generation)` pairs:
+
+```
+ViewPair = { domain: DomainId, generation: u64, head: commit id }
+View     = { pairs: [ViewPair ...], capture_kind: "sequential",
+             view_root: H("weft/view/v1", WCB({pairs})) }
+```
+
+* `capture_read_view(domains)` reads each declared domain head **once**, in the
+  declared order, and records exactly what it observed.
+* Each pair is exact at the moment it was read. Different pairs may be from
+  different instants. **There is no instant at which the whole vector is
+  simultaneously valid.** Two domains may advance independently between the
+  first and the last read.
+* `view_root` identifies *this capture*, not a result set and not a global
+  state. Two captures with different vectors have different roots.
+* A view is only as consistent as its capture. The protocol does not repair a
+  skew, does not retry a capture to make it "atomic", and does not claim
+  `capture_kind = "atomic"` (no such value exists).
+
+**Normative isolation sentence.** *MW3 provides per-domain linearizable
+publication and read-your-own-capture across domains; it does not provide a
+single global linearizable view, cross-domain snapshot isolation, or atomicity
+across domains.*
+
+A reader must not describe a view as a global snapshot, a consistent cut, or a
+linearization point. It is a capture.
+
+### 15.5 Cross-domain operations
+
+**(a) Cross-domain snapshot.** A durable view pin is a canonical record
+`weft.view.pin.v1` containing the `View`, the publishing principal, and a
+timestamp, stored create-once as a manifest-namespace blob. It is an auditable
+statement of what was observed; it is **not** a retention guarantee in this
+prototype (cross-domain GC pinning is not implemented, §15.9) and it is **not**
+a consistency guarantee. The record carries `capture_kind = "sequential"` so it
+cannot be misread as an atomic cut.
+
+**(b) Atomic grouped checkpoint spanning domains.** **Restricted to one domain.
+Not implemented across domains, and refused.** A checkpoint published inside one
+domain is atomic by the existing mechanism: it is one commit, and a reader sees
+all of it or none (MW2 guarantee P2, held per domain). A request to publish one
+atomic checkpoint spanning two or more domains is refused with the typed error
+class `CrossDomain` (`spec` text: `Class::CrossDomain`, string
+`"CrossDomain"`) naming the domains. No two-phase prepare/commit is
+implemented; this document does not specify one, because a correct one needs a
+coordinated recovery record and a fleet court that does not exist here.
+
+**(c) Split or superseded domain.** The protocol performs **no merge**. A domain
+that is split or superseded keeps its head and its whole chain. A successor is a
+new domain (new `DomainId`), and the relationship is recorded as an append-only
+`weft.domain.link.v1` record in the successor's blob namespace:
+
+```
+schema    = "weft.domain.link.v1"
+predecessor = DomainId
+successor   = DomainId
+at_generation = u64          # the predecessor generation the successor was split from
+kind        = "split" | "supersede" | "merge"
+provenance  = <provenance id or "-">
+```
+
+There is no automatic promotion, no last-writer-wins, and no silent choice
+between two heads. An operator who wants one domain to be authoritative after a
+split publishes that decision as an explicit op (a snapshot/pointer record) in
+the chosen successor, where it is visible and auditable. `weft.domain.link.v1`
+is **specified, not implemented** in T020.
+
+### 15.6 Refusal semantics
+
+A request that needs an atomicity or a guarantee MW3 cannot provide is refused
+with a typed error class. Nothing degrades silently.
+
+| request | class | rule |
+|---|---|---|
+| a transaction whose ops target more than one domain | `CrossDomain` | MW3 has no cross-domain commit; the caller must split it or use one domain |
+| an atomic checkpoint spanning domains | `CrossDomain` | §15.5(b) |
+| a `sharded` domain handle on a plane without per-domain conditional heads | `UnsupportedVersion` | only `local` and `object` are implemented; `s3`/`gcs`/`azure`/`3fs`/split planes refuse |
+| a `single` or `optimistic` handle on a `sharded` store | `UnsupportedVersion` | mode identity, §15.8; writer modes are never mixed |
+| a `sharded` handle on a `single`/`optimistic` store | `UnsupportedVersion` | same rule in the other direction |
+| a read-only open of a `sharded` store without `--domain` | `UnsupportedVersion` | the global head is undefined; returning an empty store would be a silent lie |
+| a domain that does not exist | `NotFound` | names the `DomainId` |
+| a view pair whose generation exceeds the domain head | `Conflict` | the capture is stale; re-capture, do not clamp |
+| a domain write whose touched keys changed since the observation | the MW2 conflict class (§7) | MW3 reuses the MW2 conflict table inside a domain |
+| GC on a sharded store | `UnsupportedVersion` | coordinated cross-domain GC is not implemented (§15.9) |
+
+### 15.7 Guarantees inside one domain
+
+Within one domain, MW3 provides exactly MW2's guarantees §4.1: linearizable
+authoritative head (P1), atomic visibility of one commit (P2), no lost
+acknowledged transaction (P3), and snapshot-consistent readers (P4). Nothing is
+weakened by the domain split, because a domain's `superblock` and commit chain
+are the same objects MW2 already uses, under a different key.
+
+Across domains, none of P1–P4 is a joint property. Each is held per domain.
+
+### 15.8 Mode identity
+
+The `weft.writers.v1` policy record gains one mode value:
+
+```
+weft.writers.v1
+mode = "single" | "optimistic" | "sharded"
+min_reader = "weftfs <version>"
+created_ns = i64
+```
+
+* A `sharded` store refuses a `single` or `optimistic` writable open, and a
+  `single`/`optimistic` store refuses a `sharded` writable open.
+* A read-only open of a `sharded` store **without** a domain is refused
+  `UnsupportedVersion`; a read-only open **with** a domain reads that domain's
+  chain. This is the MW1-reader rule: an MW1 reader does not silently observe an
+  empty namespace, it refuses with a typed error.
+* An absent record means `single`, as before.
+
+### 15.9 GC, retention, and in-flight transactions in MW3
+
+**Specified; not implemented in T020.** The intended rule is: GC marks from
+*every* registered domain head, every snapshot/checkpoint root in every domain,
+every live prepared transaction record, and every capability/context/provenance/
+retention root. A blob referenced by any domain is retained. A prepared
+transaction in domain D pins only its own blobs and never pins another domain's
+head.
+
+A sharded store **refuses** a GC request (`UnsupportedVersion`) rather than run a
+single-domain sweep that would reclaim another domain's data. This is a real
+limitation of the T020 prototype and is stated wherever the prototype is cited.
+
+### 15.10 What MW3 implements, honestly
+
+| surface | Rust | Go | evidence |
+|---|---|---|---|
+| domain identity and canonical encoding | yes | no | `tests/mw3.rs`; spec vectors in §15.1 |
+| per-domain head and commit chain (opt-in `sharded`) | yes, `local` and `object` | no | `tests/mw3.rs`, `scripts/mw3_court.sh` |
+| discovery record with monotonic epoch | yes | no | `tests/mw3.rs`; single CAS on registration only |
+| declared read view | yes | no | `tests/mw3.rs`, CLI `mw3 view` |
+| cross-domain view pin (record only) | yes | no | `tests/mw3.rs` |
+| cross-domain atomic transaction/checkpoint | **refused** `CrossDomain` | n/a | `tests/mw3.rs` |
+| domain split/merge (`weft.domain.link.v1`) | **specified, not implemented** | no | not claimed |
+| coordinated multi-writer GC | **not implemented; GC refused** | no | not claimed |
+| MW1 reader on a sharded store | refuses `UnsupportedVersion` | n/a | `tests/mw3.rs` |
+| cross-domain isolation | none (per-domain only) | n/a | §15.4 |
+| multi-node / fleet | **no** | no | single host, 4 vCPUs |
+
+### 15.11 Non-goals
+
+* No consensus, quorum, leader election, membership service, or clock service.
+* No single global linearizable view and no cross-domain snapshot isolation.
+* No cross-domain atomicity, and no two-phase commit.
+* No automatic merge, branch, or promotion of a split domain.
+* No coordinated GC, no multi-node GC, no physical power-loss claim.
+* No claim that the sharded mode is faster for one writer, or that it removes
+  the cost of the single-writer path; MW1 is unchanged and remains the default.
+* The domain count, the number of commits replayed on open, the discovery
+  record size, and the read-view size are all bounded and fail closed.
