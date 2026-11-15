@@ -232,6 +232,12 @@ NOT return a closure that silently omits it. The message names the identity the
 caller already supplied. It MUST NOT distinguish an absent ancestor from an
 unauthorized one.
 
+A conformance bundle (`weft.closure.bundle.v1`) MUST echo the request set it
+actually queried: `roots` is the canonical ascending, duplicate-free set of
+start identities, not the caller's unnormalised list. The refusals and the
+returned nodes are evaluated against that set, so a bundle whose `roots` differ
+from the set the producer used is not checkable and is refused.
+
 ## 6. Mutable grant record `weft.training-grant.v1`
 
 Stored under `/training/grants/<artifact-root-hex>/` as a grant record plus a
