@@ -177,7 +177,8 @@ no approximate path.
 
 * **Chunk-table shards only.** A shard whose retained representation is a
   frame (`weft.manifest.v2` `kind:"codec"` or `kind:"tensor"`, modes 9/10/15/17,
-  or a `weft.manifest.v4` overlay) has no chunk table and is **refused**. The
+  or a `weft.manifest.v4` overlay) has no chunk table and is **refused** with
+  `UnsupportedRepresentation`. The
   writer reports the refusal with its reason; it never substitutes a
   whole-file digest. Producing chunk tables for checkpoints is a
   writer-strategy decision (`--shard-strategy raw`), not something a proof can
