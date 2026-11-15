@@ -48,7 +48,7 @@ there). The first twelve rows are the codec classes as re-used by the store.
 | `DependencyMismatch` | a declared causal dependency is missing, unreachable, or mismatched | ✓ | |
 | `Parse` | selector grammar error | ✓ | ✓ |
 | `UnknownSchema` | schema string is not the expected one | ✓ | ✓ |
-| `Busy` | the writer lock or a conditional head CAS refused this writer | ✓ | ✓ |
+| `Busy` | the writer lock, a conditional head CAS, a GC epoch, or a queued writer lease refused this writer | ✓ | ✓ |
 | `NotFound` | authorized absence of an object, entry, snapshot, relation, or commit | ✓ | ✓ |
 | `Ambiguous` | a singular API matched more than one object | ✓ | ✓ |
 | `Unauthorized` | the principal may not read/traverse; nil-returning for absent and denied where nondisclosure is required | ✓ | ✓ |
@@ -69,6 +69,7 @@ there). The first twelve rows are the codec classes as re-used by the store.
 | `SnapshotMissing` | a pinned snapshot named by a Context Root or artifact request does not exist (distinct from an authorized absence inside a snapshot) | ✓ | |
 | `CapabilityRevoked` | a capability, or its revocation id, is revoked at the observed revocation epoch; the message is fixed and non-disclosing | ✓ | |
 | `StaleEpoch` | the client's revocation observation is older than the store's epoch or its freshness window; refresh, never fall back to the head | ✓ | |
+| `LeaseExpired` | this writer's session lease deadline passed, or its fence was superseded; the operation mutated nothing | ✓ | |
 
 Notes:
 
